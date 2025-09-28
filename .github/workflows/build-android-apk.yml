@@ -87,27 +87,34 @@ jobs:
       - name: Build APK for specific ABI
         run: |
           cd android
-          if [ "${{ github.event.inputs.build_type }}" == "release" ] || [ "${{ github.event_name }}" == "workflow_dispatch" -a "${{ github.event.inputs.build_type }}" == "release" ]; then
+          if [ "${{ github.event.inputs.build_type }}" == "release" ]; then
             ./gradlew assembleRelease -PreactNativeArchitectures=${{ matrix.abi }} --parallel --max-workers=2
-            echo "APK_PATH=android/app/build/outputs/apk/release/app-release-unsigned.apk" >> $GITHUB_ENV
+            APK_FILE=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+            echo "APK_FILE=$APK_FILE" >> $GITHUB_ENV
           else
             ./gradlew assembleDebug -PreactNativeArchitectures=${{ matrix.abi }} --parallel --max-workers=2
-            echo "APK_PATH=android/app/build/outputs/apk/debug/app-debug.apk" >> $GITHUB_ENV
+            APK_FILE=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+            echo "APK_FILE=$APK_FILE" >> $GITHUB_ENV
           fi
+          echo "Build completed for ${{ matrix.abi }}"
           
       - name: Rename APK with ABI info
         run: |
-          if [ "${{ github.event.inputs.build_type }}" == "release" ] || [ "${{ github.event_name }}" == "workflow_dispatch" -a "${{ github.event.inputs.build_type }}" == "release" ]; then
-            mv android/app/build/outputs/apk/release/app-release-unsigned.apk cherry-studio-${{ matrix.abi }}.apk
-          else
-            mv android/app/build/outputs/apk/debug/app-debug.apk cherry-studio-${{ matrix.abi }}.apk
+          cd android
+          if [ -z "${APK_FILE}" ]; then
+            echo "APK file not found"
+            ls -R app/build/outputs/apk/
+            exit 1
           fi
+          mv "${APK_FILE}" "../cherry-studio-${{ matrix.abi }}.apk"
+          echo "APK renamed to cherry-studio-${{ matrix.abi }}.apk"
           
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: cherry-studio-${{ matrix.abi }}
           path: cherry-studio-${{ matrix.abi }}.apk
+          if-no-files-found: warn
 
   build-universal-apk:
     runs-on: ubuntu-latest
