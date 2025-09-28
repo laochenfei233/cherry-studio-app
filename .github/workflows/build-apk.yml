@@ -41,14 +41,22 @@ jobs:
       - name: Prebuild for Android
         run: npx expo prebuild -p android
 
+      - name: Setup debug keystore
+        run: |
+          cd android/app
+          mkdir -p src/main/assets
+          # 生成调试用的密钥库
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" -storetype JKS
+
       - name: Build Android APK
         run: |
           cd android
           chmod +x ./gradlew
-          ./gradlew assembleRelease
+          # 使用调试配置构建 APK
+          ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: cherry-studio-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
