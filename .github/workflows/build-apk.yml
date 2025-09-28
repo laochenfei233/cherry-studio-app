@@ -41,18 +41,20 @@ jobs:
       - name: Prebuild for Android
         run: npx expo prebuild -p android
 
-      - name: Setup debug keystore
+      - name: Check if debug keystore exists
         run: |
           cd android/app
-          mkdir -p src/main/assets
-          # 生成调试用的密钥库
-          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" -storetype JKS
+          if [ ! -f debug.keystore ]; then
+            echo "Debug keystore not found, generating one..."
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" -storetype JKS
+          else
+            echo "Debug keystore already exists, skipping generation."
+          fi
 
       - name: Build Android APK
         run: |
           cd android
           chmod +x ./gradlew
-          # 使用调试配置构建 APK
           ./gradlew assembleDebug
 
       - name: Upload APK
