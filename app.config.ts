@@ -1,4 +1,3 @@
-import 'tsx/cjs'
 export default {
   expo: {
     name: 'Cherry Studio',
