@@ -417,9 +417,8 @@ jobs:
       - name: Add state file and cleanup
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
-          # Clean up temporary files before finalizing
+          # Clean up temporary files (keep pr-body.md for create-pull-request action)
           rm -f commits.txt aicore-changes.patch *.log changed-files-summary.log patch-check.log patch-apply.log conflicted-files.log
-          rm -f pr-body.md  # Will be used by create-pr action, don't commit it
 
           # Add state file to track this port
           mkdir -p .github
@@ -428,7 +427,7 @@ jobs:
           # IMPORTANT: Ensure workflow files are not modified
           git checkout HEAD -- .github/workflows/ 2>/dev/null || true
 
-          # Add only specific files (exclude workflows)
+          # Add only specific files (exclude workflows and pr-body.md)
           git add .github/port-bot-state
           git add .github/port-patches/ 2>/dev/null || true
 
@@ -443,6 +442,8 @@ jobs:
           else
             echo "ℹ️ No state file changes to commit"
           fi
+
+          echo "ℹ️ Keeping pr-body.md for create-pull-request action"
 
       - name: Push changes
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
