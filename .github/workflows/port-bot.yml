@@ -1,0 +1,445 @@
+name: Port Bot - aiCore Changes
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  schedule:
+    # Run every 6 hours to check for changes
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source repository ref (branch/tag/commit)'
+        required: false
+        default: 'main'
+
+jobs:
+  check-and-port:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Checkout source repository
+        uses: actions/checkout@v5
+        with:
+          repository: CherryHQ/cherry-studio
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: source-repo
+          fetch-depth: 50
+
+      - name: Set up Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Get last ported commit
+        id: last-port
+        run: |
+          # Try to get the last ported commit from a tracking file
+          if [ -f .github/port-bot-state ]; then
+            LAST_COMMIT=$(cat .github/port-bot-state)
+          else
+            # If no state file, get the commit from 7 days ago
+            cd source-repo
+            LAST_COMMIT=$(git log -1 --before="7 days ago" --format="%H")
+            cd ..
+          fi
+          echo "last_commit=$LAST_COMMIT" >> $GITHUB_OUTPUT
+          echo "Last ported commit: $LAST_COMMIT"
+
+      - name: Check for aiCore changes
+        id: check-changes
+        run: |
+          cd source-repo
+
+          # Get commits that modified src/renderer/src/aiCore since last port
+          COMMITS=$(git log ${{ steps.last-port.outputs.last_commit }}..HEAD \
+            --pretty=format:"%H|%s|%an|%ae|%aI" \
+            -- src/renderer/src/aiCore)
+
+          if [ -z "$COMMITS" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes found in src/renderer/src/aiCore"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+
+            # Get the latest commit hash
+            LATEST_COMMIT=$(git log -1 --format="%H" -- src/renderer/src/aiCore)
+            echo "latest_commit=$LATEST_COMMIT" >> $GITHUB_OUTPUT
+            echo "latest_commit_short=$(echo $LATEST_COMMIT | cut -c1-7)" >> $GITHUB_OUTPUT
+
+            # Count changes
+            COMMIT_COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+
+            # Save commits info for PR body
+            echo "$COMMITS" > ../commits.txt
+
+            echo "Found $COMMIT_COUNT commit(s) with aiCore changes"
+          fi
+
+          cd ..
+
+      - name: Create port branch
+        if: steps.check-changes.outputs.has_changes == 'true'
+        run: |
+          BRANCH_NAME="port/aicore-${{ steps.check-changes.outputs.latest_commit_short }}"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+
+          # Check if branch already exists
+          if git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME; then
+            echo "Branch $BRANCH_NAME already exists, skipping"
+            echo "skip_port=true" >> $GITHUB_ENV
+          else
+            git checkout -b $BRANCH_NAME
+            echo "skip_port=false" >> $GITHUB_ENV
+          fi
+
+      - name: Generate patch file
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          cd source-repo
+
+          # Generate patch with path transformation (src/renderer/src/aiCore -> src/aiCore)
+          git diff ${{ steps.last-port.outputs.last_commit }}..HEAD \
+            -- src/renderer/src/aiCore > ../aicore-changes.patch
+
+          cd ..
+
+          # Transform paths in the patch file for mobile structure
+          sed -i.bak 's|src/renderer/src/aiCore|src/aiCore|g' aicore-changes.patch
+          rm aicore-changes.patch.bak
+
+          echo "✅ Generated patch file with transformed paths"
+
+      - name: Apply patch
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        continue-on-error: true
+        id: apply-patch
+        run: |
+          # Try to apply the patch
+          if git apply --check aicore-changes.patch 2> patch-check.log; then
+            git apply aicore-changes.patch
+            echo "patch_status=success" >> $GITHUB_OUTPUT
+            echo "✅ Patch applied successfully"
+          else
+            # Try with 3-way merge
+            if git apply --3way aicore-changes.patch 2> patch-apply.log; then
+              echo "patch_status=partial" >> $GITHUB_OUTPUT
+              echo "⚠️ Patch applied with conflicts"
+
+              # List conflicted files
+              git diff --name-only --diff-filter=U > conflicted-files.log || echo "No conflicts detected by git"
+            else
+              echo "patch_status=failed" >> $GITHUB_OUTPUT
+              echo "❌ Patch failed to apply"
+
+              # Keep the patch file for manual application
+              mkdir -p .github/port-patches
+              cp aicore-changes.patch .github/port-patches/
+            fi
+          fi
+
+      - name: Analyze patch results
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          echo "patch_status=${{ steps.apply-patch.outputs.patch_status }}" >> $GITHUB_ENV
+
+          # Get statistics
+          if [ -f "aicore-changes.patch" ]; then
+            ADDED_LINES=$(grep "^+" aicore-changes.patch | grep -v "^+++" | wc -l | tr -d ' ')
+            REMOVED_LINES=$(grep "^-" aicore-changes.patch | grep -v "^---" | wc -l | tr -d ' ')
+            FILES_CHANGED=$(grep "^diff --git" aicore-changes.patch | wc -l | tr -d ' ')
+
+            echo "added_lines=$ADDED_LINES" >> $GITHUB_ENV
+            echo "removed_lines=$REMOVED_LINES" >> $GITHUB_ENV
+            echo "files_changed=$FILES_CHANGED" >> $GITHUB_ENV
+          fi
+
+          # Get list of changed files
+          git diff --cached --name-status > changed-files-summary.log || echo "No staged changes"
+
+          echo "📊 Patch Statistics:"
+          echo "Files changed: ${FILES_CHANGED:-0}"
+          echo "Lines added: ${ADDED_LINES:-0}"
+          echo "Lines removed: ${REMOVED_LINES:-0}"
+
+      - name: Install Node.js
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Install corepack
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: corepack enable && corepack prepare yarn@4.10.3 --activate
+
+      - name: Get yarn cache directory path
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+
+      - name: Cache yarn dependencies
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.yarn-cache-dir-path.outputs.dir }}
+            node_modules
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Install Dependencies
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: yarn install
+
+      - name: Run linting and formatting
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          yarn format || true
+          yarn lint || true
+
+      - name: Generate PR description
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          # Determine patch status emoji and message
+          if [ "${{ env.patch_status }}" == "success" ]; then
+            PATCH_EMOJI="✅"
+            PATCH_STATUS_MSG="Patch applied successfully"
+          elif [ "${{ env.patch_status }}" == "partial" ]; then
+            PATCH_EMOJI="⚠️"
+            PATCH_STATUS_MSG="Patch applied with conflicts (requires manual resolution)"
+          else
+            PATCH_EMOJI="❌"
+            PATCH_STATUS_MSG="Patch failed to apply (manual porting required)"
+          fi
+
+          cat > pr-body.md << EOF
+          ## 🤖 Automated Port from CherryHQ/cherry-studio
+
+          ${PATCH_EMOJI} **Status**: ${PATCH_STATUS_MSG}
+
+          This PR automatically ports upstream aiCore changes with path transformation:
+          \`src/renderer/src/aiCore\` → \`src/aiCore\`
+
+          ### 📊 Changes Summary
+
+          - **Files Changed**: ${{ env.files_changed }}
+          - **Lines Added**: +${{ env.added_lines }}
+          - **Lines Removed**: -${{ env.removed_lines }}
+          - **Total Commits**: ${{ steps.check-changes.outputs.commit_count }}
+          - **Source Commit**: [\`${{ steps.check-changes.outputs.latest_commit_short }}\`](https://github.com/CherryHQ/cherry-studio/commit/${{ steps.check-changes.outputs.latest_commit }})
+          - **Patch Status**: ${PATCH_STATUS_MSG}
+
+          ### 📝 Upstream Commits
+
+          EOF
+
+          # Parse and format commits
+          while IFS='|' read -r hash subject author email date; do
+            short_hash=$(echo "$hash" | cut -c1-7)
+            echo "- [\`$short_hash\`](https://github.com/CherryHQ/cherry-studio/commit/$hash) $subject - *$author* ($date)" >> pr-body.md
+          done < commits.txt
+
+          cat >> pr-body.md << 'EOF'
+
+          ### 🔧 What Was Done
+
+          1. ✅ Generated patch from upstream changes
+          2. ✅ Transformed paths for mobile structure (`src/renderer/src/aiCore` → `src/aiCore`)
+          3. ✅ Attempted automatic patch application
+          EOF
+
+          if [ "${{ env.patch_status }}" == "success" ]; then
+            cat >> pr-body.md << 'EOF'
+          4. ✅ All changes applied cleanly
+
+          ### ✅ Review Checklist
+
+          The patch was applied successfully! Please verify:
+          EOF
+          elif [ "${{ env.patch_status }}" == "partial" ]; then
+            cat >> pr-body.md << 'EOF'
+          4. ⚠️ Some conflicts need resolution
+
+          ### ⚠️ Conflicts Detected
+
+          The following files have merge conflicts:
+
+          ```
+          EOF
+            cat conflicted-files.log >> pr-body.md 2>/dev/null || echo "See git status for conflict details"
+            cat >> pr-body.md << 'EOF'
+          ```
+
+          ### ✅ Resolution Checklist
+          EOF
+          else
+            cat >> pr-body.md << 'EOF'
+          4. ❌ Automatic application failed
+
+          ### 📦 Manual Application Required
+
+          The patch is available at `.github/port-patches/aicore-changes.patch`
+
+          To apply manually:
+          ```bash
+          git apply .github/port-patches/aicore-changes.patch
+          # Or with 3-way merge:
+          git apply --3way .github/port-patches/aicore-changes.patch
+          ```
+
+          ### ✅ Manual Porting Checklist
+          EOF
+          fi
+
+          cat >> pr-body.md << 'EOF'
+
+          - [ ] Review all code changes for mobile compatibility
+          - [ ] Check for Node.js/Electron-specific APIs (fs, path, etc.)
+          - [ ] Verify imports work in React Native context
+          - [ ] Replace desktop APIs with Expo equivalents if needed
+          - [ ] Test provider functionality on iOS
+          - [ ] Test provider functionality on Android
+          - [ ] Verify streaming and SSE handling works on mobile
+          - [ ] Check error handling in mobile environment
+          - [ ] Run linting: `yarn lint`
+          - [ ] Run type checking: `yarn typecheck`
+          - [ ] Run tests: `yarn test`
+          - [ ] Test on physical devices (not just emulators)
+
+          ### ⚠️ Key Differences to Watch
+
+          | Desktop (Electron) | Mobile (React Native/Expo) |
+          |-------------------|---------------------------|
+          | `fs`, `path` modules | `expo-file-system` |
+          | Electron IPC | React Native Bridge |
+          | Synchronous file ops | Async-first with promises |
+          | Full file system access | Sandboxed directories |
+          | Node.js crypto | `expo-crypto` or `react-native-crypto` |
+
+          ### 🔗 Related Links
+
+          - [Source Repository](https://github.com/CherryHQ/cherry-studio)
+          - [Compare Changes](https://github.com/CherryHQ/cherry-studio/compare/${{ steps.last-port.outputs.last_commit }}...${{ steps.check-changes.outputs.latest_commit }})
+          - [Source aiCore Directory](https://github.com/CherryHQ/cherry-studio/tree/main/src/renderer/src/aiCore)
+          - [Expo FileSystem API](https://docs.expo.dev/versions/latest/sdk/filesystem/)
+
+          ---
+
+          *🤖 This PR was automatically created by Port Bot*
+          *📅 Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*
+          EOF
+
+      - name: Commit changes
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          git add .
+
+          # Generate commit message based on patch status
+          if [ "${{ env.patch_status }}" == "success" ]; then
+            COMMIT_MSG="port(aiCore): auto-apply changes from upstream @${{ steps.check-changes.outputs.latest_commit_short }}
+
+          ✅ Patch applied successfully
+          Files changed: ${{ env.files_changed }}
+          +${{ env.added_lines }} -${{ env.removed_lines }} lines
+
+          Source: CherryHQ/cherry-studio@${{ steps.check-changes.outputs.latest_commit }}"
+          elif [ "${{ env.patch_status }}" == "partial" ]; then
+            COMMIT_MSG="port(aiCore): partial apply from upstream @${{ steps.check-changes.outputs.latest_commit_short }}
+
+          ⚠️ Patch applied with conflicts - manual resolution required
+          Files changed: ${{ env.files_changed }}
+          +${{ env.added_lines }} -${{ env.removed_lines }} lines
+
+          Source: CherryHQ/cherry-studio@${{ steps.check-changes.outputs.latest_commit }}"
+          else
+            COMMIT_MSG="chore(aiCore): port reference from upstream @${{ steps.check-changes.outputs.latest_commit_short }}
+
+          ❌ Automatic patch failed - manual porting required
+          Patch available at: .github/port-patches/aicore-changes.patch
+
+          Source: CherryHQ/cherry-studio@${{ steps.check-changes.outputs.latest_commit }}"
+          fi
+
+          git commit -m "$COMMIT_MSG" || {
+            echo "No changes to commit"
+            echo "skip_port=true" >> $GITHUB_ENV
+          }
+
+      - name: Push changes
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          git push origin ${{ env.branch_name }}
+
+      - name: Create Pull Request
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ env.branch_name }}
+          title: "port(aiCore): upstream changes (${{ steps.check-changes.outputs.latest_commit_short }}) - ${{ env.patch_status }}"
+          body-path: pr-body.md
+          labels: |
+            automated
+            port
+            aiCore
+            ${{ env.patch_status == 'success' && 'ready-for-review' || 'needs-work' }}
+          draft: ${{ env.patch_status != 'success' }}
+
+      - name: Update tracking state
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          mkdir -p .github
+          echo "${{ steps.check-changes.outputs.latest_commit }}" > .github/port-bot-state
+
+          # Commit state file to main branch
+          git checkout main
+          git pull origin main
+          git add .github/port-bot-state
+          git commit -m "chore: update port-bot tracking state" || echo "No state update needed"
+          git push origin main || echo "Could not push state update"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "==================================="
+          echo "Port Bot Summary"
+          echo "==================================="
+
+          if [ "${{ steps.check-changes.outputs.has_changes }}" == "true" ]; then
+            if [ "${{ env.skip_port }}" == "true" ]; then
+              echo "⚠️ Changes detected but PR already exists or no changes to commit"
+            else
+              echo "✅ Successfully created port PR"
+              echo ""
+              echo "📊 Statistics:"
+              echo "  - Commits: ${{ steps.check-changes.outputs.commit_count }}"
+              echo "  - Files: ${{ env.files_changed }}"
+              echo "  - Lines: +${{ env.added_lines }} -${{ env.removed_lines }}"
+              echo ""
+              echo "🔧 Patch Status: ${{ env.patch_status }}"
+
+              if [ "${{ env.patch_status }}" == "success" ]; then
+                echo "  ✅ All changes applied automatically"
+              elif [ "${{ env.patch_status }}" == "partial" ]; then
+                echo "  ⚠️ Applied with conflicts - needs manual resolution"
+              else
+                echo "  ❌ Failed to apply - manual porting required"
+                echo "  📦 Patch saved to: .github/port-patches/aicore-changes.patch"
+              fi
+            fi
+          else
+            echo "ℹ️ No new changes found in src/renderer/src/aiCore"
+            echo "✨ Repository is up to date with upstream"
+          fi
+
+          echo "==================================="
