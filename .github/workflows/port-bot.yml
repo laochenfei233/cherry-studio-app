@@ -373,7 +373,15 @@ jobs:
       - name: Commit changes
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
-          git add .
+          # IMPORTANT: Exclude .github/workflows/ to avoid permission issues
+          git add . ':!.github/workflows'
+
+          # Verify no workflow files are staged
+          if git diff --cached --name-only | grep -q "^.github/workflows/"; then
+            echo "❌ ERROR: Workflow files detected in staged changes"
+            git diff --cached --name-only | grep "^.github/workflows/"
+            exit 1
+          fi
 
           # Generate commit message based on patch status
           if [ "${{ env.patch_status }}" == "success" ]; then
@@ -417,18 +425,24 @@ jobs:
           mkdir -p .github
           echo "${{ steps.check-changes.outputs.latest_commit }}" > .github/port-bot-state
 
-          # IMPORTANT: Exclude workflow files to avoid permission issues
-          # Reset any changes to .github/workflows/
+          # IMPORTANT: Ensure workflow files are not modified
           git checkout HEAD -- .github/workflows/ 2>/dev/null || true
 
-          # Add to staged changes (only state file and port-patches if exists)
+          # Add only specific files (exclude workflows)
           git add .github/port-bot-state
           git add .github/port-patches/ 2>/dev/null || true
 
-          # Amend the commit to include state file
-          git commit --amend --no-edit
+          # Double check: remove workflow files from staging if somehow added
+          git reset HEAD .github/workflows/ 2>/dev/null || true
 
-          echo "✅ Added state file and cleaned up temporary files"
+          # Create a new commit for state file instead of amending
+          # (amend might re-include excluded files)
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update port-bot state to ${{ steps.check-changes.outputs.latest_commit_short }}"
+            echo "✅ Added state file in separate commit"
+          else
+            echo "ℹ️ No state file changes to commit"
+          fi
 
       - name: Push changes
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
