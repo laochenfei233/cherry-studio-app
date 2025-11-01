@@ -12,7 +12,10 @@
       "@db": ["../db/index"],
       "@database/*": ["./database/*"],
       "@database": ["./database/index"]
-    }
+    },
+    "lib": [
+      "ESNext"
+    ]
   },
   "include": ["**/*.ts", "**/*.tsx", ".expo/types/**/*.ts", "expo-env.d.ts", "nativewind-env.d.ts"]
 }
