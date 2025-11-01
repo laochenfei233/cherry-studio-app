@@ -45,12 +45,22 @@ jobs:
           # Try to get the last ported commit from a tracking file
           if [ -f .github/port-bot-state ]; then
             LAST_COMMIT=$(cat .github/port-bot-state)
+            echo "📝 Using tracked commit from state file"
           else
-            # If no state file, get the commit from 7 days ago
+            # If no state file, get a commit from 30 days ago as starting point
             cd source-repo
-            LAST_COMMIT=$(git log -1 --before="7 days ago" --format="%H")
+            LAST_COMMIT=$(git log --before="30 days ago" --format="%H" -- src/renderer/src/aiCore | head -1)
+
+            # If still empty (repo is newer than 30 days or no aiCore changes in 30 days), use first aiCore commit
+            if [ -z "$LAST_COMMIT" ]; then
+              LAST_COMMIT=$(git log --format="%H" -- src/renderer/src/aiCore | tail -1)
+              echo "⚠️ No state file and no commits in last 30 days, using first aiCore commit"
+            else
+              echo "ℹ️ No state file found, starting from 30 days ago"
+            fi
             cd ..
           fi
+
           echo "last_commit=$LAST_COMMIT" >> $GITHUB_OUTPUT
           echo "Last ported commit: $LAST_COMMIT"
 
@@ -375,6 +385,21 @@ jobs:
             echo "skip_port=true" >> $GITHUB_ENV
           }
 
+      - name: Add state file to commit
+        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
+        run: |
+          # Add state file to track this port
+          mkdir -p .github
+          echo "${{ steps.check-changes.outputs.latest_commit }}" > .github/port-bot-state
+
+          # Add to staged changes
+          git add .github/port-bot-state
+
+          # Amend the commit to include state file
+          git commit --amend --no-edit
+
+          echo "✅ Added state file (will update when PR merges)"
+
       - name: Push changes
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
@@ -394,19 +419,6 @@ jobs:
             aiCore
             ${{ env.patch_status == 'success' && 'ready-for-review' || 'needs-work' }}
           draft: ${{ env.patch_status != 'success' }}
-
-      - name: Update tracking state
-        if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
-        run: |
-          mkdir -p .github
-          echo "${{ steps.check-changes.outputs.latest_commit }}" > .github/port-bot-state
-
-          # Commit state file to main branch
-          git checkout main
-          git pull origin main
-          git add .github/port-bot-state
-          git commit -m "chore: update port-bot tracking state" || echo "No state update needed"
-          git push origin main || echo "Could not push state update"
 
       - name: Summary
         if: always()
