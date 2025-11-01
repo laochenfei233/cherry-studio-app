@@ -135,7 +135,7 @@ jobs:
         id: apply-patch
         run: |
           # Try to apply the patch
-          if git apply --check aicore-changes.patch 2> patch-check.log; then
+          if git apply --check aicore-changes.patch 2>/dev/null; then
             git apply aicore-changes.patch
             echo "patch_status=success" >> $GITHUB_OUTPUT
             echo "✅ Patch applied successfully"
@@ -144,12 +144,9 @@ jobs:
             rm -f aicore-changes.patch
           else
             # Try with 3-way merge
-            if git apply --3way aicore-changes.patch 2> patch-apply.log; then
+            if git apply --3way aicore-changes.patch 2>/dev/null; then
               echo "patch_status=partial" >> $GITHUB_OUTPUT
               echo "⚠️ Patch applied with conflicts"
-
-              # List conflicted files
-              git diff --name-only --diff-filter=U > conflicted-files.log || echo "No conflicts detected by git"
 
               # Save patch file for reference when there are conflicts
               mkdir -p .github/port-patches
@@ -175,24 +172,28 @@ jobs:
         run: |
           echo "patch_status=${{ steps.apply-patch.outputs.patch_status }}" >> $GITHUB_ENV
 
-          # Get statistics
+          # Get statistics from patch file (check both locations)
+          PATCH_FILE=""
           if [ -f "aicore-changes.patch" ]; then
-            ADDED_LINES=$(grep "^+" aicore-changes.patch | grep -v "^+++" | wc -l | tr -d ' ')
-            REMOVED_LINES=$(grep "^-" aicore-changes.patch | grep -v "^---" | wc -l | tr -d ' ')
-            FILES_CHANGED=$(grep "^diff --git" aicore-changes.patch | wc -l | tr -d ' ')
+            PATCH_FILE="aicore-changes.patch"
+          elif [ -f ".github/port-patches/aicore-changes.patch" ]; then
+            PATCH_FILE=".github/port-patches/aicore-changes.patch"
+          fi
+
+          if [ -n "$PATCH_FILE" ]; then
+            ADDED_LINES=$(grep "^+" "$PATCH_FILE" | grep -v "^+++" | wc -l | tr -d ' ')
+            REMOVED_LINES=$(grep "^-" "$PATCH_FILE" | grep -v "^---" | wc -l | tr -d ' ')
+            FILES_CHANGED=$(grep "^diff --git" "$PATCH_FILE" | wc -l | tr -d ' ')
 
             echo "added_lines=$ADDED_LINES" >> $GITHUB_ENV
             echo "removed_lines=$REMOVED_LINES" >> $GITHUB_ENV
             echo "files_changed=$FILES_CHANGED" >> $GITHUB_ENV
+
+            echo "📊 Patch Statistics:"
+            echo "Files changed: $FILES_CHANGED"
+            echo "Lines added: $ADDED_LINES"
+            echo "Lines removed: $REMOVED_LINES"
           fi
-
-          # Get list of changed files
-          git diff --cached --name-status > changed-files-summary.log || echo "No staged changes"
-
-          echo "📊 Patch Statistics:"
-          echo "Files changed: ${FILES_CHANGED:-0}"
-          echo "Lines added: ${ADDED_LINES:-0}"
-          echo "Lines removed: ${REMOVED_LINES:-0}"
 
       - name: Install Node.js
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
@@ -310,13 +311,10 @@ jobs:
 
           ### ⚠️ Conflicts Detected
 
-          The following files have merge conflicts:
-
-          ```
-          EOF
-            cat conflicted-files.log >> pr-body.md 2>/dev/null || echo "See git status for conflict details"
-            cat >> pr-body.md << 'EOF'
-          ```
+          The patch was applied with conflicts. Please check the code for conflict markers:
+          - Look for `<<<<<<<`, `=======`, and `>>>>>>>` in modified files
+          - Use `git status` to see which files have conflicts
+          - The original patch is saved at `.github/port-patches/aicore-changes.patch` for reference
 
           ### ✅ Resolution Checklist
           EOF
@@ -424,8 +422,8 @@ jobs:
       - name: Add state file and cleanup
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
-          # Clean up temporary files (keep pr-body.md for create-pull-request action)
-          rm -f commits.txt aicore-changes.patch *.log changed-files-summary.log patch-check.log patch-apply.log conflicted-files.log
+          # Clean up temporary files (keep pr-body.md for gh pr create)
+          rm -f commits.txt aicore-changes.patch
 
           # Add state file to track this port
           mkdir -p .github
