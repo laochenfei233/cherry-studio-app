@@ -151,7 +151,7 @@ class WebSearchService {
   public async processWebsearch(
     webSearchProvider: WebSearchProvider,
     extractResults: ExtractResults,
-    requestId: string
+    _requestId: string
   ): Promise<WebSearchProviderResponse> {
     // 检查 websearch 和 question 是否有效
     if (!extractResults.websearch?.question || extractResults.websearch.question.length === 0) {
@@ -163,9 +163,6 @@ class WebSearchService {
 
     const searchPromises = questions.map(q => this.search(webSearchProvider, q))
     const searchResults = await Promise.allSettled(searchPromises)
-
-    // 统计成功完成的搜索数量
-    const successfulSearchCount = searchResults.filter(result => result.status === 'fulfilled').length
 
     const finalResults: WebSearchProviderResult[] = []
     searchResults.forEach(result => {

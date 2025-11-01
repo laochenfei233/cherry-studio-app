@@ -25,9 +25,9 @@ const MessageHeader: React.FC<MessageHeaderProps> = ({ message }) => {
   return (
     <View>
       {message.model && (
-        <XStack className="gap-2 items-center">
+        <XStack className="items-center gap-2">
           <ModelIcon model={message.model} />
-          <Text className="text-base max-w-[40%]" ellipsizeMode="middle" numberOfLines={1}>
+          <Text className="max-w-[40%] text-base" ellipsizeMode="middle" numberOfLines={1}>
             {getBaseModelName(message.model?.name)}
           </Text>
           <Text>|</Text>

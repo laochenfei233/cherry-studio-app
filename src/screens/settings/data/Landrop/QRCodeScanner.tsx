@@ -122,7 +122,7 @@ export function QRCodeScanner({ onQRCodeScanned }: QRCodeScannerProps) {
 
   return (
     <Container>
-      <XStack className="gap-1 items-center">
+      <XStack className="items-center gap-1">
         <ScanQrCode />
         <Text>{t('settings.data.landrop.scan_qr_code.description')}</Text>
       </XStack>
@@ -159,7 +159,7 @@ export function QRCodeScanner({ onQRCodeScanned }: QRCodeScannerProps) {
             alignItems: 'center'
           }}>
           <Spinner />
-          <Text className="mt-4 text-white text-lg">
+          <Text className="mt-4 text-lg text-white">
             {t('settings.data.landrop.scan_qr_code.processing') || 'Processing QR code...'}
           </Text>
         </YStack>
