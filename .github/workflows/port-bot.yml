@@ -139,6 +139,9 @@ jobs:
             git apply aicore-changes.patch
             echo "patch_status=success" >> $GITHUB_OUTPUT
             echo "✅ Patch applied successfully"
+
+            # Delete patch file after successful application
+            rm -f aicore-changes.patch
           else
             # Try with 3-way merge
             if git apply --3way aicore-changes.patch 2> patch-apply.log; then
@@ -147,13 +150,17 @@ jobs:
 
               # List conflicted files
               git diff --name-only --diff-filter=U > conflicted-files.log || echo "No conflicts detected by git"
+
+              # Save patch file for reference when there are conflicts
+              mkdir -p .github/port-patches
+              mv aicore-changes.patch .github/port-patches/
             else
               echo "patch_status=failed" >> $GITHUB_OUTPUT
               echo "❌ Patch failed to apply"
 
-              # Keep the patch file for manual application
+              # Save the patch file for manual application
               mkdir -p .github/port-patches
-              cp aicore-changes.patch .github/port-patches/
+              mv aicore-changes.patch .github/port-patches/
             fi
           fi
 
@@ -468,7 +475,6 @@ jobs:
             --body-file pr-body.md \
             --base main \
             --head "${{ env.branch_name }}" \
-            --label "automated,port,aiCore" \
             $DRAFT_FLAG
 
           echo "✅ Pull request created successfully"
