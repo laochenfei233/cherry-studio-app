@@ -157,6 +157,12 @@ jobs:
             fi
           fi
 
+          # IMPORTANT: Always exclude .github/workflows/ changes to avoid permission issues
+          if [ -d ".github/workflows" ]; then
+            git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+            echo "ℹ️ Excluded workflow changes (no workflows permission)"
+          fi
+
       - name: Analyze patch results
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
@@ -410,6 +416,10 @@ jobs:
           # Add state file to track this port
           mkdir -p .github
           echo "${{ steps.check-changes.outputs.latest_commit }}" > .github/port-bot-state
+
+          # IMPORTANT: Exclude workflow files to avoid permission issues
+          # Reset any changes to .github/workflows/
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
 
           # Add to staged changes (only state file and port-patches if exists)
           git add .github/port-bot-state
