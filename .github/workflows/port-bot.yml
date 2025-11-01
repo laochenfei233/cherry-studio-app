@@ -452,18 +452,26 @@ jobs:
 
       - name: Create Pull Request
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          branch: ${{ env.branch_name }}
-          title: "port(aiCore): upstream changes (${{ steps.check-changes.outputs.latest_commit_short }}) - ${{ env.patch_status }}"
-          body-path: pr-body.md
-          labels: |
-            automated
-            port
-            aiCore
-            ${{ env.patch_status == 'success' && 'ready-for-review' || 'needs-work' }}
-          draft: ${{ env.patch_status != 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine if PR should be draft
+          if [ "${{ env.patch_status }}" == "success" ]; then
+            DRAFT_FLAG=""
+          else
+            DRAFT_FLAG="--draft"
+          fi
+
+          # Create PR using GitHub CLI
+          gh pr create \
+            --title "port(aiCore): upstream changes (${{ steps.check-changes.outputs.latest_commit_short }}) - ${{ env.patch_status }}" \
+            --body-file pr-body.md \
+            --base main \
+            --head "${{ env.branch_name }}" \
+            --label "automated,port,aiCore" \
+            $DRAFT_FLAG
+
+          echo "✅ Pull request created successfully"
 
       - name: Summary
         if: always()
