@@ -214,8 +214,23 @@ jobs:
       - name: Run linting and formatting
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
+          # Remove source-repo to avoid linting upstream code
+          rm -rf source-repo
+
+          # Run format and lint on ported code only (ignore temporary files)
           yarn format || true
           yarn lint || true
+
+          # Stage any formatting changes (exclude temporary files)
+          git add src/ || true
+
+          # Commit formatting changes if any
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: apply lint and format fixes" || true
+            echo "✅ Applied formatting fixes"
+          else
+            echo "ℹ️ No formatting changes needed"
+          fi
 
       - name: Generate PR description
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
@@ -385,20 +400,25 @@ jobs:
             echo "skip_port=true" >> $GITHUB_ENV
           }
 
-      - name: Add state file to commit
+      - name: Add state file and cleanup
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
         run: |
+          # Clean up temporary files before finalizing
+          rm -f commits.txt aicore-changes.patch *.log changed-files-summary.log patch-check.log patch-apply.log conflicted-files.log
+          rm -f pr-body.md  # Will be used by create-pr action, don't commit it
+
           # Add state file to track this port
           mkdir -p .github
           echo "${{ steps.check-changes.outputs.latest_commit }}" > .github/port-bot-state
 
-          # Add to staged changes
+          # Add to staged changes (only state file and port-patches if exists)
           git add .github/port-bot-state
+          git add .github/port-patches/ 2>/dev/null || true
 
           # Amend the commit to include state file
           git commit --amend --no-edit
 
-          echo "✅ Added state file (will update when PR merges)"
+          echo "✅ Added state file and cleaned up temporary files"
 
       - name: Push changes
         if: steps.check-changes.outputs.has_changes == 'true' && env.skip_port == 'false'
