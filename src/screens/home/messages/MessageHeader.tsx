@@ -20,7 +20,7 @@ const MessageHeader: React.FC<MessageHeaderProps> = ({ message }) => {
   const currentLanguage = storage.getString('language')
   const providerDisplayName = providerId
     ? t(`provider.${providerId}`, { defaultValue: provider?.name ?? providerId })
-    : provider?.name ?? providerId
+    : (provider?.name ?? providerId)
 
   return (
     <View>
@@ -31,9 +31,7 @@ const MessageHeader: React.FC<MessageHeaderProps> = ({ message }) => {
             {getBaseModelName(message.model?.name)}
           </Text>
           <Text>|</Text>
-          <Text className="text-base text-text-secondary dark:text-text-secondary-dark">
-            {providerDisplayName}
-          </Text>
+          <Text className="text-base text-text-secondary dark:text-text-secondary-dark">{providerDisplayName}</Text>
           <Text className="text-xs text-text-secondary dark:text-text-secondary-dark">
             {new Date(message.createdAt).toLocaleTimeString(currentLanguage, {
               hour: '2-digit',

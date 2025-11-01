@@ -258,7 +258,7 @@ export function useTopic(topicId: string) {
         .then(() => {
           setIsLoading(false)
         })
-        .catch((error) => {
+        .catch(error => {
           logger.error(`Failed to load topic ${topicId}:`, error as Error)
           setIsLoading(false)
         })

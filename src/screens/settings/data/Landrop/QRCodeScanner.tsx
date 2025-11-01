@@ -16,12 +16,7 @@ const logger = loggerService.withContext('QRCodeScanner')
 
 // Helper function to convert number back to IP address
 const numberToIp = (num: number): string => {
-  return [
-    (num >>> 24) & 255,
-    (num >>> 16) & 255,
-    (num >>> 8) & 255,
-    num & 255
-  ].join('.')
+  return [(num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255].join('.')
 }
 
 // Function to decompress connection info from QR code
@@ -139,9 +134,13 @@ export function QRCodeScanner({ onQRCodeScanned }: QRCodeScannerProps) {
           minHeight: 300
         }}
         facing="back"
-        onBarcodeScanned={isProcessing ? undefined : (data) => {
-          handleBarcodeScanned(data)
-        }}
+        onBarcodeScanned={
+          isProcessing
+            ? undefined
+            : data => {
+                handleBarcodeScanned(data)
+              }
+        }
         barcodeScannerSettings={{
           barcodeTypes: ['qr']
         }}

@@ -1,4 +1,3 @@
-
 import { loggerService } from '@/services/LoggerService'
 import { useNavigation } from '@react-navigation/native'
 import { ConnectionInfo } from '@/types/network'
@@ -99,7 +98,9 @@ export default function LandropSettingsScreen() {
     if (typeof connectionInfo === 'string') {
       logger.info(`Connecting to Landrop sender at ${connectionInfo} (legacy format)`)
     } else {
-      logger.info(`Connecting to Landrop sender with ${connectionInfo.candidates.length} IP candidates, selected: ${connectionInfo.selectedHost}`)
+      logger.info(
+        `Connecting to Landrop sender with ${connectionInfo.candidates.length} IP candidates, selected: ${connectionInfo.selectedHost}`
+      )
     }
   }
 

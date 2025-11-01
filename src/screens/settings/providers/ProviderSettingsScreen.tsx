@@ -100,39 +100,45 @@ export default function ProviderSettingsScreen() {
     }
   }
 
-  const handleRemoveModel = useCallback(async (modelId: string) => {
-    if (provider) {
-      const updatedModels = provider.models.filter(model => model.id !== modelId)
-      const updatedProvider = { ...provider, models: updatedModels }
+  const handleRemoveModel = useCallback(
+    async (modelId: string) => {
+      if (provider) {
+        const updatedModels = provider.models.filter(model => model.id !== modelId)
+        const updatedProvider = { ...provider, models: updatedModels }
 
-      try {
-        await updateProvider(updatedProvider)
-        logger.info(`Removed model ${modelId} from provider ${provider.id}`)
-      } catch (error) {
-        logger.error('Failed to remove model:', error)
+        try {
+          await updateProvider(updatedProvider)
+          logger.info(`Removed model ${modelId} from provider ${provider.id}`)
+        } catch (error) {
+          logger.error('Failed to remove model:', error)
+        }
       }
-    }
-  }, [provider, updateProvider])
+    },
+    [provider, updateProvider]
+  )
 
-  const renderModelItem = useCallback((model: Model, _index: number) => (
-    <XStack className="items-center justify-between w-full">
-      <XStack className="flex-1 gap-2">
-        <XStack className="items-center justify-center">
-          <ModelIcon model={model} />
+  const renderModelItem = useCallback(
+    (model: Model, _index: number) => (
+      <XStack className="items-center justify-between w-full">
+        <XStack className="flex-1 gap-2">
+          <XStack className="items-center justify-center">
+            <ModelIcon model={model} />
+          </XStack>
+          <YStack className="flex-1 gap-1">
+            <Text numberOfLines={1} ellipsizeMode="tail">
+              {model.name}
+            </Text>
+            <ModelTags model={model} size={11} />
+          </YStack>
         </XStack>
-        <YStack className="flex-1 gap-1">
-          <Text numberOfLines={1} ellipsizeMode="tail">
-            {model.name}
-          </Text>
-          <ModelTags model={model} size={11} />
-        </YStack>
+        <IconButton
+          icon={<Minus size={18} className="rounded-full bg-red-20 text-red-100 dark:text-red-100" />}
+          onPress={() => handleRemoveModel(model.id)}
+        />
       </XStack>
-      <IconButton
-        icon={<Minus size={18} className="rounded-full bg-red-20 text-red-100 dark:text-red-100" />}
-        onPress={() => handleRemoveModel(model.id)}
-      />
-    </XStack>
-  ), [handleRemoveModel])
+    ),
+    [handleRemoveModel]
+  )
 
   if (isLoading) {
     return (
