@@ -31,6 +31,7 @@ import { loggerService } from '@/services/LoggerService'
 import { persistor } from '@/store'
 import type { NavigationProps } from '@/types/naviagate'
 import { formatFileSize } from '@/utils/file'
+import { delay } from 'lodash'
 const logger = loggerService.withContext('BasicDataSettingsScreen')
 
 interface SettingItemConfig {
@@ -116,6 +117,7 @@ export default function BasicDataSettingsScreen() {
       content: t('settings.data.reset_warning'),
       confirmText: t('common.confirm'),
       cancelText: t('common.cancel'),
+      showLoading: true,
       onConFirm: async () => {
         setIsResetting(true)
 
@@ -123,16 +125,16 @@ export default function BasicDataSettingsScreen() {
           await databaseMaintenance.resetDatabase() // reset sqlite
           await persistor.purge() // reset redux
           await resetCacheDirectory() // reset cache
+
+          delay(async () => await reloadAppAsync(), 200)
         } catch (error) {
+          setIsResetting(false)
           dialog.open({
             type: 'error',
             title: t('common.error'),
             content: t('settings.data.data_reset.error')
           })
           logger.error('handleDataReset', error as Error)
-        } finally {
-          setIsResetting(false)
-          await reloadAppAsync()
         }
       }
     })
