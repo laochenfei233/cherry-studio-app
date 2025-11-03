@@ -22,7 +22,7 @@ async function ensureDirExists(dir: Directory) {
   const dirInfo = dir.info()
 
   if (!dirInfo.exists) {
-    dir.create()
+    dir.create({ intermediates: true })
   }
 }
 
@@ -156,7 +156,7 @@ export async function resetCacheDirectory() {
     }
 
     // Recreate Files directory
-    DEFAULT_STORAGE.create()
+    DEFAULT_STORAGE.create({ intermediates: true })
   } catch (error) {
     logger.error('resetCacheDirectory', error)
   }
