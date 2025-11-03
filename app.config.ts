@@ -5,26 +5,14 @@ import packageJson from './package.json'
 // Read version from environment variable (set during build) or fallback to package.json
 const appVersion = process.env.APP_VERSION || packageJson.version
 
-// Determine if this is a production build
-// EAS Build sets EAS_BUILD_PROFILE, fallback to PROFILE for local development
-const buildProfile = process.env.EAS_BUILD_PROFILE || process.env.PROFILE
-const isProduction = buildProfile === 'production'
-
-// Configure app identity based on environment
-const appName = isProduction ? 'Cherry Studio' : 'Cherry Studio Dev'
-const appSlug = isProduction ? 'cherry-studio' : 'cherry-studio-dev'
-const appScheme = isProduction ? 'cherry-studio' : 'cherry-studio-dev'
-const iosBundleId = isProduction ? 'com.cherry-ai.cherry-studio-app' : 'com.cherry-ai.cherry-studio-app-dev'
-const androidPackage = isProduction ? 'com.cherry_ai.cherry_studio_app' : 'com.cherry_ai.cherry_studio_app_dev'
-
 export default {
   expo: {
-    name: appName,
-    slug: appSlug,
+    name: 'Cherry Studio',
+    slug: 'cherry-studio',
     version: appVersion,
     orientation: 'portrait',
     icon: './src/assets/images/favicon.png',
-    scheme: appScheme,
+    scheme: 'cherry-studio',
     userInterfaceStyle: 'automatic',
     newArchEnabled: true,
     entryPoint: './src/app.js',
@@ -36,7 +24,7 @@ export default {
     },
     ios: {
       supportsTablet: true,
-      bundleIdentifier: iosBundleId,
+      bundleIdentifier: 'com.cherry-ai.cherry-studio-app',
       userInterfaceStyle: 'automatic'
     },
     android: {
@@ -45,7 +33,7 @@ export default {
         backgroundColor: '#F65D5D'
       },
       edgeToEdgeEnabled: true,
-      package: androidPackage,
+      package: 'com.cherry_ai.cherry_studio_app',
       userInterfaceStyle: 'automatic',
       predictiveBackGestureEnabled: false
     },
@@ -162,8 +150,7 @@ export default {
           android: ['com.facebook.katana', 'com.instagram.android', 'com.twitter.android', 'com.zhiliaoapp.musically'],
           enableBase64ShareAndroid: true
         }
-      ],
-      './plugins/heapSize'
+      ]
     ],
     experiments: {
       typedRoutes: true,
