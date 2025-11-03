@@ -12,6 +12,7 @@ import { persistor } from '@/store'
 import type { FileMetadata } from '@/types/file'
 import { uuid } from '@/utils'
 import { getFileType } from '@/utils/file'
+import { resetAppInitializationState, runAppDataMigrations } from '@/services/AppInitializationService'
 const logger = loggerService.withContext('useRestore')
 
 // 定义步骤配置类型
@@ -147,6 +148,8 @@ export function useRestore(options: UseRestoreOptions = {}) {
       try {
         logger.info('Clearing existing data before restore...')
         await databaseMaintenance.resetDatabase()
+        resetAppInitializationState()
+        await runAppDataMigrations()
         logger.info('Existing data cleared successfully')
       } catch (error) {
         logger.error('Failed to clear existing data:', error)

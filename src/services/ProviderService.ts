@@ -600,6 +600,23 @@ export class ProviderService {
   }
 
   /**
+   * Clear cached providers and reset initialization state
+   */
+  public clearCache(): void {
+    this.defaultProviderCache = null
+    this.defaultProviderInitialized = false
+    this.providerCache.clear()
+    this.accessOrder = []
+    this.loadPromises.clear()
+    this.allProvidersCache.clear()
+    this.allProvidersCacheTimestamp = null
+    this.isLoadingAllProviders = false
+    this.loadAllProvidersPromise = null
+
+    logger.info('ProviderService caches cleared')
+  }
+
+  /**
    * Subscribe to default provider changes
    */
   public subscribeDefaultProvider(callback: () => void): UnsubscribeFunction {
