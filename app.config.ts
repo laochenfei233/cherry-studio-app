@@ -6,14 +6,16 @@ import packageJson from './package.json'
 const appVersion = process.env.APP_VERSION || packageJson.version
 
 // Determine if this is a production build
-const isProduction = process.env.PROFILE === 'production'
+// EAS Build sets EAS_BUILD_PROFILE, fallback to PROFILE for local development
+const buildProfile = process.env.EAS_BUILD_PROFILE || process.env.PROFILE
+const isProduction = buildProfile === 'production'
 
 // Configure app identity based on environment
 const appName = isProduction ? 'Cherry Studio' : 'Cherry Studio Dev'
 const appSlug = isProduction ? 'cherry-studio' : 'cherry-studio-dev'
 const appScheme = isProduction ? 'cherry-studio' : 'cherry-studio-dev'
-const iosBundleId = isProduction ? 'com.cherry-ai.cherry-studio' : 'com.cherry-ai.cherry-studio-dev'
-const androidPackage = isProduction ? 'com.cherry_ai.cherry_studio' : 'com.cherry_ai.cherry_studio_dev'
+const iosBundleId = isProduction ? 'com.cherry-ai.cherry-studio-app' : 'com.cherry-ai.cherry-studio-app-dev'
+const androidPackage = isProduction ? 'com.cherry_ai.cherry_studio_app' : 'com.cherry_ai.cherry_studio_app_dev'
 
 export default {
   expo: {
