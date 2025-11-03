@@ -147,7 +147,6 @@ export function useRestore(options: UseRestoreOptions = {}) {
       try {
         logger.info('Clearing existing data before restore...')
         await databaseMaintenance.resetDatabase()
-        await persistor.purge()
         logger.info('Existing data cleared successfully')
       } catch (error) {
         logger.error('Failed to clear existing data:', error)
