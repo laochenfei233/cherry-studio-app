@@ -180,6 +180,7 @@ export class AssistantService {
    * @returns Promise resolving to the assistant or null
    */
   public async getAssistant(assistantId: string): Promise<Assistant | null> {
+    debugger
     // Validate assistantId
     if (!assistantId || assistantId.trim() === '') {
       logger.warn('getAssistant called with empty assistantId')
@@ -824,7 +825,7 @@ export async function getDefaultAssistant(): Promise<Assistant> {
  * Get default model
  */
 export function getDefaultModel() {
-  return SYSTEM_MODELS.cherryin[0]
+  return SYSTEM_MODELS.cherryai[0]
 }
 
 /**

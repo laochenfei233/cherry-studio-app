@@ -32,6 +32,7 @@ import { loggerService } from '@/services/LoggerService'
 import type { Assistant, Model, Provider } from '@/types/assistant'
 
 import { getDefaultModel } from './AssistantService'
+import { CHERRYAI_PROVIDER } from '@/config/providers'
 
 const logger = loggerService.withContext('ProviderService')
 
@@ -234,6 +235,11 @@ export class ProviderService {
       return null
     }
 
+    // 0. Check special provider
+    if (providerId === 'cherryai') {
+      return CHERRYAI_PROVIDER
+    }
+
     // 1. Check default provider cache
     if (this.defaultProviderCache && this.defaultProviderCache.id === providerId) {
       logger.verbose(`Returning default provider from cache: ${providerId}`)
@@ -277,6 +283,10 @@ export class ProviderService {
    * @returns The cached provider or null
    */
   public getProviderCached(providerId: string): Provider | null {
+    if (providerId === 'cherryai') {
+      return CHERRYAI_PROVIDER
+    }
+
     // Check default provider cache
     if (this.defaultProviderCache && this.defaultProviderCache.id === providerId) {
       return this.defaultProviderCache

@@ -4,6 +4,11 @@ import { loggerService } from '@/services/LoggerService'
 import { providerService } from '@/services/ProviderService'
 import type { Provider } from '@/types/assistant'
 
+import { db } from '@db'
+import { transformDbToProvider } from '@db/mappers'
+import { providers as providersSchema } from '@db/schema'
+import { CHERRYAI_PROVIDER } from '@/config/providers'
+
 const logger = loggerService.withContext('useProvider')
 
 /**
@@ -53,14 +58,24 @@ export function useAllProviders() {
     try {
       setIsLoading(true)
       const allProviders = await providerService.getAllProviders()
+
       // Sort by enabled: true first, then false
       const sortedProviders = allProviders.sort((a, b) => {
         if (a.enabled === b.enabled) return 0
         return a.enabled ? -1 : 1
       })
-      setProviders(sortedProviders)
+
+      // If no providers exist, return CHERRYAI_PROVIDER
+      // Otherwise, always add CHERRYAI_PROVIDER at the end
+      if (sortedProviders.length === 0) {
+        setProviders([CHERRYAI_PROVIDER])
+      } else {
+        setProviders([...sortedProviders, CHERRYAI_PROVIDER])
+      }
     } catch (error) {
       logger.error('Failed to load all providers:', error as Error)
+      // On error, still return CHERRYAI_PROVIDER
+      setProviders([CHERRYAI_PROVIDER])
     } finally {
       setIsLoading(false)
     }
@@ -192,6 +207,14 @@ export function useProvider(providerId: string) {
   )
 
   // ==================== Return API ====================
+
+  if (providerId === 'cherryai') {
+    return {
+      provider: CHERRYAI_PROVIDER,
+      isLoading: false,
+      updateProvider: () => {}
+    }
+  }
 
   return {
     provider,

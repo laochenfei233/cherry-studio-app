@@ -269,6 +269,7 @@ export type EndpointType = 'openai' | 'openai-response' | 'anthropic' | 'gemini'
 
 export const SystemProviderIds = {
   cherryin: 'cherryin',
+  cherryai: 'cherryai',
   silicon: 'silicon',
   aihubmix: 'aihubmix',
   ocoolai: 'ocoolai',
