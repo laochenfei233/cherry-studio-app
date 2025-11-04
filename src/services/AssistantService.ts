@@ -180,7 +180,6 @@ export class AssistantService {
    * @returns Promise resolving to the assistant or null
    */
   public async getAssistant(assistantId: string): Promise<Assistant | null> {
-    debugger
     // Validate assistantId
     if (!assistantId || assistantId.trim() === '') {
       logger.warn('getAssistant called with empty assistantId')
