@@ -1,4 +1,5 @@
-import { useNavigation } from '@react-navigation/native'
+import type { NavigationProp, ParamListBase } from '@react-navigation/native'
+import { useNavigation, useRoute } from '@react-navigation/native'
 import { File } from 'expo-file-system'
 import { Spinner } from 'heroui-native'
 import React, { useEffect, useRef, useState } from 'react'
@@ -6,10 +7,14 @@ import { useTranslation } from 'react-i18next'
 
 import { HeaderBar, RestoreProgressModal, SafeAreaContainer, Text, YStack } from '@/componentsV2'
 import { DEFAULT_BACKUP_STORAGE } from '@/constants/storage'
+import { useAppState } from '@/hooks/useAppState'
 import { LANDROP_RESTORE_STEPS, RESTORE_STEP_CONFIGS, useRestore } from '@/hooks/useRestore'
+import { useCurrentTopic } from '@/hooks/useTopic'
 import { useWebSocket, WebSocketStatus } from '@/hooks/useWebSocket'
+import { getDefaultAssistant } from '@/services/AssistantService'
 import { loggerService } from '@/services/LoggerService'
-import type { DataSourcesNavigationProps } from '@/types/naviagate'
+import { topicService } from '@/services/TopicService'
+import type { LandropSettingsRouteProp } from '@/types/naviagate'
 import type { ConnectionInfo } from '@/types/network'
 
 import { QRCodeScanner } from './QRCodeScanner'
@@ -18,7 +23,10 @@ const logger = loggerService.withContext('landropSettingsScreen')
 
 export default function LandropSettingsScreen() {
   const { t } = useTranslation()
-  const navigation = useNavigation<DataSourcesNavigationProps>()
+  const navigation = useNavigation<NavigationProp<ParamListBase>>()
+  const route = useRoute<LandropSettingsRouteProp>()
+  const { setWelcomeShown } = useAppState()
+  const { switchTopic } = useCurrentTopic()
   const { status, filename, connect, disconnect } = useWebSocket()
   const [scannedIP, setScannedIP] = useState<string | null>(null)
   const { isModalOpen, restoreSteps, overallStatus, startRestore, closeModal, updateStepStatus, openModal } =
@@ -104,8 +112,30 @@ export default function LandropSettingsScreen() {
     }
   }
 
-  const handleModalClose = () => {
+  const handleModalClose = async () => {
     closeModal()
+
+    const shouldRedirectToHome = route.params?.redirectToHome && overallStatus === 'success'
+
+    if (shouldRedirectToHome) {
+      try {
+        const defaultAssistant = await getDefaultAssistant()
+        const newTopic = await topicService.createTopic(defaultAssistant)
+        navigation.navigate('HomeScreen', {
+          screen: 'Home',
+          params: {
+            screen: 'ChatScreen',
+            params: { topicId: newTopic.id }
+          }
+        })
+        await switchTopic(newTopic.id)
+        await setWelcomeShown(true)
+        return
+      } catch (error) {
+        logger.error('Failed to redirect after Landrop restore:', error)
+      }
+    }
+
     navigation.goBack()
   }
 
