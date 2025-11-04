@@ -1,13 +1,9 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 
+import { CHERRYAI_PROVIDER } from '@/config/providers'
 import { loggerService } from '@/services/LoggerService'
 import { providerService } from '@/services/ProviderService'
 import type { Provider } from '@/types/assistant'
-
-import { db } from '@db'
-import { transformDbToProvider } from '@db/mappers'
-import { providers as providersSchema } from '@db/schema'
-import { CHERRYAI_PROVIDER } from '@/config/providers'
 
 const logger = loggerService.withContext('useProvider')
 

@@ -5,6 +5,7 @@ import * as DocumentPicker from 'expo-document-picker'
 import { Paths } from 'expo-file-system'
 import * as IntentLauncher from 'expo-intent-launcher'
 import * as Sharing from 'expo-sharing'
+import { delay } from 'lodash'
 import React, { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Platform } from 'react-native'
@@ -31,7 +32,6 @@ import { loggerService } from '@/services/LoggerService'
 import { persistor } from '@/store'
 import type { NavigationProps } from '@/types/naviagate'
 import { formatFileSize } from '@/utils/file'
-import { delay } from 'lodash'
 const logger = loggerService.withContext('BasicDataSettingsScreen')
 
 interface SettingItemConfig {

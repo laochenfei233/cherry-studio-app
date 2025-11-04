@@ -28,11 +28,11 @@
 
 import { providerDatabase } from '@database'
 
+import { CHERRYAI_PROVIDER } from '@/config/providers'
 import { loggerService } from '@/services/LoggerService'
 import type { Assistant, Model, Provider } from '@/types/assistant'
 
 import { getDefaultModel } from './AssistantService'
-import { CHERRYAI_PROVIDER } from '@/config/providers'
 
 const logger = loggerService.withContext('ProviderService')
 

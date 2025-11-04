@@ -1,8 +1,10 @@
 import type { ProviderId, ProviderSettingsMap } from '@cherrystudio/ai-core/provider'
 import { hasProviderConfig, ProviderConfigFactory } from '@cherrystudio/ai-core/provider'
+import { fetch } from 'expo/fetch'
 import { cloneDeep } from 'lodash'
 
 import { isOpenAIChatCompletionOnlyModel } from '@/config/models'
+import { generateSignature } from '@/integration/cherryai'
 import { loggerService } from '@/services/LoggerService'
 import { getProviderByModel } from '@/services/ProviderService'
 import type { Model, Provider } from '@/types/assistant'
@@ -11,8 +13,6 @@ import { formatApiHost } from '@/utils/api'
 
 import { aihubmixProviderCreator, newApiResolverCreator } from './config'
 import { getAiSdkProviderId } from './factory'
-import { generateSignature } from '@/integration/cherryai'
-import { fetch } from 'expo/fetch'
 
 const logger = loggerService.withContext('ProviderConfigProcessor')
 

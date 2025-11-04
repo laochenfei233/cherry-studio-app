@@ -17,7 +17,7 @@ import {
 import AssistantItem from '@/componentsV2/features/Assistant/AssistantItem'
 import AssistantItemSheet from '@/componentsV2/features/Assistant/AssistantItemSheet'
 import { Menu, Plus, Store } from '@/componentsV2/icons/LucideIcon'
-import { useAssistants, useExternalAssistants } from '@/hooks/useAssistant'
+import { useAssistants } from '@/hooks/useAssistant'
 import { useSearch } from '@/hooks/useSearch'
 import { createAssistant } from '@/services/AssistantService'
 import type { Assistant } from '@/types/assistant'
