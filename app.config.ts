@@ -151,7 +151,8 @@ export default {
           android: ['com.facebook.katana', 'com.instagram.android', 'com.twitter.android', 'com.zhiliaoapp.musically'],
           enableBase64ShareAndroid: true
         }
-      ]
+      ],
+      './plugins/heapSize'
     ],
     experiments: {
       typedRoutes: true,
