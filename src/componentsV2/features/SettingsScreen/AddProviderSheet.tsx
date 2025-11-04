@@ -1,9 +1,9 @@
 import { BottomSheetBackdrop, BottomSheetModal, BottomSheetTextInput, BottomSheetView } from '@gorhom/bottom-sheet'
 import { File, Paths } from 'expo-file-system'
 import { Button, useTheme } from 'heroui-native'
-import React, { forwardRef, useEffect, useState } from 'react'
+import React, { forwardRef, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { BackHandler, Keyboard, TouchableWithoutFeedback } from 'react-native'
+import { BackHandler, Keyboard, TouchableWithoutFeedback, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { Text, XStack, YStack } from '@/componentsV2'
@@ -21,6 +21,9 @@ import { ProviderSelect } from './ProviderSelect'
 
 const logger = loggerService.withContext('ProviderSheet')
 
+// Stable handler to prevent re-renders
+const stopPropagation = () => true
+
 interface ProviderSheetProps {
   mode?: 'add' | 'edit'
   editProvider?: Provider
@@ -33,6 +36,21 @@ export const AddProviderSheet = forwardRef<BottomSheetModal, ProviderSheetProps>
     const insets = useSafeAreaInsets()
     const dialog = useDialog()
     const [providerId, setProviderId] = useState(() => editProvider?.id || uuid())
+
+    // Memoized input style to prevent re-renders
+    const inputStyle = useMemo(
+      () => ({
+        height: 40,
+        paddingHorizontal: 12,
+        paddingVertical: 12,
+        borderRadius: 6,
+        borderWidth: 1,
+        borderColor: isDark ? '#2f2f2f' : '#e5e5e5',
+        backgroundColor: isDark ? '#1a1a1a' : '#ffffff',
+        color: isDark ? '#a1a1a1' : '#737373'
+      }),
+      [isDark]
+    )
 
     const [providerName, setProviderName] = useState(editProvider?.name || '')
     const [selectedProviderType, setSelectedProviderType] = useState<ProviderType | undefined>(
@@ -183,12 +201,14 @@ export const AddProviderSheet = forwardRef<BottomSheetModal, ProviderSheetProps>
                     </Text>
                     <Text className="text-red-500 dark:text-red-500">*</Text>
                   </XStack>
-                  <BottomSheetTextInput
-                    className="h-10 rounded-md border border-gray-20 bg-ui-card-background px-3 py-3 text-text-secondary dark:bg-ui-card-background-dark dark:text-text-secondary-dark"
-                    placeholder={t('settings.provider.add.name.placeholder')}
-                    value={providerName}
-                    onChangeText={setProviderName}
-                  />
+                  <View onStartShouldSetResponder={stopPropagation}>
+                    <BottomSheetTextInput
+                      style={inputStyle}
+                      placeholder={t('settings.provider.add.name.placeholder')}
+                      value={providerName}
+                      onChangeText={setProviderName}
+                    />
+                  </View>
                 </YStack>
                 <YStack className="w-full gap-2">
                   <XStack className="gap-2">

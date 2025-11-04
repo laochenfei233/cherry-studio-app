@@ -1,8 +1,8 @@
 import { BottomSheetBackdrop, BottomSheetModal, BottomSheetTextInput, BottomSheetView } from '@gorhom/bottom-sheet'
 import { Button, useTheme } from 'heroui-native'
-import React, { forwardRef, useEffect, useState } from 'react'
+import React, { forwardRef, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { BackHandler, Keyboard, TouchableWithoutFeedback } from 'react-native'
+import { BackHandler, Keyboard, TouchableWithoutFeedback, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import Text from '@/componentsV2/base/Text'
@@ -13,6 +13,9 @@ import type { Model, Provider } from '@/types/assistant'
 import { getDefaultGroupName } from '@/utils/naming'
 
 const logger = loggerService.withContext('AddModelSheet')
+
+// Stable handler to prevent re-renders
+const stopPropagation = () => true
 
 interface AddModelSheetProps {
   provider?: Provider
@@ -86,15 +89,18 @@ export const AddModelSheet = forwardRef<BottomSheetModal, AddModelSheetProps>(({
     <BottomSheetBackdrop {...props} appearsOnIndex={0} disappearsOnIndex={-1} opacity={0.5} pressBehavior="close" />
   )
 
-  const inputStyle = {
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderRadius: 16,
-    backgroundColor: isDark ? '#19191C' : '#ffffffff',
-    borderWidth: 0.5,
-    borderColor: '#a0a1b066',
-    color: isDark ? '#f9f9f9ff' : '#202020ff'
-  }
+  const inputStyle = useMemo(
+    () => ({
+      paddingHorizontal: 14,
+      paddingVertical: 12,
+      borderRadius: 16,
+      backgroundColor: isDark ? '#19191C' : '#ffffffff',
+      borderWidth: 0.5,
+      borderColor: '#a0a1b066',
+      color: isDark ? '#f9f9f9ff' : '#202020ff'
+    }),
+    [isDark]
+  )
 
   return (
     <BottomSheetModal
@@ -128,12 +134,14 @@ export const AddModelSheet = forwardRef<BottomSheetModal, AddModelSheetProps>(({
                   </Text>
                   <Text className="text-red-500 dark:text-red-500">*</Text>
                 </XStack>
-                <BottomSheetTextInput
-                  style={inputStyle}
-                  placeholder={t('settings.models.add.model.id.placeholder')}
-                  value={modelId}
-                  onChangeText={setModelId}
-                />
+                <View onStartShouldSetResponder={stopPropagation}>
+                  <BottomSheetTextInput
+                    style={inputStyle}
+                    placeholder={t('settings.models.add.model.id.placeholder')}
+                    value={modelId}
+                    onChangeText={setModelId}
+                  />
+                </View>
               </YStack>
               {/* Model Name Input */}
               <YStack className="w-full gap-2">
@@ -142,12 +150,14 @@ export const AddModelSheet = forwardRef<BottomSheetModal, AddModelSheetProps>(({
                     {t('settings.models.add.model.name.label')}
                   </Text>
                 </XStack>
-                <BottomSheetTextInput
-                  style={inputStyle}
-                  placeholder={t('settings.models.add.model.name.placeholder')}
-                  value={modelName}
-                  onChangeText={setModelName}
-                />
+                <View onStartShouldSetResponder={stopPropagation}>
+                  <BottomSheetTextInput
+                    style={inputStyle}
+                    placeholder={t('settings.models.add.model.name.placeholder')}
+                    value={modelName}
+                    onChangeText={setModelName}
+                  />
+                </View>
               </YStack>
               {/* Model Group Input */}
               <YStack className="w-full gap-2">
@@ -156,12 +166,14 @@ export const AddModelSheet = forwardRef<BottomSheetModal, AddModelSheetProps>(({
                     {t('settings.models.add.model.group.label')}
                   </Text>
                 </XStack>
-                <BottomSheetTextInput
-                  style={inputStyle}
-                  placeholder={t('settings.models.add.model.group.placeholder')}
-                  value={modelGroup}
-                  onChangeText={setModelGroup}
-                />
+                <View onStartShouldSetResponder={stopPropagation}>
+                  <BottomSheetTextInput
+                    style={inputStyle}
+                    placeholder={t('settings.models.add.model.group.placeholder')}
+                    value={modelGroup}
+                    onChangeText={setModelGroup}
+                  />
+                </View>
               </YStack>
               <Button
                 variant="tertiary"
