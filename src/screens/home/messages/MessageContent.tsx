@@ -28,16 +28,19 @@ const MessageContent: React.FC<Props> = ({ message, assistant, isMultiModel = fa
 
   if (isUser)
     return (
-      <View className="w-full max-w-full flex-1 items-end rounded-2xl px-[14px]">
+      // item-end 会导致android端消息框重叠
+      <View className="w-full max-w-full flex-1 rounded-2xl px-[14px]">
         {mediaBlocks.length > 0 && <MessageBlockRenderer blocks={mediaBlocks} message={message} />}
         {mediaBlocks.length > 0 && <View className="h-2" />}
-        <MessageContextMenu message={message} assistant={assistant}>
-          {contentBlocks.length > 0 && (
-            <YStack className="rounded-l-xl rounded-br-sm rounded-tr-xl border border-green-20 bg-green-10 px-5 dark:border-green-dark-20 dark:bg-green-dark-10 ">
-              <MessageBlockRenderer blocks={contentBlocks} message={message} />
-            </YStack>
-          )}
-        </MessageContextMenu>
+        <View className="flex-row justify-end">
+          <MessageContextMenu message={message} assistant={assistant}>
+            {contentBlocks.length > 0 && (
+              <YStack className="rounded-l-xl rounded-br-sm rounded-tr-xl border border-green-20 bg-green-10 px-5 dark:border-green-dark-20 dark:bg-green-dark-10 ">
+                <MessageBlockRenderer blocks={contentBlocks} message={message} />
+              </YStack>
+            )}
+          </MessageContextMenu>
+        </View>
       </View>
     )
 
