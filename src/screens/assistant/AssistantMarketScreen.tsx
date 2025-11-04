@@ -20,7 +20,7 @@ export default function AssistantMarketScreen() {
   const [selectedAssistant, setSelectedAssistant] = useState<Assistant | null>(null)
   const [isInitializing, setIsInitializing] = useState(true)
 
-  const { builtInAssistants } = useBuiltInAssistants()
+  const { assistants: builtInAssistants } = useBuiltInAssistants()
   const {
     searchText,
     setSearchText,
@@ -40,7 +40,7 @@ export default function AssistantMarketScreen() {
   }
 
   useEffect(() => {
-    if (builtInAssistants.length > 0 && isInitializing) {
+    if (builtInAssistants && builtInAssistants.length > 0 && isInitializing) {
       const id = setTimeout(() => {
         setIsInitializing(false)
       }, 100)
