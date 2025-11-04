@@ -49,7 +49,8 @@ export default {
             minSdkVersion: 24,
             gradleVersion: '8.13',
             androidGradlePluginVersion: '8.13.0',
-            buildArchs: ['arm64-v8a']
+            buildArchs: ['arm64-v8a'],
+            usesCleartextTraffic: true
           }
         }
       ],
