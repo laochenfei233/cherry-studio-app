@@ -40,6 +40,7 @@ export const AddProviderSheet = forwardRef<BottomSheetModal, ProviderSheetProps>
     )
     const [selectedImageFile, setSelectedImageFile] = useState<Omit<FileMetadata, 'md5'> | null>(null)
     const [isVisible, setIsVisible] = useState(false)
+    const [existingIconUri, setExistingIconUri] = useState<string | undefined>(undefined)
 
     // 当 editProvider 变化时，更新表单字段
     useEffect(() => {
@@ -53,6 +54,21 @@ export const AddProviderSheet = forwardRef<BottomSheetModal, ProviderSheetProps>
         setSelectedProviderType(undefined)
       }
     }, [editProvider])
+
+    // 在编辑模式下查找现有的图标文件
+    useEffect(() => {
+      if (mode === 'edit' && providerId) {
+        const possibleExtensions = ['png', 'jpg', 'jpeg']
+        for (const ext of possibleExtensions) {
+          const file = new File(Paths.join(DEFAULT_ICONS_STORAGE, `${providerId}.${ext}`))
+          if (file.exists) {
+            setExistingIconUri(file.uri)
+            return
+          }
+        }
+        setExistingIconUri(undefined)
+      }
+    }, [mode, providerId])
 
     useEffect(() => {
       if (!isVisible) return
@@ -157,9 +173,7 @@ export const AddProviderSheet = forwardRef<BottomSheetModal, ProviderSheetProps>
               <YStack className="w-full items-center justify-center gap-6">
                 <ProviderIconButton
                   providerId={providerId}
-                  iconUri={
-                    mode === 'edit' ? new File(Paths.join(DEFAULT_ICONS_STORAGE, `${providerId}.png`)).uri : undefined
-                  }
+                  iconUri={mode === 'edit' ? existingIconUri : undefined}
                   onImageSelected={handleImageSelected}
                 />
                 <YStack className="w-full gap-2">
