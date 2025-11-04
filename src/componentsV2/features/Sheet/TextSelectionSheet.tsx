@@ -23,9 +23,9 @@ export interface TextSelectionSheetRef {
 function SelectableText({ children }) {
   if (Platform.OS === 'ios') {
     return (
-      <TextField className="h-full w-full">
+      <TextField className="w-full">
         <TextField.Input
-          className="h-full w-full rounded-none border-0 px-4 text-sm leading-6"
+          className="w-full rounded-none border-0 px-4 py-4 text-sm leading-6"
           multiline
           editable={false}
           value={children}
@@ -33,7 +33,11 @@ function SelectableText({ children }) {
       </TextField>
     )
   } else {
-    return <Text className="text-sm leading-6">{children}</Text>
+    return (
+      <Text className="px-4 py-4 text-sm leading-6" selectable>
+        {children}
+      </Text>
+    )
   }
 }
 
@@ -95,9 +99,7 @@ const TextSelectionSheet = forwardRef<TextSelectionSheetRef, TextSelectionSheetP
         </XStack>
         <BottomSheetScrollView
           contentContainerStyle={{
-            flex: 1,
-            height: '100%',
-            width: '100%'
+            flexGrow: 1
           }}>
           <SelectableText>{content}</SelectableText>
         </BottomSheetScrollView>
