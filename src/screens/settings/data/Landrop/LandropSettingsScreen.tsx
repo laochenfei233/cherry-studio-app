@@ -8,6 +8,7 @@ import { useTranslation } from 'react-i18next'
 import { HeaderBar, RestoreProgressModal, SafeAreaContainer, Text, YStack } from '@/componentsV2'
 import { DEFAULT_BACKUP_STORAGE } from '@/constants/storage'
 import { useAppState } from '@/hooks/useAppState'
+import { useDialog } from '@/hooks/useDialog'
 import { LANDROP_RESTORE_STEPS, RESTORE_STEP_CONFIGS, useRestore } from '@/hooks/useRestore'
 import { useCurrentTopic } from '@/hooks/useTopic'
 import { useWebSocket, WebSocketStatus } from '@/hooks/useWebSocket'
@@ -28,7 +29,9 @@ export default function LandropSettingsScreen() {
   const { setWelcomeShown } = useAppState()
   const { switchTopic } = useCurrentTopic()
   const { status, filename, connect, disconnect } = useWebSocket()
+  const dialog = useDialog()
   const [scannedIP, setScannedIP] = useState<string | null>(null)
+  const [hasShownDisconnectDialog, setHasShownDisconnectDialog] = useState(false)
   const { isModalOpen, restoreSteps, overallStatus, startRestore, closeModal, updateStepStatus, openModal } =
     useRestore({
       stepConfigs: LANDROP_RESTORE_STEPS
@@ -51,10 +54,29 @@ export default function LandropSettingsScreen() {
   useEffect(() => {
     if (status === WebSocketStatus.DISCONNECTED) {
       setScannedIP(null)
-
       hasScannedRef.current = false
+
+      if (!hasShownDisconnectDialog) {
+        setHasShownDisconnectDialog(true)
+        dialog.open({
+          type: 'error',
+          title: t('settings.data.landrop.scan_qr_code.disconnected_title'),
+          content: t('settings.data.landrop.scan_qr_code.disconnected_message'),
+          showCancel: false,
+          maskClosable: false,
+          onConFirm: () => {
+            navigation.goBack()
+          }
+        })
+      }
     }
-  }, [status])
+  }, [status, dialog, hasShownDisconnectDialog, navigation, t])
+
+  useEffect(() => {
+    if (status !== WebSocketStatus.DISCONNECTED && hasShownDisconnectDialog) {
+      setHasShownDisconnectDialog(false)
+    }
+  }, [status, hasShownDisconnectDialog])
 
   // 监听 WebSocket 状态，更新文件接收步骤
   useEffect(() => {
