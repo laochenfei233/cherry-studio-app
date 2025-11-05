@@ -37,7 +37,7 @@ export class CherryinAPIClient extends OpenAIAPIClient {
     const models = ['glm-4.5-flash', 'Qwen/Qwen3-8B']
 
     const created = Date.now()
-    return models.map((id) => ({
+    return models.map(id => ({
       id,
       owned_by: 'cherryai',
       object: 'model' as const,

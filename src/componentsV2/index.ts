@@ -49,6 +49,7 @@ export { default as ModelGroup, type ModelGroupProps } from './features/ModelGro
 export { default as Searching } from './features/Searching'
 export { RestoreProgressModal } from './features/SettingsScreen/RestoreProgressModal'
 export { CitationSheet } from './features/Sheet/CitationSheet'
+export { McpServerSheet } from './features/Sheet/McpServerSheet'
 export { ReasoningSheet } from './features/Sheet/ReasoningSheet'
 export { ToolSheet } from './features/Sheet/ToolSheet'
 export { ToolUseSheet } from './features/Sheet/ToolUseSheet'

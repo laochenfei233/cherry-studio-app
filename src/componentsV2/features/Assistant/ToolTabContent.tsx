@@ -1,20 +1,18 @@
 import type { BottomSheetModal } from '@gorhom/bottom-sheet'
 import { MotiView } from 'moti'
-import React, { useRef } from 'react'
+import React, { useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Pressable } from 'react-native'
 
+import { McpServerSheet, ToolUseSheet, WebsearchSheet } from '@/componentsV2'
 import Text from '@/componentsV2/base/Text'
 import { Globe, SquareFunction, WebsearchProviderIcon, Wrench } from '@/componentsV2/icons'
 import RowRightArrow from '@/componentsV2/layout/Row/RowRightArrow'
 import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
+import { useActiveMcpServers } from '@/hooks/useMcp'
 import { useWebsearchProviders } from '@/hooks/useWebsearchProviders'
 import type { Assistant } from '@/types/assistant'
-
-import { McpServerSheet } from '../Sheet/McpServerSheet'
-import { ToolUseSheet } from '../Sheet/ToolUseSheet'
-import { WebsearchSheet } from '../Sheet/WebsearchSheet'
 
 interface ToolTabContentProps {
   assistant: Assistant
@@ -27,6 +25,13 @@ export function ToolTabContent({ assistant, updateAssistant }: ToolTabContentPro
   const websearchSheetRef = useRef<BottomSheetModal>(null)
   const mcpServerSheetRef = useRef<BottomSheetModal>(null)
   const { apiProviders } = useWebsearchProviders()
+  const { activeMcpServers } = useActiveMcpServers()
+
+  // Calculate active MCP count based on real-time active MCP servers
+  const activeMcpCount = useMemo(() => {
+    const assistantMcpIds = assistant.mcpServers?.map(mcp => mcp.id) ?? []
+    return activeMcpServers.filter(mcp => assistantMcpIds.includes(mcp.id)).length
+  }, [assistant.mcpServers, activeMcpServers])
 
   const handleToolUsePress = () => {
     toolUseSheetRef.current?.present()
@@ -145,8 +150,8 @@ export function ToolTabContent({ assistant, updateAssistant }: ToolTabContentPro
             onPress={handleMcpServerPress}
             className="flex-row items-center justify-between rounded-lg bg-ui-card-background px-3 py-3 active:opacity-80 dark:bg-ui-card-background-dark">
             <XStack className="flex-1 items-center gap-2">
-              {assistant.mcpServers && assistant.mcpServers.length > 0 ? (
-                <Text>{t('mcp.server.selected', { num: assistant.mcpServers.length })}</Text>
+              {activeMcpCount > 0 ? (
+                <Text>{t('mcp.server.selected', { num: activeMcpCount })}</Text>
               ) : (
                 <Text
                   className="flex-1 text-base text-text-secondary dark:text-text-secondary"

@@ -40,7 +40,9 @@ export const McpServerSheet: FC<McpServerProps> = ({ ref, assistant, updateAssis
       label: mcpServer.name,
       isSelected: !!assistant.mcpServers?.find(s => s.id === mcpServer.id),
       onSelect: async () => {
-        const currentMcpServers = assistant.mcpServers || []
+        // Filter out inactive MCPs to keep data consistent
+        const activeMcpIds = new Set(activeMcpServers.map(s => s.id))
+        const currentMcpServers = (assistant.mcpServers || []).filter(s => activeMcpIds.has(s.id))
         const exists = currentMcpServers.some(s => s.id === mcpServer.id)
 
         const updatedMcpServers = exists
