@@ -86,6 +86,20 @@ export async function deleteMessagesByTopicId(topicId: string): Promise<void> {
 }
 
 /**
+ * 根据助手 ID 删除该助手下的所有消息
+ * @param assistantId - 助手的唯一标识符
+ * @throws 当删除操作失败时抛出错误
+ */
+export async function deleteMessagesByAssistantId(assistantId: string): Promise<void> {
+  try {
+    await db.delete(messages).where(eq(messages.assistant_id, assistantId))
+  } catch (error) {
+    logger.error(`Error deleting messages for assistant ID ${assistantId}:`, error)
+    throw error
+  }
+}
+
+/**
  * 根据消息 ID 删除指定消息
  * @param messageId - 消息的唯一标识符
  * @throws 当删除操作失败时抛出错误

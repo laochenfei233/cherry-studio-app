@@ -18,7 +18,7 @@ import { assistantService } from '@/services/AssistantService'
 import { loggerService } from '@/services/LoggerService'
 import { topicService } from '@/services/TopicService'
 import type { Assistant } from '@/types/assistant'
-import type { HomeNavigationProps } from '@/types/naviagate'
+import type { DrawerNavigationProps } from '@/types/naviagate'
 
 import EmojiAvatar from './EmojiAvatar'
 
@@ -31,7 +31,7 @@ interface AssistantItemProps {
 
 const AssistantItem: FC<AssistantItemProps> = ({ assistant, onAssistantPress }) => {
   const { t } = useTranslation()
-  const navigation = useNavigation<HomeNavigationProps>()
+  const navigation = useNavigation<DrawerNavigationProps>()
   const toast = useToast()
   const { isDark } = useTheme()
 
@@ -41,14 +41,22 @@ const AssistantItem: FC<AssistantItemProps> = ({ assistant, onAssistantPress }) 
 
   const handleDelete = async () => {
     try {
-      const isTopicOwnedByAssistant = await topicService.isTopicOwnedByAssistant(assistant.id, getCurrentTopicId())
+      const currentTopicId = getCurrentTopicId()
+      const isTopicOwnedByAssistant = await topicService.isTopicOwnedByAssistant(assistant.id, currentTopicId)
 
+      // If deleting current topic, create a new topic with default assistant first
       if (isTopicOwnedByAssistant) {
-        navigation.navigate('ChatScreen', { topicId: 'new' })
+        const defaultAssistant = await assistantService.getAssistant('default')
+        if (defaultAssistant) {
+          const newTopic = await topicService.createTopic(defaultAssistant)
+          await topicService.switchToTopic(newTopic.id)
+          navigation.navigate('Home', { screen: 'ChatScreen', params: { topicId: newTopic.id } })
+          logger.info('Created and switched to new topic before deletion')
+        }
       }
 
-      await assistantService.deleteAssistant(assistant.id)
       await topicService.deleteTopicsByAssistantId(assistant.id)
+      await assistantService.deleteAssistant(assistant.id)
       toast.show(t('message.assistant_deleted'))
     } catch (error) {
       logger.error('Delete Assistant error', error)
