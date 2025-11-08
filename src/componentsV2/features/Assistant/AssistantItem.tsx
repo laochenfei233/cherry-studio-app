@@ -1,5 +1,4 @@
 import { useNavigation } from '@react-navigation/native'
-import { useTheme } from 'heroui-native'
 import { isEmpty } from 'lodash'
 import type { FC } from 'react'
 import React from 'react'
@@ -12,6 +11,7 @@ import Text from '@/componentsV2/base/Text'
 import { Trash2 } from '@/componentsV2/icons/LucideIcon'
 import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
+import { useTheme } from '@/hooks/useTheme'
 import { useToast } from '@/hooks/useToast'
 import { getCurrentTopicId } from '@/hooks/useTopic'
 import { assistantService } from '@/services/AssistantService'
@@ -76,7 +76,7 @@ const AssistantItem: FC<AssistantItemProps> = ({ assistant, onAssistantPress }) 
 
   return (
     <ContextMenu borderRadius={16} list={contextMenuItems} onPress={handlePress}>
-      <View className="items-center justify-between rounded-2xl bg-ui-card-background px-2.5 py-2.5 dark:bg-ui-card-background-dark">
+      <View className="bg-ui-card-background items-center justify-between rounded-2xl px-2.5 py-2.5">
         <XStack className="gap-3.5">
           <EmojiAvatar
             emoji={assistant.emoji}
@@ -90,10 +90,7 @@ const AssistantItem: FC<AssistantItemProps> = ({ assistant, onAssistantPress }) 
               {assistant.name}
             </Text>
             {!isEmpty(assistant.prompt) && (
-              <Text
-                ellipsizeMode="tail"
-                numberOfLines={1}
-                className="text-xs  text-text-secondary dark:text-text-secondary-dark">
+              <Text ellipsizeMode="tail" numberOfLines={1} className="text-text-secondary  text-xs">
                 {assistant.prompt}
               </Text>
             )}

@@ -1,11 +1,11 @@
 import { LinearGradient } from 'expo-linear-gradient'
-import { useTheme } from 'heroui-native'
 import React from 'react'
 import { TouchableOpacity } from 'react-native'
 import type { EmojiType } from 'rn-emoji-keyboard'
 import EmojiPicker from 'rn-emoji-keyboard'
 
 import YStack from '@/componentsV2/layout/YStack'
+import { useTheme } from '@/hooks/useTheme'
 
 import Text from '../Text'
 
@@ -55,9 +55,7 @@ export function AvatarEditButton({
           })
         }}>
         {isEmoji ? (
-          <Text
-            style={{ fontSize: size * 0.5, lineHeight: size * 0.5 }}
-            className="text-text-primary dark:text-text-primary-dark">
+          <Text style={{ fontSize: size * 0.5, lineHeight: size * 0.5 }} className="text-text-primary">
             {content}
           </Text>
         ) : (

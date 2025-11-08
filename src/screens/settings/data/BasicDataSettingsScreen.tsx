@@ -266,7 +266,7 @@ export default function BasicDataSettingsScreen() {
   ]
 
   return (
-    <SafeAreaContainer style={{ flex: 1 }}>
+    <SafeAreaContainer>
       <HeaderBar title={t('settings.data.basic_title')} />
 
       <Container>
@@ -318,7 +318,7 @@ function SettingItem({ title, screen, icon, subtitle, danger, onPress, disabled 
       <XStack className="items-center gap-3">
         {icon}
         <YStack>
-          <Text className={danger ? 'text-red-500 dark:text-red-500' : ''}>{title}</Text>
+          <Text className={danger ? 'text-red-500' : ''}>{title}</Text>
           {subtitle && <Text className="text-sm">{subtitle}</Text>}
         </YStack>
       </XStack>

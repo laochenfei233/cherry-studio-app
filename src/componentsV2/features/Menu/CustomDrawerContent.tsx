@@ -1,5 +1,5 @@
 import type { DrawerContentComponentProps } from '@react-navigation/drawer'
-import { Divider, useTheme } from 'heroui-native'
+import { Divider } from 'heroui-native'
 import React from 'react'
 import { useTranslation } from 'react-i18next'
 import { View } from 'react-native'
@@ -14,6 +14,7 @@ import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
 import { useSafeArea } from '@/hooks/useSafeArea'
 import { useSettings } from '@/hooks/useSettings'
+import { useTheme } from '@/hooks/useTheme'
 import { useTopics } from '@/hooks/useTopic'
 
 import { TopicList } from '../TopicList'
@@ -66,7 +67,7 @@ export default function CustomDrawerContent(props: DrawerContentComponentProps) 
             onPress={handleNavigateAssistantScreen}>
             <XStack className="items-center justify-center gap-2.5">
               <UnionIcon size={24} />
-              <Text className="text-base ">{t('assistants.market.my_assistant')}</Text>
+              <Text className="text-base">{t('assistants.market.my_assistant')}</Text>
             </XStack>
             <RowRightArrow />
           </PressableRow>
@@ -76,7 +77,7 @@ export default function CustomDrawerContent(props: DrawerContentComponentProps) 
             onPress={handleNavigateMcpMarketScreen}>
             <XStack className="items-center justify-center gap-2.5">
               <MCPIcon size={24} />
-              <Text className="text-base ">{t('mcp.market.title')}</Text>
+              <Text className="text-base">{t('mcp.market.title')}</Text>
             </XStack>
             <RowRightArrow />
           </PressableRow>

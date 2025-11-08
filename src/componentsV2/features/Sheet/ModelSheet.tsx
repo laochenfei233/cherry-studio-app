@@ -1,7 +1,7 @@
 import { BottomSheetBackdrop, BottomSheetModal, useBottomSheetScrollableCreator } from '@gorhom/bottom-sheet'
 import { LegendList } from '@legendapp/list'
 import { useNavigation } from '@react-navigation/native'
-import { Button, useTheme } from 'heroui-native'
+import { Button } from 'heroui-native'
 import { sortBy } from 'lodash'
 import debounce from 'lodash/debounce'
 import React, { forwardRef, useEffect, useMemo, useState } from 'react'
@@ -18,6 +18,7 @@ import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
 import { isEmbeddingModel, isRerankModel } from '@/config/models'
 import { useAllProviders } from '@/hooks/useProviders'
+import { useTheme } from '@/hooks/useTheme'
 import type { Model, Provider } from '@/types/assistant'
 import type { HomeNavigationProps } from '@/types/naviagate'
 import { getModelUniqId } from '@/utils/model'
@@ -215,11 +216,11 @@ const ModelSheet = forwardRef<BottomSheetModal, ModelSheetProps>(({ mentions, se
                   <XStack className="items-center justify-center">
                     <ProviderIcon provider={item.provider} size={24} />
                   </XStack>
-                  <Text className="text-lg font-bold text-gray-80 dark:text-gray-80">{item.label.toUpperCase()}</Text>
+                  <Text className="text-lg font-bold text-gray-400 ">{item.label.toUpperCase()}</Text>
                 </XStack>
                 {item.provider.id !== 'cherryai' && (
                   <TouchableOpacity onPress={() => navigateToProvidersSetting(item.provider)}>
-                    <Settings className="text-gray-80 dark:text-gray-80" size={16} />
+                    <Settings className="text-gray-80" size={16} />
                   </TouchableOpacity>
                 )}
               </TouchableOpacity>
@@ -233,9 +234,7 @@ const ModelSheet = forwardRef<BottomSheetModal, ModelSheetProps>(({ mentions, se
               activeOpacity={0.7}
               onPress={() => handleModelToggle(item.value)}
               className={`justify-between rounded-lg border px-2 py-2 ${
-                isSelected
-                  ? 'border-green-20 bg-green-10 dark:border-green-dark-20 dark:bg-green-dark-10'
-                  : 'border-transparent bg-transparent'
+                isSelected ? 'border-green-20 bg-green-10' : 'border-transparent bg-transparent'
               }`}>
               <XStack className="w-full flex-1 items-center justify-between gap-2">
                 <XStack className="max-w-[80%] flex-1 items-center gap-2">
@@ -243,11 +242,7 @@ const ModelSheet = forwardRef<BottomSheetModal, ModelSheetProps>(({ mentions, se
                     <ModelIcon model={item.model} size={24} />
                   </XStack>
                   <Text
-                    className={`flex-1 ${
-                      isSelected
-                        ? 'text-green-100 dark:text-green-dark-100'
-                        : 'text-text-primary dark:text-text-primary-dark'
-                    }`}
+                    className={`flex-1 ${isSelected ? 'text-green-100' : 'text-text-primary'}`}
                     numberOfLines={1}
                     ellipsizeMode="tail">
                     {item.label}
@@ -280,31 +275,20 @@ const ModelSheet = forwardRef<BottomSheetModal, ModelSheetProps>(({ mentions, se
                 <Button
                   size="sm"
                   className={`rounded-full ${
-                    isMultiSelectActive
-                      ? 'border border-green-20 bg-green-10 dark:border-green-dark-20 dark:bg-green-dark-10'
-                      : 'border border-transparent bg-ui-card dark:bg-ui-card-dark'
+                    isMultiSelectActive ? 'border-green-20 bg-green-10 border' : 'bg-ui-card border border-transparent'
                   }`}
                   onPress={toggleMultiSelectMode}>
                   <Button.Label>
-                    <Text
-                      className={
-                        isMultiSelectActive
-                          ? 'text-green-100 dark:text-green-dark-100'
-                          : 'text-text-primary dark:text-text-primary-dark'
-                      }>
+                    <Text className={isMultiSelectActive ? 'text-green-100' : 'text-text-primary'}>
                       {t('button.multiple')}
                     </Text>
                   </Button.Label>
                 </Button>
               )}
               {multiple && isMultiSelectActive && (
-                <Button
-                  size="sm"
-                  className="rounded-full bg-ui-card dark:bg-ui-card-dark"
-                  isIconOnly
-                  onPress={handleClearAll}>
+                <Button size="sm" className="bg-ui-card rounded-full" isIconOnly onPress={handleClearAll}>
                   <Button.Label>
-                    <BrushCleaning size={18} className="text-text-primary dark:text-text-primary-dark" />
+                    <BrushCleaning size={18} className="text-text-primary" />
                   </Button.Label>
                 </Button>
               )}

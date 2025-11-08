@@ -1,5 +1,4 @@
 import { useNavigation } from '@react-navigation/native'
-import { useTheme } from 'heroui-native'
 import type { FC } from 'react'
 import React, { useEffect, useRef, useState } from 'react'
 import ContentLoader, { Rect } from 'react-content-loader/native'
@@ -14,6 +13,7 @@ import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
 import { useAssistant } from '@/hooks/useAssistant'
 import { useDialog } from '@/hooks/useDialog'
+import { useTheme } from '@/hooks/useTheme'
 import { useToast } from '@/hooks/useToast'
 import i18n from '@/i18n'
 import { fetchTopicNaming } from '@/services/ApiService'
@@ -164,13 +164,13 @@ export const TopicItem: FC<TopicItemProps> = ({
         {
           title: t('button.generate_topic_name'),
           iOSIcon: 'sparkles',
-          androidIcon: <Sparkles size={16} className="text-text-primary dark:text-text-primary-dark" />,
+          androidIcon: <Sparkles size={16} className="text-text-primary" />,
           onSelect: handleGenerateName
         },
         {
           title: t('button.rename_topic_name'),
           iOSIcon: 'rectangle.and.pencil.and.ellipsis',
-          androidIcon: <Edit3 size={16} className="text-text-primary dark:text-text-primary-dark" />,
+          androidIcon: <Edit3 size={16} className="text-text-primary" />,
           onSelect: handleRename
         },
         {
@@ -185,7 +185,7 @@ export const TopicItem: FC<TopicItemProps> = ({
       onPress={openTopic}>
       <XStack
         className={`items-center justify-center gap-1.5 rounded-lg px-1 py-1 ${
-          isActive ? 'bg-green-10 dark:bg-green-10' : 'bg-transparent'
+          isActive ? 'bg-green-10' : 'bg-transparent'
         }`}>
         <EmojiAvatar
           emoji={assistant?.emoji}
@@ -199,17 +199,12 @@ export const TopicItem: FC<TopicItemProps> = ({
             <Text className="flex-1 text-base font-bold" numberOfLines={1} ellipsizeMode="tail">
               {assistant?.name}
             </Text>
-            <Text className="text-wrap-none shrink-0 text-xs text-text-secondary dark:text-text-secondary-dark">
-              {displayTime}
-            </Text>
+            <Text className="text-wrap-none text-text-secondary shrink-0 text-xs">{displayTime}</Text>
           </XStack>
           {isGeneratingName ? (
             <TopicNameSkeleton isDark={isDark} />
           ) : (
-            <Text
-              className="text-[13px] font-normal text-text-secondary dark:text-text-secondary-dark"
-              numberOfLines={1}
-              ellipsizeMode="tail">
+            <Text className="text-text-secondary text-[13px] font-normal" numberOfLines={1} ellipsizeMode="tail">
               {topic.name}
             </Text>
           )}

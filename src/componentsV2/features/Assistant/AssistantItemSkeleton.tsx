@@ -1,13 +1,14 @@
-import { useTheme } from 'heroui-native'
 import type { FC } from 'react'
 import React from 'react'
 import ContentLoader, { Rect } from 'react-content-loader/native'
 import { View } from 'react-native'
 
+import { useTheme } from '@/hooks/useTheme'
+
 const AssistantItemSkeleton: FC = () => {
   const { isDark } = useTheme()
   return (
-    <View className="rounded-2xl bg-ui-card-background px-2.5 py-2.5 dark:bg-ui-card-background-dark">
+    <View className="bg-ui-card-background rounded-2xl px-2.5 py-2.5">
       <ContentLoader
         height={46}
         width={300}

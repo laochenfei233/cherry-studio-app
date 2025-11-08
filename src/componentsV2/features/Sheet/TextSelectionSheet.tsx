@@ -1,5 +1,4 @@
 import { BottomSheetBackdrop, BottomSheetModal, BottomSheetScrollView } from '@gorhom/bottom-sheet'
-import { useTheme } from 'heroui-native'
 import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { BackHandler, Platform, TouchableOpacity } from 'react-native'
@@ -9,6 +8,7 @@ import TextField from '@/componentsV2/base/TextField'
 import { X } from '@/componentsV2/icons'
 import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
+import { useTheme } from '@/hooks/useTheme'
 
 interface TextSelectionSheetProps {
   content: string
@@ -84,7 +84,7 @@ const TextSelectionSheet = forwardRef<TextSelectionSheetRef, TextSelectionSheetP
       onDismiss={() => setIsVisible(false)}
       onChange={index => setIsVisible(index >= 0)}>
       <YStack className="flex-1">
-        <XStack className="items-center justify-between border-b border-black/10 px-4 pb-4 dark:border-white/10">
+        <XStack className="items-center justify-between border-b border-black/10 px-4 pb-4">
           <Text className="text-base font-bold">{t('common.select_text')}</Text>
           <TouchableOpacity
             style={{

@@ -1,5 +1,4 @@
 import { BottomSheetBackdrop, BottomSheetModal, BottomSheetScrollView, BottomSheetView } from '@gorhom/bottom-sheet'
-import { useTheme } from 'heroui-native'
 import React, { forwardRef, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ActivityIndicator, BackHandler } from 'react-native'
@@ -9,6 +8,7 @@ import Text from '@/componentsV2/base/Text'
 import { CircleCheck, RefreshCw, XCircle } from '@/componentsV2/icons/LucideIcon'
 import XStack from '@/componentsV2/layout/XStack'
 import YStack from '@/componentsV2/layout/YStack'
+import { useTheme } from '@/hooks/useTheme'
 import { loggerService } from '@/services/LoggerService'
 import { modelHealthService } from '@/services/ModelHealthService'
 import type { Model, ModelHealth, Provider } from '@/types/assistant'
@@ -128,10 +128,8 @@ export const ModelHealthCheckSheet = forwardRef<BottomSheetModal, ModelHealthChe
               <Text className="text-xl font-semibold">{t('settings.models.health_check.title')}</Text>
               {isChecking && (
                 <XStack className="items-center gap-2">
-                  <RefreshCw size={16} className="animate-spin text-text-secondary dark:text-text-secondary-dark" />
-                  <Text className="text-sm text-text-secondary dark:text-text-secondary-dark">
-                    {t('settings.models.health_check.checking')}
-                  </Text>
+                  <RefreshCw size={16} className="text-text-secondary animate-spin" />
+                  <Text className="text-text-secondary text-sm">{t('settings.models.health_check.checking')}</Text>
                 </XStack>
               )}
             </XStack>
@@ -145,7 +143,7 @@ export const ModelHealthCheckSheet = forwardRef<BottomSheetModal, ModelHealthChe
                   return (
                     <XStack
                       key={model.id}
-                      className="dark:border-border-dark w-full items-center justify-between rounded-2xl border border-border bg-background-secondary px-4 py-3 dark:bg-background-secondary-dark">
+                      className="border-border bg-background-secondary w-full items-center justify-between rounded-2xl border px-4 py-3">
                       <YStack className="flex-1 gap-1">
                         <Text className="text-sm font-medium" numberOfLines={1}>
                           {model.name || model.id}
@@ -158,7 +156,7 @@ export const ModelHealthCheckSheet = forwardRef<BottomSheetModal, ModelHealthChe
                       </YStack>
 
                       <XStack className="items-center gap-3">
-                        <Text className="min-w-[60px] text-right font-mono text-sm text-text-secondary dark:text-text-secondary-dark">
+                        <Text className="text-text-secondary min-w-[60px] text-right font-mono text-sm">
                           {latencyText}
                         </Text>
                         {health && getStatusIcon(health.status)}
