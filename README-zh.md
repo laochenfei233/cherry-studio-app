@@ -70,6 +70,7 @@ cd android # 配置 Android SDK 路径到 local.properties
 
 npx expo run:android -d
 ```
+
 ### Android SDK 配置
 
 #### Windows 用户：
@@ -79,11 +80,13 @@ npx expo run:android -d
 ```
 sdk.dir=C:\\Users\\您的用户名\\AppData\\Local\\Android\\sdk
 ```
+
 或者（新版本 Android Studio 适用）：
 
 ```
 sdk.dir=C\:\\Users\\您的用户名\\AppData\\Local\\Android\\sdk
 ```
+
 注意将 `您的用户名` 替换为你的实际电脑用户名，且确保文件夹名称为 sdk 或 Sdk。
 
 #### Mac 用户：
@@ -91,6 +94,7 @@ sdk.dir=C\:\\Users\\您的用户名\\AppData\\Local\\Android\\sdk
 ```
 sdk.dir = /Users/用户名/Library/Android/sdk
 ```
+
 请将 `用户名` 替换为你的 macOS 用户名。
 
 你也可以通过环境变量设置：
@@ -105,6 +109,7 @@ export PATH="$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/tools"
 ```
 sdk.dir = /home/用户名/Android/Sdk
 ```
+
 将 `用户名` 替换为你的 Linux 用户名。
 
 > 请使用真机或者模拟器开发，不要使用Expo Go

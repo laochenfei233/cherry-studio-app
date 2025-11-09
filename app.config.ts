@@ -10,7 +10,8 @@ export default {
     name: 'Cherry Studio',
     slug: 'cherry-studio',
     version: appVersion,
-    orientation: 'portrait',
+    // orientation: 'portrait', 锁定竖屏
+    orientation: 'default',
     icon: './src/assets/images/favicon.png',
     scheme: 'cherry-studio',
     userInterfaceStyle: 'automatic',
