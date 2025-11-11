@@ -59,7 +59,7 @@ export default {
         'expo-splash-screen',
         {
           image: './src/assets/images/ios-splash-icon.png',
-          imageWidth: 200,
+          imageWidth: 144,
           resizeMode: 'contain',
           backgroundColor: '#ffffff',
           dark: {
@@ -79,11 +79,11 @@ export default {
           },
           android: {
             splash: {
-              image: './src/assets/images/splash-icon.png',
+              image: './src/assets/images/ios-splash-icon.png',
               backgroundColor: '#ffffff',
               resizeMode: 'contain',
               dark: {
-                image: './src/assets/images/splash-icon.png',
+                image: './src/assets/images/ios-splash-icon.png',
                 backgroundColor: '#000000'
               }
             }
