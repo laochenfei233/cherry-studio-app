@@ -1,0 +1,703 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 6e4288d..544ec44 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -30,18 +30,22 @@ export class AiSdkToChunkAdapter {
+   private onSessionUpdate?: (sessionId: string) => void
+   private responseStartTimestamp: number | null = null
+   private firstTokenTimestamp: number | null = null
++  private hasTextContent = false
++  private getSessionWasCleared?: () => boolean
+ 
+   constructor(
+     private onChunk: (chunk: Chunk) => void,
+     mcpTools: MCPTool[] = [],
+     accumulate?: boolean,
+     enableWebSearch?: boolean,
+-    onSessionUpdate?: (sessionId: string) => void
++    onSessionUpdate?: (sessionId: string) => void,
++    getSessionWasCleared?: () => boolean
+   ) {
+     this.toolCallHandler = new ToolCallChunkHandler(onChunk, mcpTools)
+     this.accumulate = accumulate
+     this.enableWebSearch = enableWebSearch || false
+     this.onSessionUpdate = onSessionUpdate
++    this.getSessionWasCleared = getSessionWasCleared
+   }
+ 
+   private markFirstTokenIfNeeded() {
+@@ -84,8 +88,9 @@ export class AiSdkToChunkAdapter {
+     }
+     this.resetTimingState()
+     this.responseStartTimestamp = Date.now()
+-    // Reset link converter state at the start of stream
++    // Reset state at the start of stream
+     this.isFirstChunk = true
++    this.hasTextContent = false
+ 
+     try {
+       while (true) {
+@@ -129,6 +134,8 @@ export class AiSdkToChunkAdapter {
+         const agentRawMessage = chunk.rawValue as ClaudeCodeRawValue
+         if (agentRawMessage.type === 'init' && agentRawMessage.session_id) {
+           this.onSessionUpdate?.(agentRawMessage.session_id)
++        } else if (agentRawMessage.type === 'compact' && agentRawMessage.session_id) {
++          this.onSessionUpdate?.(agentRawMessage.session_id)
+         }
+         this.onChunk({
+           type: ChunkType.RAW,
+@@ -143,6 +150,7 @@ export class AiSdkToChunkAdapter {
+         })
+         break
+       case 'text-delta': {
++        this.hasTextContent = true
+         const processedText = chunk.text || ''
+         let finalText: string
+ 
+@@ -301,6 +309,25 @@ export class AiSdkToChunkAdapter {
+       }
+ 
+       case 'finish': {
++        // Check if session was cleared (e.g., /clear command) and no text was output
++        const sessionCleared = this.getSessionWasCleared?.() ?? false
++        if (sessionCleared && !this.hasTextContent) {
++          // Inject a "context cleared" message for the user
++          const clearMessage = '✨ Context cleared. Starting fresh conversation.'
++          this.onChunk({
++            type: ChunkType.TEXT_START
++          })
++          this.onChunk({
++            type: ChunkType.TEXT_DELTA,
++            text: clearMessage
++          })
++          this.onChunk({
++            type: ChunkType.TEXT_COMPLETE,
++            text: clearMessage
++          })
++          final.text = clearMessage
++        }
++
+         const usage = {
+           completion_tokens: chunk.totalUsage?.outputTokens || 0,
+           prompt_tokens: chunk.totalUsage?.inputTokens || 0,
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index 800d2ff..434b232 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -7,16 +7,17 @@
+  * 2. 暂时保持接口兼容性
+  */
+ 
++import type { GatewayLanguageModelEntry } from '@ai-sdk/gateway'
+ import { createExecutor } from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+ import { addSpan, endSpan } from '@renderer/services/SpanManagerService'
+ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+-import type { Assistant, GenerateImageParams, Model, Provider } from '@renderer/types'
++import { type Assistant, type GenerateImageParams, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { AiSdkModel, StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { SUPPORTED_IMAGE_ENDPOINT_LIST } from '@renderer/utils'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+-import { type ImageModel, type LanguageModel, type Provider as AiSdkProvider, wrapLanguageModel } from 'ai'
++import { gateway, type ImageModel, type LanguageModel, type Provider as AiSdkProvider, wrapLanguageModel } from 'ai'
+ 
+ import AiSdkToChunkAdapter from './chunk/AiSdkToChunkAdapter'
+ import LegacyAiProvider from './legacy/index'
+@@ -439,6 +440,18 @@ export default class ModernAiProvider {
+ 
+   // 代理其他方法到原有实现
+   public async models() {
++    if (this.actualProvider.id === SystemProviderIds['ai-gateway']) {
++      const formatModel = function (models: GatewayLanguageModelEntry[]): Model[] {
++        return models.map((m) => ({
++          id: m.id,
++          name: m.name,
++          provider: 'gateway',
++          group: m.id.split('/')[0],
++          description: m.description ?? undefined
++        }))
++      }
++      return formatModel((await gateway.getAvailableModels()).models)
++    }
+     return this.legacyProvider.models()
+   }
+ 
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index 767cad1..f520162 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -1,5 +1,6 @@
+ import { loggerService } from '@logger'
+ import {
++  getModelSupportedVerbosity,
+   isFunctionCallingModel,
+   isNotSupportTemperatureAndTopP,
+   isOpenAIModel,
+@@ -242,12 +243,18 @@ export abstract class BaseApiClient<
+     return serviceTierSetting
+   }
+ 
+-  protected getVerbosity(): OpenAIVerbosity {
++  protected getVerbosity(model?: Model): OpenAIVerbosity {
+     try {
+       const state = window.store?.getState()
+       const verbosity = state?.settings?.openAI?.verbosity
+ 
+       if (verbosity && ['low', 'medium', 'high'].includes(verbosity)) {
++        // If model is provided, check if the verbosity is supported by the model
++        if (model) {
++          const supportedVerbosity = getModelSupportedVerbosity(model)
++          // Use user's verbosity if supported, otherwise use the first supported option
++          return supportedVerbosity.includes(verbosity) ? verbosity : supportedVerbosity[0]
++        }
+         return verbosity
+       }
+     } catch (error) {
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index 8ff25e3..ad87331 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -35,6 +35,7 @@ import {
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+   isSupportedThinkingTokenZhipuModel,
++  isSupportVerbosityModel,
+   isVisionModel,
+   MODEL_SUPPORTED_REASONING_EFFORT,
+   ZHIPU_RESULT_TOKENS
+@@ -733,6 +734,13 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+           ...modalities,
+           // groq 有不同的 service tier 配置，不符合 openai 接口类型
+           service_tier: this.getServiceTier(model) as OpenAIServiceTier,
++          ...(isSupportVerbosityModel(model)
++            ? {
++                text: {
++                  verbosity: this.getVerbosity(model)
++                }
++              }
++            : {}),
+           ...this.getProviderSpecificParameters(assistant, model),
+           ...reasoningEffort,
+           ...getOpenAIWebSearchParams(model, enableWebSearch),
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index abd1793..9a8d5f8 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -48,9 +48,8 @@ export abstract class OpenAIBaseClient<
+   }
+ 
+   // 仅适用于openai
+-  override getBaseURL(): string {
+-    const host = this.provider.apiHost
+-    return formatApiHost(host)
++  override getBaseURL(isSupportedAPIVerion: boolean = true): string {
++    return formatApiHost(this.provider.apiHost, isSupportedAPIVerion)
+   }
+ 
+   override async generateImage({
+@@ -144,6 +143,11 @@ export abstract class OpenAIBaseClient<
+     }
+ 
+     let apiKeyForSdkInstance = this.apiKey
++    let baseURLForSdkInstance = this.getBaseURL()
++    let headersForSdkInstance = {
++      ...this.defaultHeaders(),
++      ...this.provider.extra_headers
++    }
+ 
+     if (this.provider.id === 'copilot') {
+       const defaultHeaders = store.getState().copilot.defaultHeaders
+@@ -151,6 +155,11 @@ export abstract class OpenAIBaseClient<
+       // this.provider.apiKey不允许修改
+       // this.provider.apiKey = token
+       apiKeyForSdkInstance = token
++      baseURLForSdkInstance = this.getBaseURL(false)
++      headersForSdkInstance = {
++        ...headersForSdkInstance,
++        ...COPILOT_DEFAULT_HEADERS
++      }
+     }
+ 
+     if (this.provider.id === 'azure-openai' || this.provider.type === 'azure-openai') {
+@@ -164,12 +173,8 @@ export abstract class OpenAIBaseClient<
+       this.sdkInstance = new OpenAI({
+         dangerouslyAllowBrowser: true,
+         apiKey: apiKeyForSdkInstance,
+-        baseURL: this.getBaseURL(),
+-        defaultHeaders: {
+-          ...this.defaultHeaders(),
+-          ...this.provider.extra_headers,
+-          ...(this.provider.id === 'copilot' ? COPILOT_DEFAULT_HEADERS : {})
+-        }
++        baseURL: baseURLForSdkInstance,
++        defaultHeaders: headersForSdkInstance
+       }) as TSdkInstance
+     }
+     return this.sdkInstance
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+index b9131be..cfbfdfd 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+@@ -90,7 +90,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+     if (isOpenAILLMModel(model) && !isOpenAIChatCompletionOnlyModel(model)) {
+       if (this.provider.id === 'azure-openai' || this.provider.type === 'azure-openai') {
+         this.provider = { ...this.provider, apiHost: this.formatApiHost() }
+-        if (this.provider.apiVersion === 'preview') {
++        if (this.provider.apiVersion === 'preview' || this.provider.apiVersion === 'v1') {
+           return this
+         } else {
+           return this.client
+@@ -297,7 +297,31 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+ 
+   private convertResponseToMessageContent(response: OpenAI.Responses.Response): ResponseInput {
+     const content: OpenAI.Responses.ResponseInput = []
+-    content.push(...response.output)
++    response.output.forEach((item) => {
++      if (item.type !== 'apply_patch_call' && item.type !== 'apply_patch_call_output') {
++        content.push(item)
++      } else if (item.type === 'apply_patch_call') {
++        if (item.operation !== undefined) {
++          const applyPatchToolCall: OpenAI.Responses.ResponseInputItem.ApplyPatchCall = {
++            ...item,
++            operation: item.operation
++          }
++          content.push(applyPatchToolCall)
++        } else {
++          logger.warn('Undefined tool call operation for ApplyPatchToolCall.')
++        }
++      } else if (item.type === 'apply_patch_call_output') {
++        if (item.output !== undefined) {
++          const applyPatchToolCallOutput: OpenAI.Responses.ResponseInputItem.ApplyPatchCallOutput = {
++            ...item,
++            output: item.output === null ? undefined : item.output
++          }
++          content.push(applyPatchToolCallOutput)
++        } else {
++          logger.warn('Undefined tool call operation for ApplyPatchToolCall.')
++        }
++      }
++    })
+     return content
+   }
+ 
+@@ -496,7 +520,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+           ...(isSupportVerbosityModel(model)
+             ? {
+                 text: {
+-                  verbosity: this.getVerbosity()
++                  verbosity: this.getVerbosity(model)
+                 }
+               }
+             : {}),
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index 4cdbfb6..569b562 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -84,6 +84,8 @@ export async function createAiSdkProvider(config) {
+       config.providerId = `${config.providerId}-chat`
+     } else if (config.providerId === 'azure' && config.options?.mode === 'responses') {
+       config.providerId = `${config.providerId}-responses`
++    } else if (config.providerId === 'cherryin' && config.options?.mode === 'chat') {
++      config.providerId = 'cherryin-chat'
+     }
+     localProvider = await createProviderCore(config.providerId, config.options)
+ 
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 7f279a3..07b4cea 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -171,7 +171,7 @@ export function providerToAiSdkConfig(
+   extraOptions.endpoint = endpoint
+   if (actualProvider.type === 'openai-response' && !isOpenAIChatCompletionOnlyModel(model)) {
+     extraOptions.mode = 'responses'
+-  } else if (aiSdkProviderId === 'openai') {
++  } else if (aiSdkProviderId === 'openai' || (aiSdkProviderId === 'cherryin' && actualProvider.type === 'openai')) {
+     extraOptions.mode = 'chat'
+   }
+ 
+@@ -189,9 +189,11 @@ export function providerToAiSdkConfig(
+     }
+   }
+   // azure
++  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
++  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses?tabs=python-key#responses-api
+   if (aiSdkProviderId === 'azure' || actualProvider.type === 'azure-openai') {
+-    // extraOptions.apiVersion = actualProvider.apiVersion 默认使用v1，不使用azure endpoint
+-    if (actualProvider.apiVersion === 'preview') {
++    // extraOptions.apiVersion = actualProvider.apiVersion === 'preview' ? 'v1' : actualProvider.apiVersion 默认使用v1，不使用azure endpoint
++    if (actualProvider.apiVersion === 'preview' || actualProvider.apiVersion === 'v1') {
+       extraOptions.mode = 'responses'
+     } else {
+       extraOptions.mode = 'chat'
+diff --git a/src/aiCore/provider/providerInitialization.ts b/src/aiCore/provider/providerInitialization.ts
+index 665f2bd..baf4005 100644
+--- a/src/aiCore/provider/providerInitialization.ts
++++ b/src/aiCore/provider/providerInitialization.ts
+@@ -71,6 +71,21 @@ export const NEW_PROVIDER_CONFIGS: ProviderConfig[] = [
+     creatorFunctionName: 'createHuggingFace',
+     supportsImageGeneration: true,
+     aliases: ['hf', 'hugging-face']
++  },
++  {
++    id: 'ai-gateway',
++    name: 'AI Gateway',
++    import: () => import('@ai-sdk/gateway'),
++    creatorFunctionName: 'createGateway',
++    supportsImageGeneration: true,
++    aliases: ['gateway']
++  },
++  {
++    id: 'cerebras',
++    name: 'Cerebras',
++    import: () => import('@ai-sdk/cerebras'),
++    creatorFunctionName: 'createCerebras',
++    supportsImageGeneration: false
+   }
+ ] as const
+ 
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 60d9b1e..128a0f5 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -1,5 +1,12 @@
+ import { baseProviderIdSchema, customProviderIdSchema } from '@cherrystudio/ai-core/provider'
+-import { isOpenAIModel, isQwenMTModel, isSupportFlexServiceTierModel } from '@renderer/config/models'
++import { loggerService } from '@logger'
++import {
++  getModelSupportedVerbosity,
++  isOpenAIModel,
++  isQwenMTModel,
++  isSupportFlexServiceTierModel,
++  isSupportVerbosityModel
++} from '@renderer/config/models'
+ import { isSupportServiceTierProvider } from '@renderer/config/providers'
+ import { mapLanguageToQwenMTModel } from '@renderer/config/translate'
+ import type { Assistant, Model, Provider } from '@renderer/types'
+@@ -26,6 +33,8 @@ import {
+ } from './reasoning'
+ import { getWebSearchParams } from './websearch'
+ 
++const logger = loggerService.withContext('aiCore.utils.options')
++
+ // copy from BaseApiClient.ts
+ const getServiceTier = (model: Model, provider: Provider) => {
+   const serviceTierSetting = provider.serviceTier
+@@ -70,6 +79,7 @@ export function buildProviderOptions(
+     enableGenerateImage: boolean
+   }
+ ): Record<string, any> {
++  logger.debug('buildProviderOptions', { assistant, model, actualProvider, capabilities })
+   const rawProviderId = getAiSdkProviderId(actualProvider)
+   // 构建 provider 特定的选项
+   let providerSpecificOptions: Record<string, any> = {}
+@@ -113,6 +123,9 @@ export function buildProviderOptions(
+         }
+         break
+       }
++      case 'cherryin':
++        providerSpecificOptions = buildCherryInProviderOptions(assistant, model, capabilities, actualProvider)
++        break
+       default:
+         throw new Error(`Unsupported base provider ${baseProviderId}`)
+     }
+@@ -148,11 +161,12 @@ export function buildProviderOptions(
+     ...providerSpecificOptions,
+     ...getCustomParameters(assistant)
+   }
+-  // vertex需要映射到google或anthropic
++
+   const rawProviderKey =
+     {
+       'google-vertex': 'google',
+-      'google-vertex-anthropic': 'anthropic'
++      'google-vertex-anthropic': 'anthropic',
++      'ai-gateway': 'gateway'
+     }[rawProviderId] || rawProviderId
+ 
+   // 返回 AI Core SDK 要求的格式：{ 'providerId': providerOptions }
+@@ -183,6 +197,23 @@ function buildOpenAIProviderOptions(
+       ...reasoningParams
+     }
+   }
++
++  if (isSupportVerbosityModel(model)) {
++    const state = window.store?.getState()
++    const userVerbosity = state?.settings?.openAI?.verbosity
++
++    if (userVerbosity && ['low', 'medium', 'high'].includes(userVerbosity)) {
++      const supportedVerbosity = getModelSupportedVerbosity(model)
++      // Use user's verbosity if supported, otherwise use the first supported option
++      const verbosity = supportedVerbosity.includes(userVerbosity) ? userVerbosity : supportedVerbosity[0]
++
++      providerOptions = {
++        ...providerOptions,
++        textVerbosity: verbosity
++      }
++    }
++  }
++
+   return providerOptions
+ }
+ 
+@@ -270,6 +301,34 @@ function buildXAIProviderOptions(
+   return providerOptions
+ }
+ 
++function buildCherryInProviderOptions(
++  assistant: Assistant,
++  model: Model,
++  capabilities: {
++    enableReasoning: boolean
++    enableWebSearch: boolean
++    enableGenerateImage: boolean
++  },
++  actualProvider: Provider
++): Record<string, any> {
++  const serviceTierSetting = getServiceTier(model, actualProvider)
++
++  switch (actualProvider.type) {
++    case 'openai':
++      return {
++        ...buildOpenAIProviderOptions(assistant, model, capabilities),
++        serviceTier: serviceTierSetting
++      }
++
++    case 'anthropic':
++      return buildAnthropicProviderOptions(assistant, model, capabilities)
++
++    case 'gemini':
++      return buildGeminiProviderOptions(assistant, model, capabilities)
++  }
++  return {}
++}
++
+ /**
+  * Build Bedrock providerOptions
+  */
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 3a36fb6..dfe0841 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -1,3 +1,7 @@
++import type { BedrockProviderOptions } from '@ai-sdk/amazon-bedrock'
++import type { AnthropicProviderOptions } from '@ai-sdk/anthropic'
++import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
++import type { XaiProviderOptions } from '@ai-sdk/xai'
+ import { loggerService } from '@logger'
+ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+ import {
+@@ -7,6 +11,7 @@ import {
+   isDeepSeekHybridInferenceModel,
+   isDoubaoSeedAfter251015,
+   isDoubaoThinkingAutoModel,
++  isGPT51SeriesModel,
+   isGrok4FastReasoningModel,
+   isGrokReasoningModel,
+   isOpenAIDeepResearchModel,
+@@ -56,13 +61,20 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   }
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  if (!reasoningEffort) {
++  // Handle undefined and 'none' reasoningEffort.
++  // TODO: They should be separated.
++  if (!reasoningEffort || reasoningEffort === 'none') {
+     // openrouter: use reasoning
+     if (model.provider === SystemProviderIds.openrouter) {
+       // Don't disable reasoning for Gemini models that support thinking tokens
+       if (isSupportedThinkingTokenGeminiModel(model) && !GEMINI_FLASH_MODEL_REGEX.test(model.id)) {
+         return {}
+       }
++      // 'none' is not an available value for effort for now.
++      // I think they should resolve this issue soon, so I'll just go ahead and use this value.
++      if (isGPT51SeriesModel(model) && reasoningEffort === 'none') {
++        return { reasoning: { effort: 'none' } }
++      }
+       // Don't disable reasoning for models that require it
+       if (
+         isGrokReasoningModel(model) ||
+@@ -109,9 +121,21 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+ 
+     // use thinking, doubao, zhipu, etc.
+     if (isSupportedThinkingTokenDoubaoModel(model) || isSupportedThinkingTokenZhipuModel(model)) {
++      if (provider.id === SystemProviderIds.cerebras) {
++        return {
++          disable_reasoning: true
++        }
++      }
+       return { thinking: { type: 'disabled' } }
+     }
+ 
++    // Specially for GPT-5.1. Suppose this is a OpenAI Compatible provider
++    if (isGPT51SeriesModel(model) && reasoningEffort === 'none') {
++      return {
++        reasoningEffort: 'none'
++      }
++    }
++
+     return {}
+   }
+ 
+@@ -306,6 +330,9 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     return {}
+   }
+   if (isSupportedThinkingTokenZhipuModel(model)) {
++    if (provider.id === SystemProviderIds.cerebras) {
++      return {}
++    }
+     return { thinking: { type: 'enabled' } }
+   }
+ 
+@@ -363,7 +390,7 @@ export function getOpenAIReasoningParams(assistant: Assistant, model: Model): Re
+ 
+ export function getAnthropicThinkingBudget(assistant: Assistant, model: Model): number {
+   const { maxTokens, reasoning_effort: reasoningEffort } = getAssistantSettings(assistant)
+-  if (reasoningEffort === undefined) {
++  if (reasoningEffort === undefined || reasoningEffort === 'none') {
+     return 0
+   }
+   const effortRatio = EFFORT_RATIO[reasoningEffort]
+@@ -385,14 +412,17 @@ export function getAnthropicThinkingBudget(assistant: Assistant, model: Model):
+  * 获取 Anthropic 推理参数
+  * 从 AnthropicAPIClient 中提取的逻辑
+  */
+-export function getAnthropicReasoningParams(assistant: Assistant, model: Model): Record<string, any> {
++export function getAnthropicReasoningParams(
++  assistant: Assistant,
++  model: Model
++): Pick<AnthropicProviderOptions, 'thinking'> {
+   if (!isReasoningModel(model)) {
+     return {}
+   }
+ 
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  if (reasoningEffort === undefined) {
++  if (reasoningEffort === undefined || reasoningEffort === 'none') {
+     return {
+       thinking: {
+         type: 'disabled'
+@@ -418,8 +448,13 @@ export function getAnthropicReasoningParams(assistant: Assistant, model: Model):
+ /**
+  * 获取 Gemini 推理参数
+  * 从 GeminiAPIClient 中提取的逻辑
++ * 注意：Gemini/GCP 端点所使用的 thinkingBudget 等参数应该按照驼峰命名法传递
++ * 而在 Google 官方提供的 OpenAI 兼容端点中则使用蛇形命名法 thinking_budget
+  */
+-export function getGeminiReasoningParams(assistant: Assistant, model: Model): Record<string, any> {
++export function getGeminiReasoningParams(
++  assistant: Assistant,
++  model: Model
++): Pick<GoogleGenerativeAIProviderOptions, 'thinkingConfig'> {
+   if (!isReasoningModel(model)) {
+     return {}
+   }
+@@ -428,11 +463,11 @@ export function getGeminiReasoningParams(assistant: Assistant, model: Model): Re
+ 
+   // Gemini 推理参数
+   if (isSupportedThinkingTokenGeminiModel(model)) {
+-    if (reasoningEffort === undefined) {
++    if (reasoningEffort === undefined || reasoningEffort === 'none') {
+       return {
+         thinkingConfig: {
+-          include_thoughts: false,
+-          ...(GEMINI_FLASH_MODEL_REGEX.test(model.id) ? { thinking_budget: 0 } : {})
++          includeThoughts: false,
++          ...(GEMINI_FLASH_MODEL_REGEX.test(model.id) ? { thinkingBudget: 0 } : {})
+         }
+       }
+     }
+@@ -442,7 +477,7 @@ export function getGeminiReasoningParams(assistant: Assistant, model: Model): Re
+     if (effortRatio > 1) {
+       return {
+         thinkingConfig: {
+-          include_thoughts: true
++          includeThoughts: true
+         }
+       }
+     }
+@@ -452,8 +487,8 @@ export function getGeminiReasoningParams(assistant: Assistant, model: Model): Re
+ 
+     return {
+       thinkingConfig: {
+-        ...(budget > 0 ? { thinking_budget: budget } : {}),
+-        include_thoughts: true
++        ...(budget > 0 ? { thinkingBudget: budget } : {}),
++        includeThoughts: true
+       }
+     }
+   }
+@@ -468,27 +503,35 @@ export function getGeminiReasoningParams(assistant: Assistant, model: Model): Re
+  * @param model - The model being used
+  * @returns XAI-specific reasoning parameters
+  */
+-export function getXAIReasoningParams(assistant: Assistant, model: Model): Record<string, any> {
++export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<XaiProviderOptions, 'reasoningEffort'> {
+   if (!isSupportedReasoningEffortGrokModel(model)) {
+     return {}
+   }
+ 
+   const { reasoning_effort: reasoningEffort } = getAssistantSettings(assistant)
+ 
+-  if (!reasoningEffort) {
++  if (!reasoningEffort || reasoningEffort === 'none') {
+     return {}
+   }
+ 
+-  // For XAI provider Grok models, use reasoningEffort parameter directly
+-  return {
+-    reasoningEffort
++  switch (reasoningEffort) {
++    case 'auto':
++    case 'minimal':
++    case 'medium':
++      return { reasoningEffort: 'low' }
++    case 'low':
++    case 'high':
++      return { reasoningEffort }
+   }
+ }
+ 
+ /**
+  * Get Bedrock reasoning parameters
+  */
+-export function getBedrockReasoningParams(assistant: Assistant, model: Model): Record<string, any> {
++export function getBedrockReasoningParams(
++  assistant: Assistant,
++  model: Model
++): Pick<BedrockProviderOptions, 'reasoningConfig'> {
+   if (!isReasoningModel(model)) {
+     return {}
+   }
+@@ -499,6 +542,14 @@ export function getBedrockReasoningParams(assistant: Assistant, model: Model): R
+     return {}
+   }
+ 
++  if (reasoningEffort === 'none') {
++    return {
++      reasoningConfig: {
++        type: 'disabled'
++      }
++    }
++  }
++
+   // Only apply thinking budget for Claude reasoning models
+   if (!isSupportedThinkingTokenClaudeModel(model)) {
+     return {}
+diff --git a/src/aiCore/utils/websearch.ts b/src/aiCore/utils/websearch.ts
+index fde4ff5..02619b5 100644
+--- a/src/aiCore/utils/websearch.ts
++++ b/src/aiCore/utils/websearch.ts
+@@ -107,6 +107,11 @@ export function buildProviderBuiltinWebSearchConfig(
+         }
+       }
+     }
++    case 'cherryin': {
++      const _providerId =
++        { 'openai-response': 'openai', openai: 'openai-chat' }[model?.endpoint_type ?? ''] ?? model?.endpoint_type
++      return buildProviderBuiltinWebSearchConfig(_providerId, webSearchConfig, model)
++    }
+     default: {
+       return {}
+     }
