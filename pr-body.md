@@ -1,0 +1,86 @@
+## 🤖 Automated Port from CherryHQ/cherry-studio
+
+❌ **Status**: Patch failed to apply (manual porting required)
+
+This PR automatically ports upstream aiCore changes with path transformation:
+`src/renderer/src/aiCore` → `src/aiCore`
+
+### 📊 Changes Summary
+
+- **Files Changed**: 33
+- **Lines Added**: +3541
+- **Lines Removed**: -200
+- **Total Commits**: 13
+- **Source Commit**: [`2c33389`](https://github.com/CherryHQ/cherry-studio/commit/2c3338939ee974b52a59f4e9861db4d5c6cdfab4)
+- **Patch Status**: Patch failed to apply (manual porting required)
+
+### 📝 Upstream Commits
+
+- [`2c33389`](https://github.com/CherryHQ/cherry-studio/commit/2c3338939ee974b52a59f4e9861db4d5c6cdfab4) feat: update Google and OpenAI SDKs with new features and fixes (#11395) - *SuYao* (2025-11-23T23:18:57+08:00)
+- [`fa36112`](https://github.com/CherryHQ/cherry-studio/commit/fa361126b8d8b755c103f99d083a9f6253a6a1d1) refactor: aisdk config (#11402) - *Phantom* (2025-11-23T21:12:57+08:00)
+- [`49903a1`](https://github.com/CherryHQ/cherry-studio/commit/49903a1567963f4bbae2ba221afafcc9fe7db92b) Test/ai-core (#11307) - *SuYao* (2025-11-23T17:33:27+08:00)
+- [`c1f1d79`](https://github.com/CherryHQ/cherry-studio/commit/c1f1d7996d56a7a4f1486b3eafc33a07dca8e5a9) test: add thinking budget token test (#11305) - *SuYao* (2025-11-22T21:43:57+08:00)
+- [`0a72c61`](https://github.com/CherryHQ/cherry-studio/commit/0a72c613af750a3ed2a4359e76b7a080fe32f7a0) fix(openai): apply verbosity setting with type safety improvements (#10964) - *Phantom* (2025-11-22T21:41:12+08:00)
+- [`a1ac320`](https://github.com/CherryHQ/cherry-studio/commit/a1ac3207f1bed6e162e6a054dd3b7fcf02cd70e2) fix/anthropic-vertex (#11397) - *SuYao* (2025-11-22T20:56:05+08:00)
+- [`c48f222`](https://github.com/CherryHQ/cherry-studio/commit/c48f222cdb694d0625bdd7596a25c51512b44b08) feat: add endpoint type support for cherryin provider (#11367) - *defi-failure* (2025-11-21T21:42:08+08:00)
+- [`c8e9a10`](https://github.com/CherryHQ/cherry-studio/commit/c8e9a101907bd5e82f9eac28280b704dbeeecf59) bump ai core version (#11363) - *SuYao* (2025-11-19T18:13:33+08:00)
+- [`40a64a7`](https://github.com/CherryHQ/cherry-studio/commit/40a64a7c9228251cab662c508df5674ffc1d63ba) feat(options): enhance provider key handling for cherryin in buildPro… (#11361) - *MyPrototypeWhat* (2025-11-19T16:25:29+08:00)
+- [`31eec40`](https://github.com/CherryHQ/cherry-studio/commit/31eec403f74750b837b8d5e527a92c5a4759ce76) fix: url context and web search capability (#11306) - *SuYao* (2025-11-17T10:53:47+08:00)
+- [`11fb730`](https://github.com/CherryHQ/cherry-studio/commit/11fb730b4db1e904366fd135594135fc3222e20c) fix: add verbosity parameter support for GPT-5 models across legacy and modern AI SDK (#11281) - *Copilot* (2025-11-16T10:22:14+08:00)
+- [`2511113`](https://github.com/CherryHQ/cherry-studio/commit/2511113b6244bce20498e2162fd7f9c1409c5140) feat: support gpt-5.1 (#11294) - *Phantom* (2025-11-15T19:09:43+08:00)
+- [`a29b2bb`](https://github.com/CherryHQ/cherry-studio/commit/a29b2bb3d6b762b30cd45dee62f3bd757d8e3331) chore: update @opeoginni/github-copilot-openai-compatible to support gpt5.1 (#11299) - *beyondkmp* (2025-11-15T19:07:16+08:00)
+
+### 🔧 What Was Done
+
+1. ✅ Generated patch from upstream changes
+2. ✅ Transformed paths for mobile structure (`src/renderer/src/aiCore` → `src/aiCore`)
+3. ✅ Attempted automatic patch application
+4. ❌ Automatic application failed
+
+### 📦 Manual Application Required
+
+The patch is available at `.github/port-patches/aicore-changes.patch`
+
+To apply manually:
+```bash
+git apply .github/port-patches/aicore-changes.patch
+# Or with 3-way merge:
+git apply --3way .github/port-patches/aicore-changes.patch
+```
+
+### ✅ Manual Porting Checklist
+
+- [ ] Review all code changes for mobile compatibility
+- [ ] Check for Node.js/Electron-specific APIs (fs, path, etc.)
+- [ ] Verify imports work in React Native context
+- [ ] Replace desktop APIs with Expo equivalents if needed
+- [ ] Test provider functionality on iOS
+- [ ] Test provider functionality on Android
+- [ ] Verify streaming and SSE handling works on mobile
+- [ ] Check error handling in mobile environment
+- [ ] Run linting: `yarn lint`
+- [ ] Run type checking: `yarn typecheck`
+- [ ] Run tests: `yarn test`
+- [ ] Test on physical devices (not just emulators)
+
+### ⚠️ Key Differences to Watch
+
+| Desktop (Electron) | Mobile (React Native/Expo) |
+|-------------------|---------------------------|
+| `fs`, `path` modules | `expo-file-system` |
+| Electron IPC | React Native Bridge |
+| Synchronous file ops | Async-first with promises |
+| Full file system access | Sandboxed directories |
+| Node.js crypto | `expo-crypto` or `react-native-crypto` |
+
+### 🔗 Related Links
+
+- [Source Repository](https://github.com/CherryHQ/cherry-studio)
+- [Compare Changes](https://github.com/CherryHQ/cherry-studio/compare/a1a3b9bd96571525935379a06f7d550a9a7ae76b...2c3338939ee974b52a59f4e9861db4d5c6cdfab4)
+- [Source aiCore Directory](https://github.com/CherryHQ/cherry-studio/tree/main/src/renderer/src/aiCore)
+- [Expo FileSystem API](https://docs.expo.dev/versions/latest/sdk/filesystem/)
+
+---
+
+*🤖 This PR was automatically created by Port Bot*
+*📅 Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*
