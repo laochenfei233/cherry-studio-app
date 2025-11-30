@@ -1,0 +1,2597 @@
+diff --git a/src/aiCore/chunk/handleToolCallChunk.ts b/src/aiCore/chunk/handleToolCallChunk.ts
+index 32c7e53..b5acbb6 100644
+--- a/src/aiCore/chunk/handleToolCallChunk.ts
++++ b/src/aiCore/chunk/handleToolCallChunk.ts
+@@ -212,8 +212,9 @@ export class ToolCallChunkHandler {
+         description: toolName,
+         type: 'builtin'
+       } as BaseTool
+-    } else if ((mcpTool = this.mcpTools.find((t) => t.name === toolName) as MCPTool)) {
++    } else if ((mcpTool = this.mcpTools.find((t) => t.id === toolName) as MCPTool)) {
+       // 如果是客户端执行的 MCP 工具，沿用现有逻辑
++      // toolName is mcpTool.id (registered with id as key in convertMcpToolsToAiSdkTools)
+       logger.info(`[ToolCallChunkHandler] Handling client-side MCP tool: ${toolName}`)
+       // mcpTool = this.mcpTools.find((t) => t.name === toolName) as MCPTool
+       // if (!mcpTool) {
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index a98ca34..cf12a46 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -50,7 +50,40 @@ export default class ModernAiProvider {
+   private model?: Model
+   private localProvider: Awaited<AiSdkProvider> | null = null
+ 
+-  // 构造函数重载签名
++  /**
++   * Constructor for ModernAiProvider
++   *
++   * @param modelOrProvider - Model or Provider object
++   * @param provider - Optional Provider object (only used when first param is Model)
++   *
++   * @remarks
++   * **Important behavior notes**:
++   *
++   * 1. When called with `(model)`:
++   *    - Calls `getActualProvider(model)` to retrieve and format the provider
++   *    - URL will be automatically formatted via `formatProviderApiHost`, adding version suffixes like `/v1`
++   *
++   * 2. When called with `(model, provider)`:
++   *    - **Directly uses the provided provider WITHOUT going through `getActualProvider`**
++   *    - **URL will NOT be automatically formatted, `/v1` suffix will NOT be added**
++   *    - This is legacy behavior kept for backward compatibility
++   *
++   * 3. When called with `(provider)`:
++   *    - Directly uses the provider without requiring a model
++   *    - Used for operations that don't need a model (e.g., fetchModels)
++   *
++   * @example
++   * ```typescript
++   * // Recommended: Auto-format URL
++   * const ai = new ModernAiProvider(model)
++   *
++   * // Not recommended: Skip URL formatting (only for special cases)
++   * const ai = new ModernAiProvider(model, customProvider)
++   *
++   * // For operations that don't need a model
++   * const ai = new ModernAiProvider(provider)
++   * ```
++   */
+   constructor(model: Model, provider?: Provider)
+   constructor(provider: Provider)
+   constructor(modelOrProvider: Model | Provider, provider?: Provider)
+@@ -156,7 +189,7 @@ export default class ModernAiProvider {
+     config: ModernAiProviderConfig
+   ): Promise<CompletionsResult> {
+     // ai-gateway不是image/generation 端点，所以就先不走legacy了
+-    if (config.isImageGenerationEndpoint && config.provider!.id !== SystemProviderIds['ai-gateway']) {
++    if (config.isImageGenerationEndpoint && this.getActualProvider().id !== SystemProviderIds['ai-gateway']) {
+       // 使用 legacy 实现处理图像生成（支持图片编辑等高级功能）
+       if (!config.uiMessages) {
+         throw new Error('uiMessages is required for image generation endpoint')
+@@ -322,10 +355,10 @@ export default class ModernAiProvider {
+     }
+   }
+ 
+-  /**
+-   * 使用现代化 AI SDK 的图像生成实现，支持流式输出
+-   * @deprecated 已改为使用 legacy 实现以支持图片编辑等高级功能
+-   */
++  // /**
++  //  * 使用现代化 AI SDK 的图像生成实现，支持流式输出
++  //  * @deprecated 已改为使用 legacy 实现以支持图片编辑等高级功能
++  //  */
+   /*
+   private async modernImageGeneration(
+     model: ImageModel,
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index c1c06b3..e755ce3 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -405,6 +405,9 @@ export abstract class BaseApiClient<
+         if (!param.name?.trim()) {
+           return acc
+         }
++        // Parse JSON type parameters (Legacy API clients)
++        // Related: src/renderer/src/pages/settings/AssistantSettings/AssistantModelSettings.tsx:133-148
++        // The UI stores JSON type params as strings, this function parses them before sending to API
+         if (param.type === 'json') {
+           const value = param.value as string
+           if (value === 'undefined') {
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index 27e659c..9c930a3 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -46,6 +46,7 @@ import type {
+   GeminiSdkRawOutput,
+   GeminiSdkToolCall
+ } from '@renderer/types/sdk'
++import { getTrailingApiVersion, withoutTrailingApiVersion } from '@renderer/utils'
+ import { isToolUseModeFunction } from '@renderer/utils/assistant'
+ import {
+   geminiFunctionCallToMcpTool,
+@@ -163,6 +164,10 @@ export class GeminiAPIClient extends BaseApiClient<
+     return models
+   }
+ 
++  override getBaseURL(): string {
++    return withoutTrailingApiVersion(super.getBaseURL())
++  }
++
+   override async getSdkInstance() {
+     if (this.sdkInstance) {
+       return this.sdkInstance
+@@ -188,6 +193,13 @@ export class GeminiAPIClient extends BaseApiClient<
+     if (this.provider.isVertex) {
+       return 'v1'
+     }
++
++    // Extract trailing API version from the URL
++    const trailingVersion = getTrailingApiVersion(this.provider.apiHost || '')
++    if (trailingVersion) {
++      return trailingVersion
++    }
++
+     return 'v1beta'
+   }
+ 
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index 55299c1..ea50680 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -11,10 +11,8 @@ import {
+   findTokenLimit,
+   GEMINI_FLASH_MODEL_REGEX,
+   getThinkModelType,
+-  isClaudeReasoningModel,
+   isDeepSeekHybridInferenceModel,
+   isDoubaoThinkingAutoModel,
+-  isGeminiReasoningModel,
+   isGPT5SeriesModel,
+   isGrokReasoningModel,
+   isNotSupportSystemMessageModel,
+@@ -651,7 +649,6 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+           logger.warn('No user message. Some providers may not support.')
+         }
+ 
+-        // poe 需要通过用户消息传递 reasoningEffort
+         const reasoningEffort = this.getReasoningEffort(assistant, model)
+ 
+         const lastUserMsg = userMessages.findLast((m) => m.role === 'user')
+@@ -662,22 +659,6 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+ 
+             lastUserMsg.content = processPostsuffixQwen3Model(currentContent, qwenThinkModeEnabled)
+           }
+-          if (this.provider.id === SystemProviderIds.poe) {
+-            // 如果以后 poe 支持 reasoning_effort 参数了，可以删掉这部分
+-            let suffix = ''
+-            if (isGPT5SeriesModel(model) && reasoningEffort.reasoning_effort) {
+-              suffix = ` --reasoning_effort ${reasoningEffort.reasoning_effort}`
+-            } else if (isClaudeReasoningModel(model) && reasoningEffort.thinking?.budget_tokens) {
+-              suffix = ` --thinking_budget ${reasoningEffort.thinking.budget_tokens}`
+-            } else if (isGeminiReasoningModel(model) && reasoningEffort.extra_body?.google?.thinking_config) {
+-              suffix = ` --thinking_budget ${reasoningEffort.extra_body.google.thinking_config.thinking_budget}`
+-            }
+-            // FIXME: poe 不支持多个text part，上传文本文件的时候用的不是file part而是text part，因此会出问题
+-            // 临时解决方案是强制poe用string content，但是其实poe部分支持array
+-            if (typeof lastUserMsg.content === 'string') {
+-              lastUserMsg.content += suffix
+-            }
+-          }
+         }
+ 
+         // 4. 最终请求消息
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+index 0b89f55..b314ddd 100644
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+@@ -1,6 +1,6 @@
+ import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugins'
+ import { loggerService } from '@logger'
+-import { isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
++import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
+ import type { MCPTool } from '@renderer/types'
+ import { type Assistant, type Message, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+@@ -9,11 +9,13 @@ import type { LanguageModelMiddleware } from 'ai'
+ import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+ import { isEmpty } from 'lodash'
+ 
++import { getAiSdkProviderId } from '../provider/factory'
+ import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
+ import { noThinkMiddleware } from './noThinkMiddleware'
+ import { openrouterGenerateImageMiddleware } from './openrouterGenerateImageMiddleware'
+ import { openrouterReasoningMiddleware } from './openrouterReasoningMiddleware'
+ import { qwenThinkingMiddleware } from './qwenThinkingMiddleware'
++import { skipGeminiThoughtSignatureMiddleware } from './skipGeminiThoughtSignatureMiddleware'
+ import { toolChoiceMiddleware } from './toolChoiceMiddleware'
+ 
+ const logger = loggerService.withContext('AiSdkMiddlewareBuilder')
+@@ -257,6 +259,15 @@ function addModelSpecificMiddlewares(builder: AiSdkMiddlewareBuilder, config: Ai
+       middleware: openrouterGenerateImageMiddleware()
+     })
+   }
++
++  if (isGemini3Model(config.model)) {
++    const aiSdkId = getAiSdkProviderId(config.provider)
++    builder.add({
++      name: 'skip-gemini3-thought-signature',
++      middleware: skipGeminiThoughtSignatureMiddleware(aiSdkId)
++    })
++    logger.debug('Added skip Gemini3 thought signature middleware')
++  }
+ }
+ 
+ /**
+diff --git a/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts b/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
+new file mode 100644
+index 0000000..da318ea
+--- /dev/null
++++ b/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
+@@ -0,0 +1,36 @@
++import type { LanguageModelMiddleware } from 'ai'
++
++/**
++ * skip Gemini Thought Signature Middleware
++ * 由于多模型客户端请求的复杂性（可以中途切换其他模型），这里选择通过中间件方式添加跳过所有 Gemini3 思考签名
++ * Due to the complexity of multi-model client requests (which can switch to other models mid-process),
++ * it was decided to add a skip for all Gemini3 thinking signatures via middleware.
++ * @param aiSdkId AI SDK Provider ID
++ * @returns LanguageModelMiddleware
++ */
++export function skipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageModelMiddleware {
++  const MAGIC_STRING = 'skip_thought_signature_validator'
++  return {
++    middlewareVersion: 'v2',
++
++    transformParams: async ({ params }) => {
++      const transformedParams = { ...params }
++      // Process messages in prompt
++      if (transformedParams.prompt && Array.isArray(transformedParams.prompt)) {
++        transformedParams.prompt = transformedParams.prompt.map((message) => {
++          if (typeof message.content !== 'string') {
++            for (const part of message.content) {
++              const googleOptions = part?.providerOptions?.[aiSdkId]
++              if (googleOptions?.thoughtSignature) {
++                googleOptions.thoughtSignature = MAGIC_STRING
++              }
++            }
++          }
++          return message
++        })
++      }
++
++      return transformedParams
++    }
++  }
++}
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index 2e7ae52..2433192 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -180,6 +180,10 @@ describe('messageConverter', () => {
+       const result = await convertMessagesToSdkMessages([initialUser, assistant, finalUser], model)
+ 
+       expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start editing' }]
++        },
+         {
+           role: 'assistant',
+           content: [{ type: 'text', text: 'Here is the current preview' }]
+@@ -217,6 +221,7 @@ describe('messageConverter', () => {
+ 
+       expect(result).toEqual([
+         { role: 'system', content: 'fileid://reference' },
++        { role: 'user', content: [{ type: 'text', text: 'Use this document as inspiration' }] },
+         {
+           role: 'assistant',
+           content: [{ type: 'text', text: 'Generated previews ready' }]
+diff --git a/src/aiCore/prepareParams/header.ts b/src/aiCore/prepareParams/header.ts
+index 19d4611..480f133 100644
+--- a/src/aiCore/prepareParams/header.ts
++++ b/src/aiCore/prepareParams/header.ts
+@@ -7,7 +7,7 @@ import { isAwsBedrockProvider, isVertexProvider } from '@renderer/utils/provider
+ // https://docs.claude.com/en/docs/build-with-claude/extended-thinking#interleaved-thinking
+ const INTERLEAVED_THINKING_HEADER = 'interleaved-thinking-2025-05-14'
+ // https://docs.claude.com/en/docs/build-with-claude/context-windows#1m-token-context-window
+-const CONTEXT_100M_HEADER = 'context-1m-2025-08-07'
++// const CONTEXT_100M_HEADER = 'context-1m-2025-08-07'
+ // https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/web-search
+ const WEBSEARCH_HEADER = 'web-search-2025-03-05'
+ 
+@@ -17,7 +17,7 @@ export function addAnthropicHeaders(assistant: Assistant, model: Model): string[
+   if (
+     isClaude45ReasoningModel(model) &&
+     isToolUseModeFunction(assistant) &&
+-    !(isVertexProvider(provider) && isAwsBedrockProvider(provider))
++    !(isVertexProvider(provider) || isAwsBedrockProvider(provider))
+   ) {
+     anthropicHeaders.push(INTERLEAVED_THINKING_HEADER)
+   }
+@@ -25,7 +25,9 @@ export function addAnthropicHeaders(assistant: Assistant, model: Model): string[
+     if (isVertexProvider(provider) && assistant.enableWebSearch) {
+       anthropicHeaders.push(WEBSEARCH_HEADER)
+     }
+-    anthropicHeaders.push(CONTEXT_100M_HEADER)
++    // We may add it by user preference in assistant.settings instead of always adding it.
++    // See #11540, #11397
++    // anthropicHeaders.push(CONTEXT_100M_HEADER)
+   }
+   return anthropicHeaders
+ }
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index 72f387d..b0c432e 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -194,20 +194,20 @@ async function convertMessageToAssistantModelMessage(
+  * This function processes messages and transforms them into the format required by the SDK.
+  * It handles special cases for vision models and image enhancement models.
+  *
+- * @param messages - Array of messages to convert. Must contain at least 2 messages when using image enhancement models.
++ * @param messages - Array of messages to convert. Must contain at least 3 messages when using image enhancement models for special handling.
+  * @param model - The model configuration that determines conversion behavior
+  *
+  * @returns A promise that resolves to an array of SDK-compatible model messages
+  *
+  * @remarks
+- * For image enhancement models with 2+ messages:
+- * - Expects the second-to-last message (index length-2) to be an assistant message containing image blocks
+- * - Expects the last message (index length-1) to be a user message
+- * - Extracts images from the assistant message and appends them to the user message content
+- * - Returns only the last two processed messages [assistantSdkMessage, userSdkMessage]
++ * For image enhancement models with 3+ messages:
++ * - Examines the last 2 messages to find an assistant message containing image blocks
++ * - If found, extracts images from the assistant message and appends them to the last user message content
++ * - Returns all converted messages (not just the last two) with the images merged into the user message
++ * - Typical pattern: [system?, assistant(image), user] -> [system?, assistant, user(image)]
+  *
+  * For other models:
+- * - Returns all converted messages in order
++ * - Returns all converted messages in order without special image handling
+  *
+  * The function automatically detects vision model capabilities and adjusts conversion accordingly.
+  */
+@@ -220,29 +220,25 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+     sdkMessages.push(...(Array.isArray(sdkMessage) ? sdkMessage : [sdkMessage]))
+   }
+   // Special handling for image enhancement models
+-  // Only keep the last two messages and merge images into the user message
+-  // [system?, user, assistant, user]
++  // Only merge images into the user message
++  // [system?, assistant(image), user] -> [system?, assistant, user(image)]
+   if (isImageEnhancementModel(model) && messages.length >= 3) {
+     const needUpdatedMessages = messages.slice(-2)
+-    const needUpdatedSdkMessages = sdkMessages.slice(-2)
+-    const assistantMessage = needUpdatedMessages.filter((m) => m.role === 'assistant')[0]
+-    const assistantSdkMessage = needUpdatedSdkMessages.filter((m) => m.role === 'assistant')[0]
+-    const userSdkMessage = needUpdatedSdkMessages.filter((m) => m.role === 'user')[0]
+-    const systemSdkMessages = sdkMessages.filter((m) => m.role === 'system')
+-    const imageBlocks = findImageBlocks(assistantMessage)
+-    const imageParts = await convertImageBlockToImagePart(imageBlocks)
+-    const parts: Array<TextPart | ImagePart | FilePart> = []
+-    if (typeof userSdkMessage.content === 'string') {
+-      parts.push({ type: 'text', text: userSdkMessage.content })
+-      parts.push(...imageParts)
+-      userSdkMessage.content = parts
+-    } else {
+-      userSdkMessage.content.push(...imageParts)
+-    }
+-    if (systemSdkMessages.length > 0) {
+-      return [systemSdkMessages[0], assistantSdkMessage, userSdkMessage]
++    const assistantMessage = needUpdatedMessages.find((m) => m.role === 'assistant')
++    const userSdkMessage = sdkMessages[sdkMessages.length - 1]
++
++    if (assistantMessage && userSdkMessage?.role === 'user') {
++      const imageBlocks = findImageBlocks(assistantMessage)
++      const imageParts = await convertImageBlockToImagePart(imageBlocks)
++
++      if (imageParts.length > 0) {
++        if (typeof userSdkMessage.content === 'string') {
++          userSdkMessage.content = [{ type: 'text', text: userSdkMessage.content }, ...imageParts]
++        } else if (Array.isArray(userSdkMessage.content)) {
++          userSdkMessage.content.push(...imageParts)
++        }
++      }
+     }
+-    return [assistantSdkMessage, userSdkMessage]
+   }
+ 
+   return sdkMessages
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index c9a9d20..c977745 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -28,6 +28,7 @@ import { type Assistant, type MCPTool, type Provider } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
++import { isAwsBedrockProvider } from '@renderer/utils/provider'
+ import type { ModelMessage, Tool } from 'ai'
+ import { stepCountIs } from 'ai'
+ 
+@@ -106,7 +107,7 @@ export async function buildStreamTextParams(
+     searchWithTime: store.getState().websearch.searchWithTime
+   }
+ 
+-  const providerOptions = buildProviderOptions(assistant, model, provider, {
++  const { providerOptions, standardParams } = buildProviderOptions(assistant, model, provider, {
+     enableReasoning,
+     enableWebSearch,
+     enableGenerateImage
+@@ -175,17 +176,22 @@ export async function buildStreamTextParams(
+ 
+   let headers: Record<string, string | undefined> = options.requestOptions?.headers ?? {}
+ 
+-  if (isAnthropicModel(model)) {
++  if (isAnthropicModel(model) && !isAwsBedrockProvider(provider)) {
+     const newBetaHeaders = { 'anthropic-beta': addAnthropicHeaders(assistant, model).join(',') }
+     headers = combineHeaders(headers, newBetaHeaders)
+   }
+ 
+   // 构建基础参数
++  // Note: standardParams (topK, frequencyPenalty, presencePenalty, stopSequences, seed)
++  // are extracted from custom parameters and passed directly to streamText()
++  // instead of being placed in providerOptions
+   const params: StreamTextParams = {
+     messages: sdkMessages,
+     maxOutputTokens: getMaxTokens(assistant, model),
+     temperature: getTemperature(assistant, model),
+     topP: getTopP(assistant, model),
++    // Include AI SDK standard params extracted from custom parameters
++    ...standardParams,
+     abortSignal: options.requestOptions?.signal,
+     headers,
+     providerOptions,
+diff --git a/src/aiCore/provider/__tests__/integratedRegistry.test.ts b/src/aiCore/provider/__tests__/integratedRegistry.test.ts
+index 1e8b1a9..9b2c063 100644
+--- a/src/aiCore/provider/__tests__/integratedRegistry.test.ts
++++ b/src/aiCore/provider/__tests__/integratedRegistry.test.ts
+@@ -1,4 +1,4 @@
+-import type { Provider } from '@renderer/types'
++import type { Model, Provider } from '@renderer/types'
+ import { describe, expect, it, vi } from 'vitest'
+ 
+ import { getAiSdkProviderId } from '../factory'
+@@ -68,6 +68,18 @@ function createTestProvider(id: string, type: string): Provider {
+   } as Provider
+ }
+ 
++function createAzureProvider(id: string, apiVersion?: string, model?: string): Provider {
++  return {
++    id,
++    type: 'azure-openai',
++    name: `Azure Test ${id}`,
++    apiKey: 'azure-test-key',
++    apiHost: 'azure-test-host',
++    apiVersion,
++    models: [{ id: model || 'gpt-4' } as Model]
++  }
++}
++
+ describe('Integrated Provider Registry', () => {
+   describe('Provider ID Resolution', () => {
+     it('should resolve openrouter provider correctly', () => {
+@@ -111,6 +123,24 @@ describe('Integrated Provider Registry', () => {
+       const result = getAiSdkProviderId(unknownProvider)
+       expect(result).toBe('unknown-provider')
+     })
++
++    it('should handle Azure OpenAI providers correctly', () => {
++      const azureProvider = createAzureProvider('azure-test', '2024-02-15', 'gpt-4o')
++      const result = getAiSdkProviderId(azureProvider)
++      expect(result).toBe('azure')
++    })
++
++    it('should handle Azure OpenAI providers response endpoint correctly', () => {
++      const azureProvider = createAzureProvider('azure-test', 'v1', 'gpt-4o')
++      const result = getAiSdkProviderId(azureProvider)
++      expect(result).toBe('azure-responses')
++    })
++
++    it('should handle Azure provider Claude Models', () => {
++      const provider = createTestProvider('azure-anthropic', 'anthropic')
++      const result = getAiSdkProviderId(provider)
++      expect(result).toBe('azure-anthropic')
++    })
+   })
+ 
+   describe('Backward Compatibility', () => {
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index 876f3ac..9760839 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -60,8 +60,12 @@ function tryResolveProviderId(identifier: string): ProviderId | null {
+ export function getAiSdkProviderId(provider: Provider): string {
+   // 1. 尝试解析provider.id
+   const resolvedFromId = tryResolveProviderId(provider.id)
+-  if (isAzureOpenAIProvider(provider) && isAzureResponsesEndpoint(provider)) {
+-    return 'azure-responses'
++  if (isAzureOpenAIProvider(provider)) {
++    if (isAzureResponsesEndpoint(provider)) {
++      return 'azure-responses'
++    } else {
++      return 'azure'
++    }
+   }
+   if (resolvedFromId) {
+     return resolvedFromId
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index ecc2cd6..53194d3 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -90,6 +90,7 @@ function formatProviderApiHost(provider: Provider): Provider {
+ 
+   if (isAnthropicProvider(provider)) {
+     const baseHost = formatted.anthropicApiHost || formatted.apiHost
++    // AI SDK needs /v1 in baseURL, Anthropic SDK will strip it in getSdkClient
+     formatted.apiHost = formatApiHost(baseHost)
+     if (!formatted.anthropicApiHost) {
+       formatted.anthropicApiHost = formatted.apiHost
+diff --git a/src/aiCore/trace/AiSdkSpanAdapter.ts b/src/aiCore/trace/AiSdkSpanAdapter.ts
+index f3df504..0c0e08a 100644
+--- a/src/aiCore/trace/AiSdkSpanAdapter.ts
++++ b/src/aiCore/trace/AiSdkSpanAdapter.ts
+@@ -245,8 +245,8 @@ export class AiSdkSpanAdapter {
+       'gen_ai.usage.output_tokens'
+     ]
+ 
+-    const completionTokens = attributes[inputsTokenKeys.find((key) => attributes[key]) || '']
+-    const promptTokens = attributes[outputTokenKeys.find((key) => attributes[key]) || '']
++    const promptTokens = attributes[inputsTokenKeys.find((key) => attributes[key]) || '']
++    const completionTokens = attributes[outputTokenKeys.find((key) => attributes[key]) || '']
+ 
+     if (completionTokens !== undefined || promptTokens !== undefined) {
+       const usage: TokenUsage = {
+diff --git a/src/aiCore/trace/__tests__/AiSdkSpanAdapter.test.ts b/src/aiCore/trace/__tests__/AiSdkSpanAdapter.test.ts
+new file mode 100644
+index 0000000..4cd6241
+--- /dev/null
++++ b/src/aiCore/trace/__tests__/AiSdkSpanAdapter.test.ts
+@@ -0,0 +1,53 @@
++import type { Span } from '@opentelemetry/api'
++import { SpanKind, SpanStatusCode } from '@opentelemetry/api'
++import { describe, expect, it, vi } from 'vitest'
++
++import { AiSdkSpanAdapter } from '../AiSdkSpanAdapter'
++
++vi.mock('@logger', () => ({
++  loggerService: {
++    withContext: () => ({
++      debug: vi.fn(),
++      error: vi.fn(),
++      info: vi.fn(),
++      warn: vi.fn()
++    })
++  }
++}))
++
++describe('AiSdkSpanAdapter', () => {
++  const createMockSpan = (attributes: Record<string, unknown>): Span => {
++    const span = {
++      spanContext: () => ({
++        traceId: 'trace-id',
++        spanId: 'span-id'
++      }),
++      _attributes: attributes,
++      _events: [],
++      name: 'test span',
++      status: { code: SpanStatusCode.OK },
++      kind: SpanKind.CLIENT,
++      startTime: [0, 0] as [number, number],
++      endTime: [0, 1] as [number, number],
++      ended: true,
++      parentSpanId: '',
++      links: []
++    }
++    return span as unknown as Span
++  }
++
++  it('maps prompt and completion usage tokens to the correct fields', () => {
++    const attributes = {
++      'ai.usage.promptTokens': 321,
++      'ai.usage.completionTokens': 654
++    }
++
++    const span = createMockSpan(attributes)
++    const result = AiSdkSpanAdapter.convertToSpanEntity({ span })
++
++    expect(result.usage).toBeDefined()
++    expect(result.usage?.prompt_tokens).toBe(321)
++    expect(result.usage?.completion_tokens).toBe(654)
++    expect(result.usage?.total_tokens).toBe(975)
++  })
++})
+diff --git a/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts b/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
+new file mode 100644
+index 0000000..288cc2e
+--- /dev/null
++++ b/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
+@@ -0,0 +1,652 @@
++/**
++ * extractAiSdkStandardParams Unit Tests
++ * Tests for extracting AI SDK standard parameters from custom parameters
++ */
++
++import { describe, expect, it, vi } from 'vitest'
++
++import { extractAiSdkStandardParams } from '../options'
++
++// Mock logger to prevent errors
++vi.mock('@logger', () => ({
++  loggerService: {
++    withContext: () => ({
++      debug: vi.fn(),
++      error: vi.fn(),
++      warn: vi.fn(),
++      info: vi.fn()
++    })
++  }
++}))
++
++// Mock settings store
++vi.mock('@renderer/store/settings', () => ({
++  default: (state = { settings: {} }) => state
++}))
++
++// Mock hooks to prevent uuid errors
++vi.mock('@renderer/hooks/useSettings', () => ({
++  getStoreSetting: vi.fn(() => ({}))
++}))
++
++// Mock uuid to prevent errors
++vi.mock('uuid', () => ({
++  v4: vi.fn(() => 'test-uuid')
++}))
++
++// Mock AssistantService to prevent uuid errors
++vi.mock('@renderer/services/AssistantService', () => ({
++  getDefaultAssistant: vi.fn(() => ({
++    id: 'test-assistant',
++    name: 'Test Assistant',
++    settings: {}
++  })),
++  getDefaultTopic: vi.fn(() => ({
++    id: 'test-topic',
++    assistantId: 'test-assistant',
++    createdAt: new Date().toISOString()
++  }))
++}))
++
++// Mock provider service
++vi.mock('@renderer/services/ProviderService', () => ({
++  getProviderById: vi.fn(() => ({
++    id: 'test-provider',
++    name: 'Test Provider'
++  }))
++}))
++
++// Mock config modules
++vi.mock('@renderer/config/models', () => ({
++  isOpenAIModel: vi.fn(() => false),
++  isQwenMTModel: vi.fn(() => false),
++  isSupportFlexServiceTierModel: vi.fn(() => false),
++  isSupportVerbosityModel: vi.fn(() => false),
++  getModelSupportedVerbosity: vi.fn(() => [])
++}))
++
++vi.mock('@renderer/config/translate', () => ({
++  mapLanguageToQwenMTModel: vi.fn()
++}))
++
++vi.mock('@renderer/utils/provider', () => ({
++  isSupportServiceTierProvider: vi.fn(() => false),
++  isSupportVerbosityProvider: vi.fn(() => false)
++}))
++
++describe('extractAiSdkStandardParams', () => {
++  describe('Positive cases - Standard parameters extraction', () => {
++    it('should extract all AI SDK standard parameters', () => {
++      const customParams = {
++        maxOutputTokens: 1000,
++        temperature: 0.7,
++        topP: 0.9,
++        topK: 40,
++        presencePenalty: 0.5,
++        frequencyPenalty: 0.3,
++        stopSequences: ['STOP', 'END'],
++        seed: 42
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        maxOutputTokens: 1000,
++        temperature: 0.7,
++        topP: 0.9,
++        topK: 40,
++        presencePenalty: 0.5,
++        frequencyPenalty: 0.3,
++        stopSequences: ['STOP', 'END'],
++        seed: 42
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract single standard parameter', () => {
++      const customParams = {
++        temperature: 0.8
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.8
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract topK parameter', () => {
++      const customParams = {
++        topK: 50
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        topK: 50
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract frequencyPenalty parameter', () => {
++      const customParams = {
++        frequencyPenalty: 0.6
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        frequencyPenalty: 0.6
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract presencePenalty parameter', () => {
++      const customParams = {
++        presencePenalty: 0.4
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        presencePenalty: 0.4
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract stopSequences parameter', () => {
++      const customParams = {
++        stopSequences: ['HALT', 'TERMINATE']
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        stopSequences: ['HALT', 'TERMINATE']
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract seed parameter', () => {
++      const customParams = {
++        seed: 12345
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        seed: 12345
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract maxOutputTokens parameter', () => {
++      const customParams = {
++        maxOutputTokens: 2048
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        maxOutputTokens: 2048
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should extract topP parameter', () => {
++      const customParams = {
++        topP: 0.95
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        topP: 0.95
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++  })
++
++  describe('Negative cases - Provider-specific parameters', () => {
++    it('should place all non-standard parameters in providerParams', () => {
++      const customParams = {
++        customParam: 'value',
++        anotherParam: 123,
++        thirdParam: true
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        customParam: 'value',
++        anotherParam: 123,
++        thirdParam: true
++      })
++    })
++
++    it('should place single provider-specific parameter in providerParams', () => {
++      const customParams = {
++        reasoningEffort: 'high'
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        reasoningEffort: 'high'
++      })
++    })
++
++    it('should place model-specific parameter in providerParams', () => {
++      const customParams = {
++        thinking: { type: 'enabled', budgetTokens: 5000 }
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        thinking: { type: 'enabled', budgetTokens: 5000 }
++      })
++    })
++
++    it('should place serviceTier in providerParams', () => {
++      const customParams = {
++        serviceTier: 'auto'
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        serviceTier: 'auto'
++      })
++    })
++
++    it('should place textVerbosity in providerParams', () => {
++      const customParams = {
++        textVerbosity: 'high'
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        textVerbosity: 'high'
++      })
++    })
++  })
++
++  describe('Mixed parameters', () => {
++    it('should correctly separate mixed standard and provider-specific parameters', () => {
++      const customParams = {
++        temperature: 0.7,
++        topK: 40,
++        customParam: 'custom_value',
++        reasoningEffort: 'medium',
++        frequencyPenalty: 0.5,
++        seed: 999
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.7,
++        topK: 40,
++        frequencyPenalty: 0.5,
++        seed: 999
++      })
++      expect(result.providerParams).toStrictEqual({
++        customParam: 'custom_value',
++        reasoningEffort: 'medium'
++      })
++    })
++
++    it('should handle complex mixed parameters with nested objects', () => {
++      const customParams = {
++        topP: 0.9,
++        presencePenalty: 0.3,
++        thinking: { type: 'enabled', budgetTokens: 5000 },
++        stopSequences: ['STOP'],
++        serviceTier: 'auto',
++        maxOutputTokens: 4096
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        topP: 0.9,
++        presencePenalty: 0.3,
++        stopSequences: ['STOP'],
++        maxOutputTokens: 4096
++      })
++      expect(result.providerParams).toStrictEqual({
++        thinking: { type: 'enabled', budgetTokens: 5000 },
++        serviceTier: 'auto'
++      })
++    })
++
++    it('should handle all standard params with some provider params', () => {
++      const customParams = {
++        maxOutputTokens: 2000,
++        temperature: 0.8,
++        topP: 0.95,
++        topK: 50,
++        presencePenalty: 0.6,
++        frequencyPenalty: 0.4,
++        stopSequences: ['END', 'DONE'],
++        seed: 777,
++        customApiParam: 'value',
++        anotherCustomParam: 123
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        maxOutputTokens: 2000,
++        temperature: 0.8,
++        topP: 0.95,
++        topK: 50,
++        presencePenalty: 0.6,
++        frequencyPenalty: 0.4,
++        stopSequences: ['END', 'DONE'],
++        seed: 777
++      })
++      expect(result.providerParams).toStrictEqual({
++        customApiParam: 'value',
++        anotherCustomParam: 123
++      })
++    })
++  })
++
++  describe('Edge cases', () => {
++    it('should handle empty object', () => {
++      const customParams = {}
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should handle zero values for numeric parameters', () => {
++      const customParams = {
++        temperature: 0,
++        topK: 0,
++        seed: 0
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0,
++        topK: 0,
++        seed: 0
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should handle negative values for numeric parameters', () => {
++      const customParams = {
++        presencePenalty: -0.5,
++        frequencyPenalty: -0.3,
++        seed: -1
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        presencePenalty: -0.5,
++        frequencyPenalty: -0.3,
++        seed: -1
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should handle empty arrays for stopSequences', () => {
++      const customParams = {
++        stopSequences: []
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        stopSequences: []
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should handle null values in mixed parameters', () => {
++      const customParams = {
++        temperature: 0.7,
++        customNull: null,
++        topK: 40
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.7,
++        topK: 40
++      })
++      expect(result.providerParams).toStrictEqual({
++        customNull: null
++      })
++    })
++
++    it('should handle undefined values in mixed parameters', () => {
++      const customParams = {
++        temperature: 0.7,
++        customUndefined: undefined,
++        topK: 40
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.7,
++        topK: 40
++      })
++      expect(result.providerParams).toStrictEqual({
++        customUndefined: undefined
++      })
++    })
++
++    it('should handle boolean values for standard parameters', () => {
++      const customParams = {
++        temperature: 0.7,
++        customBoolean: false,
++        topK: 40
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.7,
++        topK: 40
++      })
++      expect(result.providerParams).toStrictEqual({
++        customBoolean: false
++      })
++    })
++
++    it('should handle very large numeric values', () => {
++      const customParams = {
++        maxOutputTokens: 999999,
++        seed: 2147483647,
++        topK: 10000
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        maxOutputTokens: 999999,
++        seed: 2147483647,
++        topK: 10000
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++
++    it('should handle decimal values with high precision', () => {
++      const customParams = {
++        temperature: 0.123456789,
++        topP: 0.987654321,
++        presencePenalty: 0.111111111
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.123456789,
++        topP: 0.987654321,
++        presencePenalty: 0.111111111
++      })
++      expect(result.providerParams).toStrictEqual({})
++    })
++  })
++
++  describe('Case sensitivity', () => {
++    it('should NOT extract parameters with incorrect case - uppercase first letter', () => {
++      const customParams = {
++        Temperature: 0.7,
++        TopK: 40,
++        FrequencyPenalty: 0.5
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        Temperature: 0.7,
++        TopK: 40,
++        FrequencyPenalty: 0.5
++      })
++    })
++
++    it('should NOT extract parameters with incorrect case - all uppercase', () => {
++      const customParams = {
++        TEMPERATURE: 0.7,
++        TOPK: 40,
++        SEED: 42
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        TEMPERATURE: 0.7,
++        TOPK: 40,
++        SEED: 42
++      })
++    })
++
++    it('should NOT extract parameters with incorrect case - all lowercase', () => {
++      const customParams = {
++        maxoutputtokens: 1000,
++        frequencypenalty: 0.5,
++        stopsequences: ['STOP']
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        maxoutputtokens: 1000,
++        frequencypenalty: 0.5,
++        stopsequences: ['STOP']
++      })
++    })
++
++    it('should correctly extract exact case match while rejecting incorrect case', () => {
++      const customParams = {
++        temperature: 0.7,
++        Temperature: 0.8,
++        TEMPERATURE: 0.9,
++        topK: 40,
++        TopK: 50
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        temperature: 0.7,
++        topK: 40
++      })
++      expect(result.providerParams).toStrictEqual({
++        Temperature: 0.8,
++        TEMPERATURE: 0.9,
++        TopK: 50
++      })
++    })
++  })
++
++  describe('Parameter name variations', () => {
++    it('should NOT extract similar but incorrect parameter names', () => {
++      const customParams = {
++        temp: 0.7, // should not match temperature
++        top_k: 40, // should not match topK
++        max_tokens: 1000, // should not match maxOutputTokens
++        freq_penalty: 0.5 // should not match frequencyPenalty
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        temp: 0.7,
++        top_k: 40,
++        max_tokens: 1000,
++        freq_penalty: 0.5
++      })
++    })
++
++    it('should NOT extract snake_case versions of standard parameters', () => {
++      const customParams = {
++        top_k: 40,
++        top_p: 0.9,
++        presence_penalty: 0.5,
++        frequency_penalty: 0.3,
++        stop_sequences: ['STOP'],
++        max_output_tokens: 1000
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({})
++      expect(result.providerParams).toStrictEqual({
++        top_k: 40,
++        top_p: 0.9,
++        presence_penalty: 0.5,
++        frequency_penalty: 0.3,
++        stop_sequences: ['STOP'],
++        max_output_tokens: 1000
++      })
++    })
++
++    it('should extract exact camelCase parameters only', () => {
++      const customParams = {
++        topK: 40, // correct
++        top_k: 50, // incorrect
++        topP: 0.9, // correct
++        top_p: 0.8, // incorrect
++        frequencyPenalty: 0.5, // correct
++        frequency_penalty: 0.4 // incorrect
++      }
++
++      const result = extractAiSdkStandardParams(customParams)
++
++      expect(result.standardParams).toStrictEqual({
++        topK: 40,
++        topP: 0.9,
++        frequencyPenalty: 0.5
++      })
++      expect(result.providerParams).toStrictEqual({
++        top_k: 50,
++        top_p: 0.8,
++        frequency_penalty: 0.4
++      })
++    })
++  })
++})
+diff --git a/src/aiCore/utils/__tests__/mcp.test.ts b/src/aiCore/utils/__tests__/mcp.test.ts
+index a832e9f..dc26a03 100644
+--- a/src/aiCore/utils/__tests__/mcp.test.ts
++++ b/src/aiCore/utils/__tests__/mcp.test.ts
+@@ -71,10 +71,11 @@ describe('mcp utils', () => {
+       const result = setupToolsConfig(mcpTools)
+ 
+       expect(result).not.toBeUndefined()
+-      expect(Object.keys(result!)).toEqual(['test-tool'])
+-      expect(result!['test-tool']).toHaveProperty('description')
+-      expect(result!['test-tool']).toHaveProperty('inputSchema')
+-      expect(result!['test-tool']).toHaveProperty('execute')
++      // Tools are now keyed by id (which includes serverId suffix) for uniqueness
++      expect(Object.keys(result!)).toEqual(['test-tool-1'])
++      expect(result!['test-tool-1']).toHaveProperty('description')
++      expect(result!['test-tool-1']).toHaveProperty('inputSchema')
++      expect(result!['test-tool-1']).toHaveProperty('execute')
+     })
+ 
+     it('should handle multiple MCP tools', () => {
+@@ -109,7 +110,8 @@ describe('mcp utils', () => {
+ 
+       expect(result).not.toBeUndefined()
+       expect(Object.keys(result!)).toHaveLength(2)
+-      expect(Object.keys(result!)).toEqual(['tool1', 'tool2'])
++      // Tools are keyed by id for uniqueness
++      expect(Object.keys(result!)).toEqual(['tool1-id', 'tool2-id'])
+     })
+   })
+ 
+@@ -135,9 +137,10 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result)).toEqual(['get-weather'])
++      // Tools are keyed by id for uniqueness when multiple server instances exist
++      expect(Object.keys(result)).toEqual(['get-weather-id'])
+ 
+-      const tool = result['get-weather'] as Tool
++      const tool = result['get-weather-id'] as Tool
+       expect(tool.description).toBe('Get weather information')
+       expect(tool.inputSchema).toBeDefined()
+       expect(typeof tool.execute).toBe('function')
+@@ -160,8 +163,8 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result)).toEqual(['no-desc-tool'])
+-      const tool = result['no-desc-tool'] as Tool
++      expect(Object.keys(result)).toEqual(['no-desc-tool-id'])
++      const tool = result['no-desc-tool-id'] as Tool
+       expect(tool.description).toBe('Tool from test-server')
+     })
+ 
+@@ -202,13 +205,13 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result)).toEqual(['complex-tool'])
+-      const tool = result['complex-tool'] as Tool
++      expect(Object.keys(result)).toEqual(['complex-tool-id'])
++      const tool = result['complex-tool-id'] as Tool
+       expect(tool.inputSchema).toBeDefined()
+       expect(typeof tool.execute).toBe('function')
+     })
+ 
+-    it('should preserve tool names with special characters', () => {
++    it('should preserve tool id with special characters', () => {
+       const mcpTools: MCPTool[] = [
+         {
+           id: 'special-tool-id',
+@@ -225,7 +228,8 @@ describe('mcp utils', () => {
+       ]
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+-      expect(Object.keys(result)).toEqual(['tool_with-special.chars'])
++      // Tools are keyed by id for uniqueness
++      expect(Object.keys(result)).toEqual(['special-tool-id'])
+     })
+ 
+     it('should handle multiple tools with different schemas', () => {
+@@ -276,10 +280,11 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result).sort()).toEqual(['boolean-tool', 'number-tool', 'string-tool'])
+-      expect(result['string-tool']).toBeDefined()
+-      expect(result['number-tool']).toBeDefined()
+-      expect(result['boolean-tool']).toBeDefined()
++      // Tools are keyed by id for uniqueness
++      expect(Object.keys(result).sort()).toEqual(['boolean-tool-id', 'number-tool-id', 'string-tool-id'])
++      expect(result['string-tool-id']).toBeDefined()
++      expect(result['number-tool-id']).toBeDefined()
++      expect(result['boolean-tool-id']).toBeDefined()
+     })
+   })
+ 
+@@ -310,7 +315,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['test-exec-tool'] as Tool
++      const tool = tools['test-exec-tool-id'] as Tool
+       const result = await tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'test-call-123' })
+ 
+       expect(requestToolConfirmation).toHaveBeenCalled()
+@@ -343,7 +348,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['cancelled-tool'] as Tool
++      const tool = tools['cancelled-tool-id'] as Tool
+       const result = await tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'cancel-call-123' })
+ 
+       expect(requestToolConfirmation).toHaveBeenCalled()
+@@ -385,7 +390,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['error-tool'] as Tool
++      const tool = tools['error-tool-id'] as Tool
+ 
+       await expect(
+         tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'error-call-123' })
+@@ -421,7 +426,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['auto-approve-tool'] as Tool
++      const tool = tools['auto-approve-tool-id'] as Tool
+       const result = await tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'auto-call-123' })
+ 
+       expect(requestToolConfirmation).not.toHaveBeenCalled()
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 4bf8447..ca6b883 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -128,7 +128,20 @@ vi.mock('../reasoning', () => ({
+     reasoningConfig: { type: 'enabled', budgetTokens: 5000 }
+   })),
+   getReasoningEffort: vi.fn(() => ({ reasoningEffort: 'medium' })),
+-  getCustomParameters: vi.fn(() => ({}))
++  getCustomParameters: vi.fn(() => ({})),
++  extractAiSdkStandardParams: vi.fn((customParams: Record<string, any>) => {
++    const AI_SDK_STANDARD_PARAMS = ['topK', 'frequencyPenalty', 'presencePenalty', 'stopSequences', 'seed']
++    const standardParams: Record<string, any> = {}
++    const providerParams: Record<string, any> = {}
++    for (const [key, value] of Object.entries(customParams)) {
++      if (AI_SDK_STANDARD_PARAMS.includes(key)) {
++        standardParams[key] = value
++      } else {
++        providerParams[key] = value
++      }
++    }
++    return { standardParams, providerParams }
++  })
+ }))
+ 
+ vi.mock('../image', () => ({
+@@ -141,6 +154,10 @@ vi.mock('../websearch', () => ({
+   getWebSearchParams: vi.fn(() => ({ enable_search: true }))
+ }))
+ 
++vi.mock('../../prepareParams/header', () => ({
++  addAnthropicHeaders: vi.fn(() => ['context-1m-2025-08-07'])
++}))
++
+ const ensureWindowApi = () => {
+   const globalWindow = window as any
+   globalWindow.api = globalWindow.api || {}
+@@ -184,8 +201,9 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('openai')
+-        expect(result.openai).toBeDefined()
++        expect(result.providerOptions).toHaveProperty('openai')
++        expect(result.providerOptions.openai).toBeDefined()
++        expect(result.standardParams).toBeDefined()
+       })
+ 
+       it('should include reasoning parameters when enabled', () => {
+@@ -195,8 +213,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result.openai).toHaveProperty('reasoningEffort')
+-        expect(result.openai.reasoningEffort).toBe('medium')
++        expect(result.providerOptions.openai).toHaveProperty('reasoningEffort')
++        expect(result.providerOptions.openai.reasoningEffort).toBe('medium')
+       })
+ 
+       it('should include service tier when supported', () => {
+@@ -211,8 +229,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result.openai).toHaveProperty('serviceTier')
+-        expect(result.openai.serviceTier).toBe(OpenAIServiceTiers.auto)
++        expect(result.providerOptions.openai).toHaveProperty('serviceTier')
++        expect(result.providerOptions.openai.serviceTier).toBe(OpenAIServiceTiers.auto)
+       })
+     })
+ 
+@@ -239,8 +257,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('anthropic')
+-        expect(result.anthropic).toBeDefined()
++        expect(result.providerOptions).toHaveProperty('anthropic')
++        expect(result.providerOptions.anthropic).toBeDefined()
+       })
+ 
+       it('should include reasoning parameters when enabled', () => {
+@@ -250,8 +268,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result.anthropic).toHaveProperty('thinking')
+-        expect(result.anthropic.thinking).toEqual({
++        expect(result.providerOptions.anthropic).toHaveProperty('thinking')
++        expect(result.providerOptions.anthropic.thinking).toEqual({
+           type: 'enabled',
+           budgetTokens: 5000
+         })
+@@ -282,8 +300,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('google')
+-        expect(result.google).toBeDefined()
++        expect(result.providerOptions).toHaveProperty('google')
++        expect(result.providerOptions.google).toBeDefined()
+       })
+ 
+       it('should include reasoning parameters when enabled', () => {
+@@ -293,8 +311,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result.google).toHaveProperty('thinkingConfig')
+-        expect(result.google.thinkingConfig).toEqual({
++        expect(result.providerOptions.google).toHaveProperty('thinkingConfig')
++        expect(result.providerOptions.google.thinkingConfig).toEqual({
+           include_thoughts: true
+         })
+       })
+@@ -306,8 +324,8 @@ describe('options utils', () => {
+           enableGenerateImage: true
+         })
+ 
+-        expect(result.google).toHaveProperty('responseModalities')
+-        expect(result.google.responseModalities).toEqual(['TEXT', 'IMAGE'])
++        expect(result.providerOptions.google).toHaveProperty('responseModalities')
++        expect(result.providerOptions.google.responseModalities).toEqual(['TEXT', 'IMAGE'])
+       })
+     })
+ 
+@@ -335,8 +353,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('xai')
+-        expect(result.xai).toBeDefined()
++        expect(result.providerOptions).toHaveProperty('xai')
++        expect(result.providerOptions.xai).toBeDefined()
+       })
+ 
+       it('should include reasoning parameters when enabled', () => {
+@@ -346,8 +364,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result.xai).toHaveProperty('reasoningEffort')
+-        expect(result.xai.reasoningEffort).toBe('high')
++        expect(result.providerOptions.xai).toHaveProperty('reasoningEffort')
++        expect(result.providerOptions.xai.reasoningEffort).toBe('high')
+       })
+     })
+ 
+@@ -374,8 +392,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('deepseek')
+-        expect(result.deepseek).toBeDefined()
++        expect(result.providerOptions).toHaveProperty('deepseek')
++        expect(result.providerOptions.deepseek).toBeDefined()
+       })
+     })
+ 
+@@ -402,8 +420,8 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('openrouter')
+-        expect(result.openrouter).toBeDefined()
++        expect(result.providerOptions).toHaveProperty('openrouter')
++        expect(result.providerOptions.openrouter).toBeDefined()
+       })
+ 
+       it('should include web search parameters when enabled', () => {
+@@ -413,12 +431,12 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result.openrouter).toHaveProperty('enable_search')
++        expect(result.providerOptions.openrouter).toHaveProperty('enable_search')
+       })
+     })
+ 
+     describe('Custom parameters', () => {
+-      it('should merge custom parameters', async () => {
++      it('should merge custom provider-specific parameters', async () => {
+         const { getCustomParameters } = await import('../reasoning')
+ 
+         vi.mocked(getCustomParameters).mockReturnValue({
+@@ -443,10 +461,88 @@ describe('options utils', () => {
+           }
+         )
+ 
+-        expect(result.openai).toHaveProperty('custom_param')
+-        expect(result.openai.custom_param).toBe('custom_value')
+-        expect(result.openai).toHaveProperty('another_param')
+-        expect(result.openai.another_param).toBe(123)
++        expect(result.providerOptions.openai).toHaveProperty('custom_param')
++        expect(result.providerOptions.openai.custom_param).toBe('custom_value')
++        expect(result.providerOptions.openai).toHaveProperty('another_param')
++        expect(result.providerOptions.openai.another_param).toBe(123)
++      })
++
++      it('should extract AI SDK standard params from custom parameters', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        vi.mocked(getCustomParameters).mockReturnValue({
++          topK: 5,
++          frequencyPenalty: 0.5,
++          presencePenalty: 0.3,
++          seed: 42,
++          custom_param: 'custom_value'
++        })
++
++        const result = buildProviderOptions(
++          mockAssistant,
++          mockModel,
++          {
++            id: SystemProviderIds.gemini,
++            name: 'Google',
++            type: 'gemini',
++            apiKey: 'test-key',
++            apiHost: 'https://generativelanguage.googleapis.com'
++          } as Provider,
++          {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: false
++          }
++        )
++
++        // Standard params should be extracted and returned separately
++        expect(result.standardParams).toEqual({
++          topK: 5,
++          frequencyPenalty: 0.5,
++          presencePenalty: 0.3,
++          seed: 42
++        })
++
++        // Provider-specific params should still be in providerOptions
++        expect(result.providerOptions.google).toHaveProperty('custom_param')
++        expect(result.providerOptions.google.custom_param).toBe('custom_value')
++
++        // Standard params should NOT be in providerOptions
++        expect(result.providerOptions.google).not.toHaveProperty('topK')
++        expect(result.providerOptions.google).not.toHaveProperty('frequencyPenalty')
++        expect(result.providerOptions.google).not.toHaveProperty('presencePenalty')
++        expect(result.providerOptions.google).not.toHaveProperty('seed')
++      })
++
++      it('should handle stopSequences in custom parameters', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        vi.mocked(getCustomParameters).mockReturnValue({
++          stopSequences: ['STOP', 'END'],
++          custom_param: 'value'
++        })
++
++        const result = buildProviderOptions(
++          mockAssistant,
++          mockModel,
++          {
++            id: SystemProviderIds.gemini,
++            name: 'Google',
++            type: 'gemini',
++            apiKey: 'test-key',
++            apiHost: 'https://generativelanguage.googleapis.com'
++          } as Provider,
++          {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: false
++          }
++        )
++
++        expect(result.standardParams).toEqual({
++          stopSequences: ['STOP', 'END']
++        })
++        expect(result.providerOptions.google).not.toHaveProperty('stopSequences')
+       })
+     })
+ 
+@@ -474,8 +570,8 @@ describe('options utils', () => {
+           enableGenerateImage: true
+         })
+ 
+-        expect(result.google).toHaveProperty('thinkingConfig')
+-        expect(result.google).toHaveProperty('responseModalities')
++        expect(result.providerOptions.google).toHaveProperty('thinkingConfig')
++        expect(result.providerOptions.google).toHaveProperty('responseModalities')
+       })
+ 
+       it('should handle all capabilities enabled', () => {
+@@ -485,8 +581,8 @@ describe('options utils', () => {
+           enableGenerateImage: true
+         })
+ 
+-        expect(result.google).toBeDefined()
+-        expect(Object.keys(result.google).length).toBeGreaterThan(0)
++        expect(result.providerOptions.google).toBeDefined()
++        expect(Object.keys(result.providerOptions.google).length).toBeGreaterThan(0)
+       })
+     })
+ 
+@@ -513,7 +609,7 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('google')
++        expect(result.providerOptions).toHaveProperty('google')
+       })
+ 
+       it('should map google-vertex-anthropic to anthropic', () => {
+@@ -538,7 +634,66 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        expect(result).toHaveProperty('anthropic')
++        expect(result.providerOptions).toHaveProperty('anthropic')
++      })
++    })
++
++    describe('AWS Bedrock provider', () => {
++      const bedrockProvider = {
++        id: 'bedrock',
++        name: 'AWS Bedrock',
++        type: 'aws-bedrock',
++        apiKey: 'test-key',
++        apiHost: 'https://bedrock.us-east-1.amazonaws.com',
++        models: [] as Model[]
++      } as Provider
++
++      const bedrockModel: Model = {
++        id: 'anthropic.claude-sonnet-4-20250514-v1:0',
++        name: 'Claude Sonnet 4',
++        provider: 'bedrock'
++      } as Model
++
++      it('should build basic Bedrock options', () => {
++        const result = buildProviderOptions(mockAssistant, bedrockModel, bedrockProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('bedrock')
++        expect(result.providerOptions.bedrock).toBeDefined()
++      })
++
++      it('should include anthropicBeta when Anthropic headers are needed', async () => {
++        const { addAnthropicHeaders } = await import('../../prepareParams/header')
++        vi.mocked(addAnthropicHeaders).mockReturnValue(['interleaved-thinking-2025-05-14', 'context-1m-2025-08-07'])
++
++        const result = buildProviderOptions(mockAssistant, bedrockModel, bedrockProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions.bedrock).toHaveProperty('anthropicBeta')
++        expect(result.providerOptions.bedrock.anthropicBeta).toEqual([
++          'interleaved-thinking-2025-05-14',
++          'context-1m-2025-08-07'
++        ])
++      })
++
++      it('should include reasoning parameters when enabled', () => {
++        const result = buildProviderOptions(mockAssistant, bedrockModel, bedrockProvider, {
++          enableReasoning: true,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions.bedrock).toHaveProperty('reasoningConfig')
++        expect(result.providerOptions.bedrock.reasoningConfig).toEqual({
++          type: 'enabled',
++          budgetTokens: 5000
++        })
+       })
+     })
+   })
+diff --git a/src/aiCore/utils/__tests__/reasoning.poe.test.ts b/src/aiCore/utils/__tests__/reasoning.poe.test.ts
+new file mode 100644
+index 0000000..9087699
+--- /dev/null
++++ b/src/aiCore/utils/__tests__/reasoning.poe.test.ts
+@@ -0,0 +1,288 @@
++import type { Assistant, Model, ReasoningEffortOption } from '@renderer/types'
++import { SystemProviderIds } from '@renderer/types'
++import { describe, expect, it, vi } from 'vitest'
++
++import { getReasoningEffort } from '../reasoning'
++
++// Mock logger
++vi.mock('@logger', () => ({
++  loggerService: {
++    withContext: () => ({
++      warn: vi.fn(),
++      info: vi.fn(),
++      error: vi.fn()
++    })
++  }
++}))
++
++vi.mock('@renderer/store/settings', () => ({
++  default: {},
++  settingsSlice: {
++    name: 'settings',
++    reducer: vi.fn(),
++    actions: {}
++  }
++}))
++
++vi.mock('@renderer/store/assistants', () => {
++  const mockAssistantsSlice = {
++    name: 'assistants',
++    reducer: vi.fn((state = { entities: {}, ids: [] }) => state),
++    actions: {
++      updateTopicUpdatedAt: vi.fn(() => ({ type: 'UPDATE_TOPIC_UPDATED_AT' }))
++    }
++  }
++
++  return {
++    default: mockAssistantsSlice.reducer,
++    updateTopicUpdatedAt: vi.fn(() => ({ type: 'UPDATE_TOPIC_UPDATED_AT' })),
++    assistantsSlice: mockAssistantsSlice
++  }
++})
++
++// Mock provider service
++vi.mock('@renderer/services/AssistantService', () => ({
++  getProviderByModel: (model: Model) => ({
++    id: model.provider,
++    name: 'Poe',
++    type: 'openai'
++  }),
++  getAssistantSettings: (assistant: Assistant) => assistant.settings || {}
++}))
++
++describe('Poe Provider Reasoning Support', () => {
++  const createPoeModel = (id: string): Model => ({
++    id,
++    name: id,
++    provider: SystemProviderIds.poe,
++    group: 'poe'
++  })
++
++  const createAssistant = (reasoning_effort?: ReasoningEffortOption, maxTokens?: number): Assistant => ({
++    id: 'test-assistant',
++    name: 'Test Assistant',
++    emoji: '🤖',
++    prompt: '',
++    topics: [],
++    messages: [],
++    type: 'assistant',
++    regularPhrases: [],
++    settings: {
++      reasoning_effort,
++      maxTokens
++    }
++  })
++
++  describe('GPT-5 Series Models', () => {
++    it('should return reasoning_effort in extra_body for GPT-5 model with low effort', () => {
++      const model = createPoeModel('gpt-5')
++      const assistant = createAssistant('low')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({
++        extra_body: {
++          reasoning_effort: 'low'
++        }
++      })
++    })
++
++    it('should return reasoning_effort in extra_body for GPT-5 model with medium effort', () => {
++      const model = createPoeModel('gpt-5')
++      const assistant = createAssistant('medium')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({
++        extra_body: {
++          reasoning_effort: 'medium'
++        }
++      })
++    })
++
++    it('should return reasoning_effort in extra_body for GPT-5 model with high effort', () => {
++      const model = createPoeModel('gpt-5')
++      const assistant = createAssistant('high')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({
++        extra_body: {
++          reasoning_effort: 'high'
++        }
++      })
++    })
++
++    it('should convert auto to medium for GPT-5 model in extra_body', () => {
++      const model = createPoeModel('gpt-5')
++      const assistant = createAssistant('auto')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({
++        extra_body: {
++          reasoning_effort: 'medium'
++        }
++      })
++    })
++
++    it('should return reasoning_effort in extra_body for GPT-5.1 model', () => {
++      const model = createPoeModel('gpt-5.1')
++      const assistant = createAssistant('medium')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({
++        extra_body: {
++          reasoning_effort: 'medium'
++        }
++      })
++    })
++  })
++
++  describe('Claude Models', () => {
++    it('should return thinking_budget in extra_body for Claude 3.7 Sonnet', () => {
++      const model = createPoeModel('claude-3.7-sonnet')
++      const assistant = createAssistant('medium', 4096)
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toHaveProperty('extra_body')
++      expect(result.extra_body).toHaveProperty('thinking_budget')
++      expect(typeof result.extra_body?.thinking_budget).toBe('number')
++      expect(result.extra_body?.thinking_budget).toBeGreaterThan(0)
++    })
++
++    it('should return thinking_budget in extra_body for Claude Sonnet 4', () => {
++      const model = createPoeModel('claude-sonnet-4')
++      const assistant = createAssistant('high', 8192)
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toHaveProperty('extra_body')
++      expect(result.extra_body).toHaveProperty('thinking_budget')
++      expect(typeof result.extra_body?.thinking_budget).toBe('number')
++    })
++
++    it('should calculate thinking_budget based on effort ratio and maxTokens', () => {
++      const model = createPoeModel('claude-3.7-sonnet')
++      const assistant = createAssistant('low', 4096)
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result.extra_body?.thinking_budget).toBeGreaterThanOrEqual(1024)
++    })
++  })
++
++  describe('Gemini Models', () => {
++    it('should return thinking_budget in extra_body for Gemini 2.5 Flash', () => {
++      const model = createPoeModel('gemini-2.5-flash')
++      const assistant = createAssistant('medium')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toHaveProperty('extra_body')
++      expect(result.extra_body).toHaveProperty('thinking_budget')
++      expect(typeof result.extra_body?.thinking_budget).toBe('number')
++    })
++
++    it('should return thinking_budget in extra_body for Gemini 2.5 Pro', () => {
++      const model = createPoeModel('gemini-2.5-pro')
++      const assistant = createAssistant('high')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toHaveProperty('extra_body')
++      expect(result.extra_body).toHaveProperty('thinking_budget')
++    })
++
++    it('should use -1 for auto effort', () => {
++      const model = createPoeModel('gemini-2.5-flash')
++      const assistant = createAssistant('auto')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result.extra_body?.thinking_budget).toBe(-1)
++    })
++
++    it('should calculate thinking_budget for non-auto effort', () => {
++      const model = createPoeModel('gemini-2.5-flash')
++      const assistant = createAssistant('low')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(typeof result.extra_body?.thinking_budget).toBe('number')
++    })
++  })
++
++  describe('No Reasoning Effort', () => {
++    it('should return empty object when reasoning_effort is not set', () => {
++      const model = createPoeModel('gpt-5')
++      const assistant = createAssistant(undefined)
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({})
++    })
++
++    it('should return empty object when reasoning_effort is "none"', () => {
++      const model = createPoeModel('gpt-5')
++      const assistant = createAssistant('none')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({})
++    })
++  })
++
++  describe('Non-Reasoning Models', () => {
++    it('should return empty object for non-reasoning models', () => {
++      const model = createPoeModel('gpt-4')
++      const assistant = createAssistant('medium')
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toEqual({})
++    })
++  })
++
++  describe('Edge Cases: Models Without Token Limit Configuration', () => {
++    it('should return empty object for Claude models without token limit configuration', () => {
++      const model = createPoeModel('claude-unknown-variant')
++      const assistant = createAssistant('medium', 4096)
++      const result = getReasoningEffort(assistant, model)
++
++      // Should return empty object when token limit is not found
++      expect(result).toEqual({})
++      expect(result.extra_body?.thinking_budget).toBeUndefined()
++    })
++
++    it('should return empty object for unmatched Poe reasoning models', () => {
++      // A hypothetical reasoning model that doesn't match GPT-5, Claude, or Gemini
++      const model = createPoeModel('some-reasoning-model')
++      // Make it appear as a reasoning model by giving it a name that won't match known categories
++      const assistant = createAssistant('medium')
++      const result = getReasoningEffort(assistant, model)
++
++      // Should return empty object for unmatched models
++      expect(result).toEqual({})
++    })
++
++    it('should fallback to -1 for Gemini models without token limit', () => {
++      // Use a Gemini model variant that won't match any token limit pattern
++      // The current regex patterns cover gemini-.*-flash.*$ and gemini-.*-pro.*$
++      // so we need a model that matches isSupportedThinkingTokenGeminiModel but not THINKING_TOKEN_MAP
++      const model = createPoeModel('gemini-2.5-flash')
++      const assistant = createAssistant('auto')
++      const result = getReasoningEffort(assistant, model)
++
++      // For 'auto' effort, should use -1
++      expect(result.extra_body?.thinking_budget).toBe(-1)
++    })
++
++    it('should enforce minimum 1024 token floor for Claude models', () => {
++      const model = createPoeModel('claude-3.7-sonnet')
++      // Use very small maxTokens to test the minimum floor
++      const assistant = createAssistant('low', 100)
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result.extra_body?.thinking_budget).toBeGreaterThanOrEqual(1024)
++    })
++
++    it('should handle undefined maxTokens for Claude models', () => {
++      const model = createPoeModel('claude-3.7-sonnet')
++      const assistant = createAssistant('medium', undefined)
++      const result = getReasoningEffort(assistant, model)
++
++      expect(result).toHaveProperty('extra_body')
++      expect(result.extra_body).toHaveProperty('thinking_budget')
++      expect(typeof result.extra_body?.thinking_budget).toBe('number')
++      expect(result.extra_body?.thinking_budget).toBeGreaterThanOrEqual(1024)
++    })
++  })
++})
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 1303e25..36253e5 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -144,7 +144,7 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({})
+     })
+ 
+-    it('should disable reasoning for OpenRouter when no reasoning effort set', async () => {
++    it('should not override reasoning for OpenRouter when reasoning effort undefined', async () => {
+       const { isReasoningModel } = await import('@renderer/config/models')
+ 
+       vi.mocked(isReasoningModel).mockReturnValue(true)
+@@ -161,6 +161,29 @@ describe('reasoning utils', () => {
+         settings: {}
+       } as Assistant
+ 
++      const result = getReasoningEffort(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should disable reasoning for OpenRouter when reasoning effort explicitly none', async () => {
++      const { isReasoningModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'anthropic/claude-sonnet-4',
++        name: 'Claude Sonnet 4',
++        provider: SystemProviderIds.openrouter
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
+       const result = getReasoningEffort(assistant, model)
+       expect(result).toEqual({ reasoning: { enabled: false, exclude: true } })
+     })
+@@ -269,7 +292,9 @@ describe('reasoning utils', () => {
+       const assistant: Assistant = {
+         id: 'test',
+         name: 'Test',
+-        settings: {}
++        settings: {
++          reasoning_effort: 'none'
++        }
+       } as Assistant
+ 
+       const result = getReasoningEffort(assistant, model)
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index 84bc661..7d3be9a 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -28,7 +28,9 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[]): ToolSet {
+   const tools: ToolSet = {}
+ 
+   for (const mcpTool of mcpTools) {
+-    tools[mcpTool.name] = tool({
++    // Use mcpTool.id (which includes serverId suffix) to ensure uniqueness
++    // when multiple instances of the same MCP server type are configured
++    tools[mcpTool.id] = tool({
+       description: mcpTool.description || `Tool from ${mcpTool.serverName}`,
+       inputSchema: jsonSchema(mcpTool.inputSchema as JSONSchema7),
+       execute: async (params, { toolCallId }) => {
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 47e7d25..a1352a8 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -31,11 +31,12 @@ import {
+   type Provider,
+   type ServiceTier
+ } from '@renderer/types'
+-import type { OpenAIVerbosity } from '@renderer/types/aiCoreTypes'
++import { type AiSdkParam, isAiSdkParam, type OpenAIVerbosity } from '@renderer/types/aiCoreTypes'
+ import { isSupportServiceTierProvider, isSupportVerbosityProvider } from '@renderer/utils/provider'
+ import type { JSONValue } from 'ai'
+ import { t } from 'i18next'
+ 
++import { addAnthropicHeaders } from '../prepareParams/header'
+ import { getAiSdkProviderId } from '../provider/factory'
+ import { buildGeminiGenerateImageParams } from './image'
+ import {
+@@ -91,15 +92,56 @@ function getServiceTier<T extends Provider>(model: Model, provider: T): OpenAISe
+   }
+ }
+ 
+-function getVerbosity(): OpenAIVerbosity {
++function getVerbosity(model: Model): OpenAIVerbosity {
++  if (!isSupportVerbosityModel(model) || !isSupportVerbosityProvider(getProviderById(model.provider)!)) {
++    return undefined
++  }
+   const openAI = getStoreSetting('openAI')
+-  return openAI.verbosity
++
++  const userVerbosity = openAI.verbosity
++
++  if (userVerbosity) {
++    const supportedVerbosity = getModelSupportedVerbosity(model)
++    // Use user's verbosity if supported, otherwise use the first supported option
++    const verbosity = supportedVerbosity.includes(userVerbosity) ? userVerbosity : supportedVerbosity[0]
++    return verbosity
++  }
++  return undefined
++}
++
++/**
++ * Extract AI SDK standard parameters from custom parameters
++ * These parameters should be passed directly to streamText() instead of providerOptions
++ */
++export function extractAiSdkStandardParams(customParams: Record<string, any>): {
++  standardParams: Partial<Record<AiSdkParam, any>>
++  providerParams: Record<string, any>
++} {
++  const standardParams: Partial<Record<AiSdkParam, any>> = {}
++  const providerParams: Record<string, any> = {}
++
++  for (const [key, value] of Object.entries(customParams)) {
++    if (isAiSdkParam(key)) {
++      standardParams[key] = value
++    } else {
++      providerParams[key] = value
++    }
++  }
++
++  return { standardParams, providerParams }
+ }
+ 
+ /**
+  * 构建 AI SDK 的 providerOptions
+  * 按 provider 类型分离，保持类型安全
+- * 返回格式：{ 'providerId': providerOptions }
++ * 返回格式：{
++ *   providerOptions: { 'providerId': providerOptions },
++ *   standardParams: { topK, frequencyPenalty, presencePenalty, stopSequences, seed }
++ * }
++ *
++ * Custom parameters are split into two categories:
++ * 1. AI SDK standard parameters (topK, frequencyPenalty, etc.) - returned separately to be passed to streamText()
++ * 2. Provider-specific parameters - merged into providerOptions
+  */
+ export function buildProviderOptions(
+   assistant: Assistant,
+@@ -110,13 +152,16 @@ export function buildProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   }
+-): Record<string, Record<string, JSONValue>> {
++): {
++  providerOptions: Record<string, Record<string, JSONValue>>
++  standardParams: Partial<Record<AiSdkParam, any>>
++} {
+   logger.debug('buildProviderOptions', { assistant, model, actualProvider, capabilities })
+   const rawProviderId = getAiSdkProviderId(actualProvider)
+   // 构建 provider 特定的选项
+   let providerSpecificOptions: Record<string, any> = {}
+   const serviceTier = getServiceTier(model, actualProvider)
+-  const textVerbosity = getVerbosity()
++  const textVerbosity = getVerbosity(model)
+   // 根据 provider 类型分离构建逻辑
+   const { data: baseProviderId, success } = baseProviderIdSchema.safeParse(rawProviderId)
+   if (success) {
+@@ -131,7 +176,8 @@ export function buildProviderOptions(
+             assistant,
+             model,
+             capabilities,
+-            serviceTier
++            serviceTier,
++            textVerbosity
+           )
+           providerSpecificOptions = options
+         }
+@@ -164,7 +210,8 @@ export function buildProviderOptions(
+           model,
+           capabilities,
+           actualProvider,
+-          serviceTier
++          serviceTier,
++          textVerbosity
+         )
+         break
+       default:
+@@ -202,10 +249,14 @@ export function buildProviderOptions(
+     }
+   }
+ 
+-  // 合并自定义参数到 provider 特定的选项中
++  // 获取自定义参数并分离标准参数和 provider 特定参数
++  const customParams = getCustomParameters(assistant)
++  const { standardParams, providerParams } = extractAiSdkStandardParams(customParams)
++
++  // 合并 provider 特定的自定义参数到 providerSpecificOptions
+   providerSpecificOptions = {
+     ...providerSpecificOptions,
+-    ...getCustomParameters(assistant)
++    ...providerParams
+   }
+ 
+   let rawProviderKey =
+@@ -213,16 +264,21 @@ export function buildProviderOptions(
+       'google-vertex': 'google',
+       'google-vertex-anthropic': 'anthropic',
+       'azure-anthropic': 'anthropic',
+-      'ai-gateway': 'gateway'
++      'ai-gateway': 'gateway',
++      azure: 'openai',
++      'azure-responses': 'openai'
+     }[rawProviderId] || rawProviderId
+ 
+   if (rawProviderKey === 'cherryin') {
+-    rawProviderKey = { gemini: 'google' }[actualProvider.type] || actualProvider.type
++    rawProviderKey = { gemini: 'google', ['openai-response']: 'openai' }[actualProvider.type] || actualProvider.type
+   }
+ 
+-  // 返回 AI Core SDK 要求的格式：{ 'providerId': providerOptions }
++  // 返回 AI Core SDK 要求的格式：{ 'providerId': providerOptions } 以及提取的标准参数
+   return {
+-    [rawProviderKey]: providerSpecificOptions
++    providerOptions: {
++      [rawProviderKey]: providerSpecificOptions
++    },
++    standardParams
+   }
+ }
+ 
+@@ -237,7 +293,8 @@ function buildOpenAIProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   },
+-  serviceTier: OpenAIServiceTier
++  serviceTier: OpenAIServiceTier,
++  textVerbosity?: OpenAIVerbosity
+ ): OpenAIResponsesProviderOptions {
+   const { enableReasoning } = capabilities
+   let providerOptions: OpenAIResponsesProviderOptions = {}
+@@ -273,7 +330,8 @@ function buildOpenAIProviderOptions(
+ 
+   providerOptions = {
+     ...providerOptions,
+-    serviceTier
++    serviceTier,
++    textVerbosity
+   }
+ 
+   return providerOptions
+@@ -372,11 +430,13 @@ function buildCherryInProviderOptions(
+     enableGenerateImage: boolean
+   },
+   actualProvider: Provider,
+-  serviceTier: OpenAIServiceTier
++  serviceTier: OpenAIServiceTier,
++  textVerbosity: OpenAIVerbosity
+ ): OpenAIResponsesProviderOptions | AnthropicProviderOptions | GoogleGenerativeAIProviderOptions {
+   switch (actualProvider.type) {
+     case 'openai':
+-      return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier)
++    case 'openai-response':
++      return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+ 
+     case 'anthropic':
+       return buildAnthropicProviderOptions(assistant, model, capabilities)
+@@ -410,6 +470,11 @@ function buildBedrockProviderOptions(
+     }
+   }
+ 
++  const betaHeaders = addAnthropicHeaders(assistant, model)
++  if (betaHeaders.length > 0) {
++    providerOptions.anthropicBeta = betaHeaders
++  }
++
+   return providerOptions
+ }
+ 
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 8e4112c..f320a9f 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -12,13 +12,12 @@ import {
+   isDeepSeekHybridInferenceModel,
+   isDoubaoSeedAfter251015,
+   isDoubaoThinkingAutoModel,
+-  isGemini3Model,
++  isGemini3ThinkingTokenModel,
++  isGPT5SeriesModel,
+   isGPT51SeriesModel,
+   isGrok4FastReasoningModel,
+-  isGrokReasoningModel,
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+-  isOpenAIReasoningModel,
+   isQwenAlwaysThinkModel,
+   isQwenReasoningModel,
+   isReasoningModel,
+@@ -36,7 +35,7 @@ import {
+ } from '@renderer/config/models'
+ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
+-import type { Assistant, Model, ReasoningEffortOption } from '@renderer/types'
++import type { Assistant, Model } from '@renderer/types'
+ import { EFFORT_RATIO, isSystemProvider, SystemProviderIds } from '@renderer/types'
+ import type { OpenAISummaryText } from '@renderer/types/aiCoreTypes'
+ import type { ReasoningEffortOptionalParams } from '@renderer/types/sdk'
+@@ -63,30 +62,22 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   }
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  // Handle undefined and 'none' reasoningEffort.
+-  // TODO: They should be separated.
+-  if (!reasoningEffort || reasoningEffort === 'none') {
++  // reasoningEffort is not set, no extra reasoning setting
++  // Generally, for every model which supports reasoning control, the reasoning effort won't be undefined.
++  // It's for some reasoning models that don't support reasoning control, such as deepseek reasoner.
++  if (!reasoningEffort) {
++    return {}
++  }
++
++  // Handle 'none' reasoningEffort. It's explicitly off.
++  if (reasoningEffort === 'none') {
+     // openrouter: use reasoning
+     if (model.provider === SystemProviderIds.openrouter) {
+-      // Don't disable reasoning for Gemini models that support thinking tokens
+-      if (isSupportedThinkingTokenGeminiModel(model) && !GEMINI_FLASH_MODEL_REGEX.test(model.id)) {
+-        return {}
+-      }
+       // 'none' is not an available value for effort for now.
+       // I think they should resolve this issue soon, so I'll just go ahead and use this value.
+       if (isGPT51SeriesModel(model) && reasoningEffort === 'none') {
+         return { reasoning: { effort: 'none' } }
+       }
+-      // Don't disable reasoning for models that require it
+-      if (
+-        isGrokReasoningModel(model) ||
+-        isOpenAIReasoningModel(model) ||
+-        isQwenAlwaysThinkModel(model) ||
+-        model.id.includes('seed-oss') ||
+-        model.id.includes('minimax-m2')
+-      ) {
+-        return {}
+-      }
+       return { reasoning: { enabled: false, exclude: true } }
+     }
+ 
+@@ -100,11 +91,6 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { enable_thinking: false }
+     }
+ 
+-    // claude
+-    if (isSupportedThinkingTokenClaudeModel(model)) {
+-      return {}
+-    }
+-
+     // gemini
+     if (isSupportedThinkingTokenGeminiModel(model)) {
+       if (GEMINI_FLASH_MODEL_REGEX.test(model.id)) {
+@@ -117,8 +103,10 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+             }
+           }
+         }
++      } else {
++        logger.warn(`Model ${model.id} cannot disable reasoning. Fallback to empty reasoning param.`)
++        return {}
+       }
+-      return {}
+     }
+ 
+     // use thinking, doubao, zhipu, etc.
+@@ -138,10 +126,74 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       }
+     }
+ 
++    logger.warn(`Model ${model.id} doesn't match any disable reasoning behavior. Fallback to empty reasoning param.`)
+     return {}
+   }
+ 
+   // reasoningEffort有效的情况
++  // https://creator.poe.com/docs/external-applications/openai-compatible-api#additional-considerations
++  // Poe provider - supports custom bot parameters via extra_body
++  if (provider.id === SystemProviderIds.poe) {
++    // GPT-5 series models use reasoning_effort parameter in extra_body
++    if (isGPT5SeriesModel(model) || isGPT51SeriesModel(model)) {
++      return {
++        extra_body: {
++          reasoning_effort: reasoningEffort === 'auto' ? 'medium' : reasoningEffort
++        }
++      }
++    }
++
++    // Claude models use thinking_budget parameter in extra_body
++    if (isSupportedThinkingTokenClaudeModel(model)) {
++      const effortRatio = EFFORT_RATIO[reasoningEffort]
++      const tokenLimit = findTokenLimit(model.id)
++      const maxTokens = assistant.settings?.maxTokens
++
++      if (!tokenLimit) {
++        logger.warn(
++          `No token limit configuration found for Claude model "${model.id}" on Poe provider. ` +
++            `Reasoning effort setting "${reasoningEffort}" will not be applied.`
++        )
++        return {}
++      }
++
++      let budgetTokens = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
++      budgetTokens = Math.floor(Math.max(1024, Math.min(budgetTokens, (maxTokens || DEFAULT_MAX_TOKENS) * effortRatio)))
++
++      return {
++        extra_body: {
++          thinking_budget: budgetTokens
++        }
++      }
++    }
++
++    // Gemini models use thinking_budget parameter in extra_body
++    if (isSupportedThinkingTokenGeminiModel(model)) {
++      const effortRatio = EFFORT_RATIO[reasoningEffort]
++      const tokenLimit = findTokenLimit(model.id)
++      let budgetTokens: number | undefined
++      if (tokenLimit && reasoningEffort !== 'auto') {
++        budgetTokens = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
++      } else if (!tokenLimit && reasoningEffort !== 'auto') {
++        logger.warn(
++          `No token limit configuration found for Gemini model "${model.id}" on Poe provider. ` +
++            `Using auto (-1) instead of requested effort "${reasoningEffort}".`
++        )
++      }
++      return {
++        extra_body: {
++          thinking_budget: budgetTokens ?? -1
++        }
++      }
++    }
++
++    // Poe reasoning model not in known categories (GPT-5, Claude, Gemini)
++    logger.warn(
++      `Poe provider reasoning model "${model.id}" does not match known categories ` +
++        `(GPT-5, Claude, Gemini). Reasoning effort setting "${reasoningEffort}" will not be applied.`
++    )
++    return {}
++  }
+ 
+   // OpenRouter models
+   if (model.provider === SystemProviderIds.openrouter) {
+@@ -229,6 +281,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   }
+ 
+   // OpenRouter models, use reasoning
++  // FIXME: duplicated openrouter handling. remove one
+   if (model.provider === SystemProviderIds.openrouter) {
+     if (isSupportedReasoningEffortModel(model) || isSupportedThinkingTokenModel(model)) {
+       return {
+@@ -281,7 +334,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   // gemini series, openai compatible api
+   if (isSupportedThinkingTokenGeminiModel(model)) {
+     // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#openai_compatibility
+-    if (isGemini3Model(model)) {
++    if (isGemini3ThinkingTokenModel(model)) {
+       return {
+         reasoning_effort: reasoningEffort
+       }
+@@ -465,20 +518,20 @@ export function getAnthropicReasoningParams(
+   return {}
+ }
+ 
+-type GoogelThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinkingConfig']>['thinkingLevel']
+-
+-function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): GoogelThinkingLevel {
+-  switch (reasoningEffort) {
+-    case 'low':
+-      return 'low'
+-    case 'medium':
+-      return 'medium'
+-    case 'high':
+-      return 'high'
+-    default:
+-      return 'medium'
+-  }
+-}
++// type GoogleThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinkingConfig']>['thinkingLevel']
++
++// function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): GoogelThinkingLevel {
++//   switch (reasoningEffort) {
++//     case 'low':
++//       return 'low'
++//     case 'medium':
++//       return 'medium'
++//     case 'high':
++//       return 'high'
++//     default:
++//       return 'medium'
++//   }
++// }
+ 
+ /**
+  * 获取 Gemini 推理参数
+@@ -507,14 +560,15 @@ export function getGeminiReasoningParams(
+       }
+     }
+ 
++    // TODO: 很多中转还不支持
+     // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
+-    if (isGemini3Model(model)) {
+-      return {
+-        thinkingConfig: {
+-          thinkingLevel: mapToGeminiThinkingLevel(reasoningEffort)
+-        }
+-      }
+-    }
++    // if (isGemini3ThinkingTokenModel(model)) {
++    //   return {
++    //     thinkingConfig: {
++    //       thinkingLevel: mapToGeminiThinkingLevel(reasoningEffort)
++    //     }
++    //   }
++    // }
+ 
+     const effortRatio = EFFORT_RATIO[reasoningEffort]
+ 
+@@ -619,6 +673,10 @@ export function getCustomParameters(assistant: Assistant): Record<string, any> {
+       if (!param.name?.trim()) {
+         return acc
+       }
++      // Parse JSON type parameters
++      // Related: src/renderer/src/pages/settings/AssistantSettings/AssistantModelSettings.tsx:133-148
++      // The UI stores JSON type params as strings (e.g., '{"key":"value"}')
++      // This function parses them into objects before sending to the API
+       if (param.type === 'json') {
+         const value = param.value as string
+         if (value === 'undefined') {
