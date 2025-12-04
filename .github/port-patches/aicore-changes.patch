@@ -1,0 +1,1161 @@
+diff --git a/src/aiCore/chunk/handleToolCallChunk.ts b/src/aiCore/chunk/handleToolCallChunk.ts
+index 32c7e53..b5acbb6 100644
+--- a/src/aiCore/chunk/handleToolCallChunk.ts
++++ b/src/aiCore/chunk/handleToolCallChunk.ts
+@@ -212,8 +212,9 @@ export class ToolCallChunkHandler {
+         description: toolName,
+         type: 'builtin'
+       } as BaseTool
+-    } else if ((mcpTool = this.mcpTools.find((t) => t.name === toolName) as MCPTool)) {
++    } else if ((mcpTool = this.mcpTools.find((t) => t.id === toolName) as MCPTool)) {
+       // 如果是客户端执行的 MCP 工具，沿用现有逻辑
++      // toolName is mcpTool.id (registered with id as key in convertMcpToolsToAiSdkTools)
+       logger.info(`[ToolCallChunkHandler] Handling client-side MCP tool: ${toolName}`)
+       // mcpTool = this.mcpTools.find((t) => t.name === toolName) as MCPTool
+       // if (!mcpTool) {
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index cf12a46..ed92d4d 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -27,6 +27,7 @@ import { buildAiSdkMiddlewares } from './middleware/AiSdkMiddlewareBuilder'
+ import { buildPlugins } from './plugins/PluginBuilder'
+ import { createAiSdkProvider } from './provider/factory'
+ import {
++  adaptProvider,
+   getActualProvider,
+   isModernSdkSupported,
+   prepareSpecialProviderConfig,
+@@ -64,12 +65,11 @@ export default class ModernAiProvider {
+    *    - URL will be automatically formatted via `formatProviderApiHost`, adding version suffixes like `/v1`
+    *
+    * 2. When called with `(model, provider)`:
+-   *    - **Directly uses the provided provider WITHOUT going through `getActualProvider`**
+-   *    - **URL will NOT be automatically formatted, `/v1` suffix will NOT be added**
+-   *    - This is legacy behavior kept for backward compatibility
++   *    - The provided provider will be adapted via `adaptProvider`
++   *    - URL formatting behavior depends on the adapted result
+    *
+    * 3. When called with `(provider)`:
+-   *    - Directly uses the provider without requiring a model
++   *    - The provider will be adapted via `adaptProvider`
+    *    - Used for operations that don't need a model (e.g., fetchModels)
+    *
+    * @example
+@@ -77,7 +77,7 @@ export default class ModernAiProvider {
+    * // Recommended: Auto-format URL
+    * const ai = new ModernAiProvider(model)
+    *
+-   * // Not recommended: Skip URL formatting (only for special cases)
++   * // Provider will be adapted
+    * const ai = new ModernAiProvider(model, customProvider)
+    *
+    * // For operations that don't need a model
+@@ -91,12 +91,12 @@ export default class ModernAiProvider {
+     if (this.isModel(modelOrProvider)) {
+       // 传入的是 Model
+       this.model = modelOrProvider
+-      this.actualProvider = provider || getActualProvider(modelOrProvider)
++      this.actualProvider = provider ? adaptProvider({ provider }) : getActualProvider(modelOrProvider)
+       // 只保存配置，不预先创建executor
+       this.config = providerToAiSdkConfig(this.actualProvider, modelOrProvider)
+     } else {
+       // 传入的是 Provider
+-      this.actualProvider = modelOrProvider
++      this.actualProvider = adaptProvider({ provider: modelOrProvider })
+       // model为可选，某些操作（如fetchModels）不需要model
+     }
+ 
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index c1c06b3..92f24b4 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -9,6 +9,7 @@ import {
+ import { REFERENCE_PROMPT } from '@renderer/config/prompts'
+ import { getLMStudioKeepAliveTime } from '@renderer/hooks/useLMStudio'
+ import { getAssistantSettings } from '@renderer/services/AssistantService'
++import type { RootState } from '@renderer/store'
+ import type {
+   Assistant,
+   GenerateImageParams,
+@@ -245,23 +246,20 @@ export abstract class BaseApiClient<
+ 
+   protected getVerbosity(model?: Model): OpenAIVerbosity {
+     try {
+-      const state = window.store?.getState()
++      const state = window.store?.getState() as RootState
+       const verbosity = state?.settings?.openAI?.verbosity
+ 
+-      if (verbosity && ['low', 'medium', 'high'].includes(verbosity)) {
+-        // If model is provided, check if the verbosity is supported by the model
+-        if (model) {
+-          const supportedVerbosity = getModelSupportedVerbosity(model)
+-          // Use user's verbosity if supported, otherwise use the first supported option
+-          return supportedVerbosity.includes(verbosity) ? verbosity : supportedVerbosity[0]
+-        }
+-        return verbosity
++      // If model is provided, check if the verbosity is supported by the model
++      if (model) {
++        const supportedVerbosity = getModelSupportedVerbosity(model)
++        // Use user's verbosity if supported, otherwise use the first supported option
++        return supportedVerbosity.includes(verbosity) ? verbosity : supportedVerbosity[0]
+       }
++      return verbosity
+     } catch (error) {
+-      logger.warn('Failed to get verbosity from state:', error as Error)
++      logger.warn('Failed to get verbosity from state. Fallback to undefined.', error as Error)
++      return undefined
+     }
+-
+-    return 'medium'
+   }
+ 
+   protected getTimeout(model: Model) {
+@@ -405,6 +403,9 @@ export abstract class BaseApiClient<
+         if (!param.name?.trim()) {
+           return acc
+         }
++        // Parse JSON type parameters (Legacy API clients)
++        // Related: src/renderer/src/pages/settings/AssistantSettings/AssistantModelSettings.tsx:133-148
++        // The UI stores JSON type params as strings, this function parses them before sending to API
+         if (param.type === 'json') {
+           const value = param.value as string
+           if (value === 'undefined') {
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index 27e659c..9c930a3 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -46,6 +46,7 @@ import type {
+   GeminiSdkRawOutput,
+   GeminiSdkToolCall
+ } from '@renderer/types/sdk'
++import { getTrailingApiVersion, withoutTrailingApiVersion } from '@renderer/utils'
+ import { isToolUseModeFunction } from '@renderer/utils/assistant'
+ import {
+   geminiFunctionCallToMcpTool,
+@@ -163,6 +164,10 @@ export class GeminiAPIClient extends BaseApiClient<
+     return models
+   }
+ 
++  override getBaseURL(): string {
++    return withoutTrailingApiVersion(super.getBaseURL())
++  }
++
+   override async getSdkInstance() {
+     if (this.sdkInstance) {
+       return this.sdkInstance
+@@ -188,6 +193,13 @@ export class GeminiAPIClient extends BaseApiClient<
+     if (this.provider.isVertex) {
+       return 'v1'
+     }
++
++    // Extract trailing API version from the URL
++    const trailingVersion = getTrailingApiVersion(this.provider.apiHost || '')
++    if (trailingVersion) {
++      return trailingVersion
++    }
++
+     return 'v1beta'
+   }
+ 
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index ea50680..cfc9087 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -32,7 +32,6 @@ import {
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+   isSupportedThinkingTokenZhipuModel,
+-  isSupportVerbosityModel,
+   isVisionModel,
+   MODEL_SUPPORTED_REASONING_EFFORT,
+   ZHIPU_RESULT_TOKENS
+@@ -714,13 +713,8 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+           ...modalities,
+           // groq 有不同的 service tier 配置，不符合 openai 接口类型
+           service_tier: this.getServiceTier(model) as OpenAIServiceTier,
+-          ...(isSupportVerbosityModel(model)
+-            ? {
+-                text: {
+-                  verbosity: this.getVerbosity(model)
+-                }
+-              }
+-            : {}),
++          // verbosity. getVerbosity ensures the returned value is valid.
++          verbosity: this.getVerbosity(model),
+           ...this.getProviderSpecificParameters(assistant, model),
+           ...reasoningEffort,
+           // ...getOpenAIWebSearchParams(model, enableWebSearch),
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index 9a8d5f8..dc97e74 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -11,7 +11,7 @@ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { SettingsState } from '@renderer/store/settings'
+-import type { Assistant, GenerateImageParams, Model, Provider } from '@renderer/types'
++import { type Assistant, type GenerateImageParams, type Model, type Provider } from '@renderer/types'
+ import type {
+   OpenAIResponseSdkMessageParam,
+   OpenAIResponseSdkParams,
+@@ -25,7 +25,8 @@ import type {
+   OpenAISdkRawOutput,
+   ReasoningEffortOptionalParams
+ } from '@renderer/types/sdk'
+-import { formatApiHost } from '@renderer/utils/api'
++import { formatApiHost, withoutTrailingSlash } from '@renderer/utils/api'
++import { isOllamaProvider } from '@renderer/utils/provider'
+ 
+ import { BaseApiClient } from '../BaseApiClient'
+ 
+@@ -115,6 +116,34 @@ export abstract class OpenAIBaseClient<
+           }))
+           .filter(isSupportedModel)
+       }
++
++      if (isOllamaProvider(this.provider)) {
++        const baseUrl = withoutTrailingSlash(this.getBaseURL(false))
++          .replace(/\/v1$/, '')
++          .replace(/\/api$/, '')
++        const response = await fetch(`${baseUrl}/api/tags`, {
++          headers: {
++            Authorization: `Bearer ${this.apiKey}`,
++            ...this.defaultHeaders(),
++            ...this.provider.extra_headers
++          }
++        })
++
++        if (!response.ok) {
++          throw new Error(`Ollama server returned ${response.status} ${response.statusText}`)
++        }
++
++        const data = await response.json()
++        if (!data?.models || !Array.isArray(data.models)) {
++          throw new Error('Invalid response from Ollama API: missing models array')
++        }
++
++        return data.models.map((model) => ({
++          id: model.name,
++          object: 'model',
++          owned_by: 'ollama'
++        }))
++      }
+       const response = await sdk.models.list()
+       if (this.provider.id === 'together') {
+         // @ts-ignore key is not typed
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+index b314ddd..10a4d59 100644
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+@@ -4,7 +4,7 @@ import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/con
+ import type { MCPTool } from '@renderer/types'
+ import { type Assistant, type Message, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+-import { isSupportEnableThinkingProvider } from '@renderer/utils/provider'
++import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import type { LanguageModelMiddleware } from 'ai'
+ import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+ import { isEmpty } from 'lodash'
+@@ -240,6 +240,7 @@ function addModelSpecificMiddlewares(builder: AiSdkMiddlewareBuilder, config: Ai
+   // Use /think or /no_think suffix to control thinking mode
+   if (
+     config.provider &&
++    !isOllamaProvider(config.provider) &&
+     isSupportedThinkingTokenQwenModel(config.model) &&
+     !isSupportEnableThinkingProvider(config.provider)
+   ) {
+diff --git a/src/aiCore/prepareParams/header.ts b/src/aiCore/prepareParams/header.ts
+index 19d4611..480f133 100644
+--- a/src/aiCore/prepareParams/header.ts
++++ b/src/aiCore/prepareParams/header.ts
+@@ -7,7 +7,7 @@ import { isAwsBedrockProvider, isVertexProvider } from '@renderer/utils/provider
+ // https://docs.claude.com/en/docs/build-with-claude/extended-thinking#interleaved-thinking
+ const INTERLEAVED_THINKING_HEADER = 'interleaved-thinking-2025-05-14'
+ // https://docs.claude.com/en/docs/build-with-claude/context-windows#1m-token-context-window
+-const CONTEXT_100M_HEADER = 'context-1m-2025-08-07'
++// const CONTEXT_100M_HEADER = 'context-1m-2025-08-07'
+ // https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/web-search
+ const WEBSEARCH_HEADER = 'web-search-2025-03-05'
+ 
+@@ -17,7 +17,7 @@ export function addAnthropicHeaders(assistant: Assistant, model: Model): string[
+   if (
+     isClaude45ReasoningModel(model) &&
+     isToolUseModeFunction(assistant) &&
+-    !(isVertexProvider(provider) && isAwsBedrockProvider(provider))
++    !(isVertexProvider(provider) || isAwsBedrockProvider(provider))
+   ) {
+     anthropicHeaders.push(INTERLEAVED_THINKING_HEADER)
+   }
+@@ -25,7 +25,9 @@ export function addAnthropicHeaders(assistant: Assistant, model: Model): string[
+     if (isVertexProvider(provider) && assistant.enableWebSearch) {
+       anthropicHeaders.push(WEBSEARCH_HEADER)
+     }
+-    anthropicHeaders.push(CONTEXT_100M_HEADER)
++    // We may add it by user preference in assistant.settings instead of always adding it.
++    // See #11540, #11397
++    // anthropicHeaders.push(CONTEXT_100M_HEADER)
+   }
+   return anthropicHeaders
+ }
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index dda3bd0..5749e6c 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -14,9 +14,9 @@ import { isBaseProvider } from '@cherrystudio/ai-core/core/providers/schemas'
+ import { loggerService } from '@logger'
+ import {
+   isAnthropicModel,
++  isFixedReasoningModel,
+   isGenerateImageModel,
+   isOpenRouterBuiltInWebSearchModel,
+-  isReasoningModel,
+   isSupportedReasoningEffortModel,
+   isSupportedThinkingTokenModel,
+   isWebSearchModel
+@@ -28,6 +28,7 @@ import { type Assistant, type MCPTool, type Provider } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
++import { isAwsBedrockProvider } from '@renderer/utils/provider'
+ import type { ModelMessage, Tool } from 'ai'
+ import { stepCountIs } from 'ai'
+ 
+@@ -82,7 +83,7 @@ export async function buildStreamTextParams(
+   const enableReasoning =
+     ((isSupportedThinkingTokenModel(model) || isSupportedReasoningEffortModel(model)) &&
+       assistant.settings?.reasoning_effort !== undefined) ||
+-    (isReasoningModel(model) && (!isSupportedThinkingTokenModel(model) || !isSupportedReasoningEffortModel(model)))
++    isFixedReasoningModel(model)
+ 
+   // 判断是否使用内置搜索
+   // 条件：没有外部搜索提供商 && (用户开启了内置搜索 || 模型强制使用内置搜索)
+@@ -175,9 +176,13 @@ export async function buildStreamTextParams(
+ 
+   let headers: Record<string, string | undefined> = options.requestOptions?.headers ?? {}
+ 
+-  if (isAnthropicModel(model)) {
+-    const newBetaHeaders = { 'anthropic-beta': addAnthropicHeaders(assistant, model).join(',') }
+-    headers = combineHeaders(headers, newBetaHeaders)
++  if (isAnthropicModel(model) && !isAwsBedrockProvider(provider)) {
++    const betaHeaders = addAnthropicHeaders(assistant, model)
++    // Only add the anthropic-beta header if there are actual beta headers to include
++    if (betaHeaders.length > 0) {
++      const newBetaHeaders = { 'anthropic-beta': betaHeaders.join(',') }
++      headers = combineHeaders(headers, newBetaHeaders)
++    }
+   }
+ 
+   // 构建基础参数
+diff --git a/src/aiCore/provider/__tests__/integratedRegistry.test.ts b/src/aiCore/provider/__tests__/integratedRegistry.test.ts
+index 1e8b1a9..9b2c063 100644
+--- a/src/aiCore/provider/__tests__/integratedRegistry.test.ts
++++ b/src/aiCore/provider/__tests__/integratedRegistry.test.ts
+@@ -1,4 +1,4 @@
+-import type { Provider } from '@renderer/types'
++import type { Model, Provider } from '@renderer/types'
+ import { describe, expect, it, vi } from 'vitest'
+ 
+ import { getAiSdkProviderId } from '../factory'
+@@ -68,6 +68,18 @@ function createTestProvider(id: string, type: string): Provider {
+   } as Provider
+ }
+ 
++function createAzureProvider(id: string, apiVersion?: string, model?: string): Provider {
++  return {
++    id,
++    type: 'azure-openai',
++    name: `Azure Test ${id}`,
++    apiKey: 'azure-test-key',
++    apiHost: 'azure-test-host',
++    apiVersion,
++    models: [{ id: model || 'gpt-4' } as Model]
++  }
++}
++
+ describe('Integrated Provider Registry', () => {
+   describe('Provider ID Resolution', () => {
+     it('should resolve openrouter provider correctly', () => {
+@@ -111,6 +123,24 @@ describe('Integrated Provider Registry', () => {
+       const result = getAiSdkProviderId(unknownProvider)
+       expect(result).toBe('unknown-provider')
+     })
++
++    it('should handle Azure OpenAI providers correctly', () => {
++      const azureProvider = createAzureProvider('azure-test', '2024-02-15', 'gpt-4o')
++      const result = getAiSdkProviderId(azureProvider)
++      expect(result).toBe('azure')
++    })
++
++    it('should handle Azure OpenAI providers response endpoint correctly', () => {
++      const azureProvider = createAzureProvider('azure-test', 'v1', 'gpt-4o')
++      const result = getAiSdkProviderId(azureProvider)
++      expect(result).toBe('azure-responses')
++    })
++
++    it('should handle Azure provider Claude Models', () => {
++      const provider = createTestProvider('azure-anthropic', 'anthropic')
++      const result = getAiSdkProviderId(provider)
++      expect(result).toBe('azure-anthropic')
++    })
+   })
+ 
+   describe('Backward Compatibility', () => {
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index 9760839..ff10005 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -56,6 +56,7 @@ function tryResolveProviderId(identifier: string): ProviderId | null {
+ /**
+  * 获取AI SDK Provider ID
+  * 简化版：减少重复逻辑，利用通用解析函数
++ * TODO: 整理函数逻辑
+  */
+ export function getAiSdkProviderId(provider: Provider): string {
+   // 1. 尝试解析provider.id
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 53194d3..9675913 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -11,17 +11,25 @@ import { createVertexProvider, isVertexAIConfigured } from '@renderer/hooks/useV
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import { isSystemProvider, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+-import { formatApiHost, formatAzureOpenAIApiHost, formatVertexApiHost, routeToEndpoint } from '@renderer/utils/api'
++import {
++  formatApiHost,
++  formatAzureOpenAIApiHost,
++  formatOllamaApiHost,
++  formatVertexApiHost,
++  routeToEndpoint
++} from '@renderer/utils/api'
+ import {
+   isAnthropicProvider,
+   isAzureOpenAIProvider,
+   isCherryAIProvider,
+   isGeminiProvider,
+   isNewApiProvider,
++  isOllamaProvider,
+   isPerplexityProvider,
++  isSupportStreamOptionsProvider,
+   isVertexProvider
+ } from '@renderer/utils/provider'
+-import { cloneDeep } from 'lodash'
++import { cloneDeep, isEmpty } from 'lodash'
+ 
+ import type { AiSdkConfig } from '../types'
+ import { aihubmixProviderCreator, newApiResolverCreator, vertexAnthropicProviderCreator } from './config'
+@@ -78,11 +86,13 @@ function handleSpecialProviders(model: Model, provider: Provider): Provider {
+ }
+ 
+ /**
+- * 主要用来对齐AISdk的BaseURL格式
+- * @param provider
+- * @returns
++ * Format and normalize the API host URL for a provider.
++ * Handles provider-specific URL formatting rules (e.g., appending version paths, Azure formatting).
++ *
++ * @param provider - The provider whose API host is to be formatted.
++ * @returns A new provider instance with the formatted API host.
+  */
+-function formatProviderApiHost(provider: Provider): Provider {
++export function formatProviderApiHost(provider: Provider): Provider {
+   const formatted = { ...provider }
+   if (formatted.anthropicApiHost) {
+     formatted.anthropicApiHost = formatApiHost(formatted.anthropicApiHost)
+@@ -97,6 +107,8 @@ function formatProviderApiHost(provider: Provider): Provider {
+     }
+   } else if (formatted.id === SystemProviderIds.copilot || formatted.id === SystemProviderIds.github) {
+     formatted.apiHost = formatApiHost(formatted.apiHost, false)
++  } else if (isOllamaProvider(formatted)) {
++    formatted.apiHost = formatOllamaApiHost(formatted.apiHost)
+   } else if (isGeminiProvider(formatted)) {
+     formatted.apiHost = formatApiHost(formatted.apiHost, true, 'v1beta')
+   } else if (isAzureOpenAIProvider(formatted)) {
+@@ -114,18 +126,38 @@ function formatProviderApiHost(provider: Provider): Provider {
+ }
+ 
+ /**
+- * 获取实际的Provider配置
+- * 简化版：将逻辑分解为小函数
++ * Retrieve the effective Provider configuration for the given model.
++ * Applies all necessary transformations (special-provider handling, URL formatting, etc.).
++ *
++ * @param model - The model whose provider is to be resolved.
++ * @returns A new Provider instance with all adaptations applied.
+  */
+ export function getActualProvider(model: Model): Provider {
+   const baseProvider = getProviderByModel(model)
+ 
+-  // 按顺序处理各种转换
+-  let actualProvider = cloneDeep(baseProvider)
+-  actualProvider = handleSpecialProviders(model, actualProvider)
+-  actualProvider = formatProviderApiHost(actualProvider)
++  return adaptProvider({ provider: baseProvider, model })
++}
++
++/**
++ * Transforms a provider configuration by applying model-specific adaptations and normalizing its API host.
++ * The transformations are applied in the following order:
++ * 1. Model-specific provider handling (e.g., New-API, system providers, Azure OpenAI)
++ * 2. API host formatting (provider-specific URL normalization)
++ *
++ * @param provider - The base provider configuration to transform.
++ * @param model - The model associated with the provider; optional but required for special-provider handling.
++ * @returns A new Provider instance with all transformations applied.
++ */
++export function adaptProvider({ provider, model }: { provider: Provider; model?: Model }): Provider {
++  let adaptedProvider = cloneDeep(provider)
++
++  // Apply transformations in order
++  if (model) {
++    adaptedProvider = handleSpecialProviders(model, adaptedProvider)
++  }
++  adaptedProvider = formatProviderApiHost(adaptedProvider)
+ 
+-  return actualProvider
++  return adaptedProvider
+ }
+ 
+ /**
+@@ -161,6 +193,19 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
++  if (isOllamaProvider(actualProvider)) {
++    return {
++      providerId: 'ollama',
++      options: {
++        ...baseConfig,
++        headers: {
++          ...actualProvider.extra_headers,
++          Authorization: !isEmpty(baseConfig.apiKey) ? `Bearer ${baseConfig.apiKey}` : undefined
++        }
++      }
++    }
++  }
++
+   // 处理OpenAI模式
+   const extraOptions: any = {}
+   extraOptions.endpoint = endpoint
+@@ -242,7 +287,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+       ...options,
+       name: actualProvider.id,
+       ...extraOptions,
+-      includeUsage: true
++      includeUsage: isSupportStreamOptionsProvider(actualProvider)
+     }
+   }
+ }
+@@ -314,7 +359,6 @@ export async function prepareSpecialProviderConfig(
+             ...(config.options.headers ? config.options.headers : {}),
+             'Content-Type': 'application/json',
+             'anthropic-version': '2023-06-01',
+-            'anthropic-beta': 'oauth-2025-04-20',
+             Authorization: `Bearer ${oauthToken}`
+           },
+           baseURL: 'https://api.anthropic.com/v1',
+diff --git a/src/aiCore/provider/providerInitialization.ts b/src/aiCore/provider/providerInitialization.ts
+index 2e4b9fc..a42e2ac 100644
+--- a/src/aiCore/provider/providerInitialization.ts
++++ b/src/aiCore/provider/providerInitialization.ts
+@@ -94,6 +94,13 @@ export const NEW_PROVIDER_CONFIGS: ProviderConfig[] = [
+     import: () => import('@ai-sdk/cerebras'),
+     creatorFunctionName: 'createCerebras',
+     supportsImageGeneration: false
++  },
++  {
++    id: 'ollama',
++    name: 'Ollama',
++    import: () => import('ollama-ai-provider-v2'),
++    creatorFunctionName: 'createOllama',
++    supportsImageGeneration: false
+   }
+ ] as const
+ 
+diff --git a/src/aiCore/trace/AiSdkSpanAdapter.ts b/src/aiCore/trace/AiSdkSpanAdapter.ts
+index f3df504..0c0e08a 100644
+--- a/src/aiCore/trace/AiSdkSpanAdapter.ts
++++ b/src/aiCore/trace/AiSdkSpanAdapter.ts
+@@ -245,8 +245,8 @@ export class AiSdkSpanAdapter {
+       'gen_ai.usage.output_tokens'
+     ]
+ 
+-    const completionTokens = attributes[inputsTokenKeys.find((key) => attributes[key]) || '']
+-    const promptTokens = attributes[outputTokenKeys.find((key) => attributes[key]) || '']
++    const promptTokens = attributes[inputsTokenKeys.find((key) => attributes[key]) || '']
++    const completionTokens = attributes[outputTokenKeys.find((key) => attributes[key]) || '']
+ 
+     if (completionTokens !== undefined || promptTokens !== undefined) {
+       const usage: TokenUsage = {
+diff --git a/src/aiCore/trace/__tests__/AiSdkSpanAdapter.test.ts b/src/aiCore/trace/__tests__/AiSdkSpanAdapter.test.ts
+new file mode 100644
+index 0000000..4cd6241
+--- /dev/null
++++ b/src/aiCore/trace/__tests__/AiSdkSpanAdapter.test.ts
+@@ -0,0 +1,53 @@
++import type { Span } from '@opentelemetry/api'
++import { SpanKind, SpanStatusCode } from '@opentelemetry/api'
++import { describe, expect, it, vi } from 'vitest'
++
++import { AiSdkSpanAdapter } from '../AiSdkSpanAdapter'
++
++vi.mock('@logger', () => ({
++  loggerService: {
++    withContext: () => ({
++      debug: vi.fn(),
++      error: vi.fn(),
++      info: vi.fn(),
++      warn: vi.fn()
++    })
++  }
++}))
++
++describe('AiSdkSpanAdapter', () => {
++  const createMockSpan = (attributes: Record<string, unknown>): Span => {
++    const span = {
++      spanContext: () => ({
++        traceId: 'trace-id',
++        spanId: 'span-id'
++      }),
++      _attributes: attributes,
++      _events: [],
++      name: 'test span',
++      status: { code: SpanStatusCode.OK },
++      kind: SpanKind.CLIENT,
++      startTime: [0, 0] as [number, number],
++      endTime: [0, 1] as [number, number],
++      ended: true,
++      parentSpanId: '',
++      links: []
++    }
++    return span as unknown as Span
++  }
++
++  it('maps prompt and completion usage tokens to the correct fields', () => {
++    const attributes = {
++      'ai.usage.promptTokens': 321,
++      'ai.usage.completionTokens': 654
++    }
++
++    const span = createMockSpan(attributes)
++    const result = AiSdkSpanAdapter.convertToSpanEntity({ span })
++
++    expect(result.usage).toBeDefined()
++    expect(result.usage?.prompt_tokens).toBe(321)
++    expect(result.usage?.completion_tokens).toBe(654)
++    expect(result.usage?.total_tokens).toBe(975)
++  })
++})
+diff --git a/src/aiCore/utils/__tests__/mcp.test.ts b/src/aiCore/utils/__tests__/mcp.test.ts
+index a832e9f..dc26a03 100644
+--- a/src/aiCore/utils/__tests__/mcp.test.ts
++++ b/src/aiCore/utils/__tests__/mcp.test.ts
+@@ -71,10 +71,11 @@ describe('mcp utils', () => {
+       const result = setupToolsConfig(mcpTools)
+ 
+       expect(result).not.toBeUndefined()
+-      expect(Object.keys(result!)).toEqual(['test-tool'])
+-      expect(result!['test-tool']).toHaveProperty('description')
+-      expect(result!['test-tool']).toHaveProperty('inputSchema')
+-      expect(result!['test-tool']).toHaveProperty('execute')
++      // Tools are now keyed by id (which includes serverId suffix) for uniqueness
++      expect(Object.keys(result!)).toEqual(['test-tool-1'])
++      expect(result!['test-tool-1']).toHaveProperty('description')
++      expect(result!['test-tool-1']).toHaveProperty('inputSchema')
++      expect(result!['test-tool-1']).toHaveProperty('execute')
+     })
+ 
+     it('should handle multiple MCP tools', () => {
+@@ -109,7 +110,8 @@ describe('mcp utils', () => {
+ 
+       expect(result).not.toBeUndefined()
+       expect(Object.keys(result!)).toHaveLength(2)
+-      expect(Object.keys(result!)).toEqual(['tool1', 'tool2'])
++      // Tools are keyed by id for uniqueness
++      expect(Object.keys(result!)).toEqual(['tool1-id', 'tool2-id'])
+     })
+   })
+ 
+@@ -135,9 +137,10 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result)).toEqual(['get-weather'])
++      // Tools are keyed by id for uniqueness when multiple server instances exist
++      expect(Object.keys(result)).toEqual(['get-weather-id'])
+ 
+-      const tool = result['get-weather'] as Tool
++      const tool = result['get-weather-id'] as Tool
+       expect(tool.description).toBe('Get weather information')
+       expect(tool.inputSchema).toBeDefined()
+       expect(typeof tool.execute).toBe('function')
+@@ -160,8 +163,8 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result)).toEqual(['no-desc-tool'])
+-      const tool = result['no-desc-tool'] as Tool
++      expect(Object.keys(result)).toEqual(['no-desc-tool-id'])
++      const tool = result['no-desc-tool-id'] as Tool
+       expect(tool.description).toBe('Tool from test-server')
+     })
+ 
+@@ -202,13 +205,13 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result)).toEqual(['complex-tool'])
+-      const tool = result['complex-tool'] as Tool
++      expect(Object.keys(result)).toEqual(['complex-tool-id'])
++      const tool = result['complex-tool-id'] as Tool
+       expect(tool.inputSchema).toBeDefined()
+       expect(typeof tool.execute).toBe('function')
+     })
+ 
+-    it('should preserve tool names with special characters', () => {
++    it('should preserve tool id with special characters', () => {
+       const mcpTools: MCPTool[] = [
+         {
+           id: 'special-tool-id',
+@@ -225,7 +228,8 @@ describe('mcp utils', () => {
+       ]
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+-      expect(Object.keys(result)).toEqual(['tool_with-special.chars'])
++      // Tools are keyed by id for uniqueness
++      expect(Object.keys(result)).toEqual(['special-tool-id'])
+     })
+ 
+     it('should handle multiple tools with different schemas', () => {
+@@ -276,10 +280,11 @@ describe('mcp utils', () => {
+ 
+       const result = convertMcpToolsToAiSdkTools(mcpTools)
+ 
+-      expect(Object.keys(result).sort()).toEqual(['boolean-tool', 'number-tool', 'string-tool'])
+-      expect(result['string-tool']).toBeDefined()
+-      expect(result['number-tool']).toBeDefined()
+-      expect(result['boolean-tool']).toBeDefined()
++      // Tools are keyed by id for uniqueness
++      expect(Object.keys(result).sort()).toEqual(['boolean-tool-id', 'number-tool-id', 'string-tool-id'])
++      expect(result['string-tool-id']).toBeDefined()
++      expect(result['number-tool-id']).toBeDefined()
++      expect(result['boolean-tool-id']).toBeDefined()
+     })
+   })
+ 
+@@ -310,7 +315,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['test-exec-tool'] as Tool
++      const tool = tools['test-exec-tool-id'] as Tool
+       const result = await tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'test-call-123' })
+ 
+       expect(requestToolConfirmation).toHaveBeenCalled()
+@@ -343,7 +348,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['cancelled-tool'] as Tool
++      const tool = tools['cancelled-tool-id'] as Tool
+       const result = await tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'cancel-call-123' })
+ 
+       expect(requestToolConfirmation).toHaveBeenCalled()
+@@ -385,7 +390,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['error-tool'] as Tool
++      const tool = tools['error-tool-id'] as Tool
+ 
+       await expect(
+         tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'error-call-123' })
+@@ -421,7 +426,7 @@ describe('mcp utils', () => {
+       ]
+ 
+       const tools = convertMcpToolsToAiSdkTools(mcpTools)
+-      const tool = tools['auto-approve-tool'] as Tool
++      const tool = tools['auto-approve-tool-id'] as Tool
+       const result = await tool.execute!({}, { messages: [], abortSignal: undefined, toolCallId: 'auto-call-123' })
+ 
+       expect(requestToolConfirmation).not.toHaveBeenCalled()
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 8f2629f..ca6b883 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -154,6 +154,10 @@ vi.mock('../websearch', () => ({
+   getWebSearchParams: vi.fn(() => ({ enable_search: true }))
+ }))
+ 
++vi.mock('../../prepareParams/header', () => ({
++  addAnthropicHeaders: vi.fn(() => ['context-1m-2025-08-07'])
++}))
++
+ const ensureWindowApi = () => {
+   const globalWindow = window as any
+   globalWindow.api = globalWindow.api || {}
+@@ -633,5 +637,64 @@ describe('options utils', () => {
+         expect(result.providerOptions).toHaveProperty('anthropic')
+       })
+     })
++
++    describe('AWS Bedrock provider', () => {
++      const bedrockProvider = {
++        id: 'bedrock',
++        name: 'AWS Bedrock',
++        type: 'aws-bedrock',
++        apiKey: 'test-key',
++        apiHost: 'https://bedrock.us-east-1.amazonaws.com',
++        models: [] as Model[]
++      } as Provider
++
++      const bedrockModel: Model = {
++        id: 'anthropic.claude-sonnet-4-20250514-v1:0',
++        name: 'Claude Sonnet 4',
++        provider: 'bedrock'
++      } as Model
++
++      it('should build basic Bedrock options', () => {
++        const result = buildProviderOptions(mockAssistant, bedrockModel, bedrockProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('bedrock')
++        expect(result.providerOptions.bedrock).toBeDefined()
++      })
++
++      it('should include anthropicBeta when Anthropic headers are needed', async () => {
++        const { addAnthropicHeaders } = await import('../../prepareParams/header')
++        vi.mocked(addAnthropicHeaders).mockReturnValue(['interleaved-thinking-2025-05-14', 'context-1m-2025-08-07'])
++
++        const result = buildProviderOptions(mockAssistant, bedrockModel, bedrockProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions.bedrock).toHaveProperty('anthropicBeta')
++        expect(result.providerOptions.bedrock.anthropicBeta).toEqual([
++          'interleaved-thinking-2025-05-14',
++          'context-1m-2025-08-07'
++        ])
++      })
++
++      it('should include reasoning parameters when enabled', () => {
++        const result = buildProviderOptions(mockAssistant, bedrockModel, bedrockProvider, {
++          enableReasoning: true,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions.bedrock).toHaveProperty('reasoningConfig')
++        expect(result.providerOptions.bedrock.reasoningConfig).toEqual({
++          type: 'enabled',
++          budgetTokens: 5000
++        })
++      })
++    })
+   })
+ })
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 1303e25..36253e5 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -144,7 +144,7 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({})
+     })
+ 
+-    it('should disable reasoning for OpenRouter when no reasoning effort set', async () => {
++    it('should not override reasoning for OpenRouter when reasoning effort undefined', async () => {
+       const { isReasoningModel } = await import('@renderer/config/models')
+ 
+       vi.mocked(isReasoningModel).mockReturnValue(true)
+@@ -161,6 +161,29 @@ describe('reasoning utils', () => {
+         settings: {}
+       } as Assistant
+ 
++      const result = getReasoningEffort(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should disable reasoning for OpenRouter when reasoning effort explicitly none', async () => {
++      const { isReasoningModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'anthropic/claude-sonnet-4',
++        name: 'Claude Sonnet 4',
++        provider: SystemProviderIds.openrouter
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
+       const result = getReasoningEffort(assistant, model)
+       expect(result).toEqual({ reasoning: { enabled: false, exclude: true } })
+     })
+@@ -269,7 +292,9 @@ describe('reasoning utils', () => {
+       const assistant: Assistant = {
+         id: 'test',
+         name: 'Test',
+-        settings: {}
++        settings: {
++          reasoning_effort: 'none'
++        }
+       } as Assistant
+ 
+       const result = getReasoningEffort(assistant, model)
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index 84bc661..7d3be9a 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -28,7 +28,9 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[]): ToolSet {
+   const tools: ToolSet = {}
+ 
+   for (const mcpTool of mcpTools) {
+-    tools[mcpTool.name] = tool({
++    // Use mcpTool.id (which includes serverId suffix) to ensure uniqueness
++    // when multiple instances of the same MCP server type are configured
++    tools[mcpTool.id] = tool({
+       description: mcpTool.description || `Tool from ${mcpTool.serverName}`,
+       inputSchema: jsonSchema(mcpTool.inputSchema as JSONSchema7),
+       execute: async (params, { toolCallId }) => {
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 4fb6f07..2efaa69 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -29,13 +29,16 @@ import {
+   type OpenAIServiceTier,
+   OpenAIServiceTiers,
+   type Provider,
+-  type ServiceTier
++  type ServiceTier,
++  SystemProviderIds
+ } from '@renderer/types'
+ import { type AiSdkParam, isAiSdkParam, type OpenAIVerbosity } from '@renderer/types/aiCoreTypes'
+ import { isSupportServiceTierProvider, isSupportVerbosityProvider } from '@renderer/utils/provider'
+ import type { JSONValue } from 'ai'
+ import { t } from 'i18next'
++import type { OllamaCompletionProviderOptions } from 'ollama-ai-provider-v2'
+ 
++import { addAnthropicHeaders } from '../prepareParams/header'
+ import { getAiSdkProviderId } from '../provider/factory'
+ import { buildGeminiGenerateImageParams } from './image'
+ import {
+@@ -235,6 +238,9 @@ export function buildProviderOptions(
+         case 'huggingface':
+           providerSpecificOptions = buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier)
+           break
++        case SystemProviderIds.ollama:
++          providerSpecificOptions = buildOllamaProviderOptions(assistant, capabilities)
++          break
+         default:
+           // 对于其他 provider，使用通用的构建逻辑
+           providerSpecificOptions = {
+@@ -269,7 +275,9 @@ export function buildProviderOptions(
+     }[rawProviderId] || rawProviderId
+ 
+   if (rawProviderKey === 'cherryin') {
+-    rawProviderKey = { gemini: 'google', ['openai-response']: 'openai' }[actualProvider.type] || actualProvider.type
++    rawProviderKey =
++      { gemini: 'google', ['openai-response']: 'openai', openai: 'cherryin' }[actualProvider.type] ||
++      actualProvider.type
+   }
+ 
+   // 返回 AI Core SDK 要求的格式：{ 'providerId': providerOptions } 以及提取的标准参数
+@@ -434,6 +442,7 @@ function buildCherryInProviderOptions(
+ ): OpenAIResponsesProviderOptions | AnthropicProviderOptions | GoogleGenerativeAIProviderOptions {
+   switch (actualProvider.type) {
+     case 'openai':
++      return buildGenericProviderOptions(assistant, model, capabilities)
+     case 'openai-response':
+       return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+ 
+@@ -442,8 +451,10 @@ function buildCherryInProviderOptions(
+ 
+     case 'gemini':
+       return buildGeminiProviderOptions(assistant, model, capabilities)
++
++    default:
++      return buildGenericProviderOptions(assistant, model, capabilities)
+   }
+-  return {}
+ }
+ 
+ /**
+@@ -469,6 +480,28 @@ function buildBedrockProviderOptions(
+     }
+   }
+ 
++  const betaHeaders = addAnthropicHeaders(assistant, model)
++  if (betaHeaders.length > 0) {
++    providerOptions.anthropicBeta = betaHeaders
++  }
++
++  return providerOptions
++}
++
++function buildOllamaProviderOptions(
++  assistant: Assistant,
++  capabilities: {
++    enableReasoning: boolean
++    enableWebSearch: boolean
++    enableGenerateImage: boolean
++  }
++): OllamaCompletionProviderOptions {
++  const { enableReasoning } = capabilities
++  const providerOptions: OllamaCompletionProviderOptions = {}
++  const reasoningEffort = assistant.settings?.reasoning_effort
++  if (enableReasoning) {
++    providerOptions.think = !['none', undefined].includes(reasoningEffort)
++  }
+   return providerOptions
+ }
+ 
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index ba4ab35..46350b0 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -16,10 +16,8 @@ import {
+   isGPT5SeriesModel,
+   isGPT51SeriesModel,
+   isGrok4FastReasoningModel,
+-  isGrokReasoningModel,
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+-  isOpenAIReasoningModel,
+   isQwenAlwaysThinkModel,
+   isQwenReasoningModel,
+   isReasoningModel,
+@@ -64,30 +62,22 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   }
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  // Handle undefined and 'none' reasoningEffort.
+-  // TODO: They should be separated.
+-  if (!reasoningEffort || reasoningEffort === 'none') {
++  // reasoningEffort is not set, no extra reasoning setting
++  // Generally, for every model which supports reasoning control, the reasoning effort won't be undefined.
++  // It's for some reasoning models that don't support reasoning control, such as deepseek reasoner.
++  if (!reasoningEffort) {
++    return {}
++  }
++
++  // Handle 'none' reasoningEffort. It's explicitly off.
++  if (reasoningEffort === 'none') {
+     // openrouter: use reasoning
+     if (model.provider === SystemProviderIds.openrouter) {
+-      // Don't disable reasoning for Gemini models that support thinking tokens
+-      if (isSupportedThinkingTokenGeminiModel(model) && !GEMINI_FLASH_MODEL_REGEX.test(model.id)) {
+-        return {}
+-      }
+       // 'none' is not an available value for effort for now.
+       // I think they should resolve this issue soon, so I'll just go ahead and use this value.
+       if (isGPT51SeriesModel(model) && reasoningEffort === 'none') {
+         return { reasoning: { effort: 'none' } }
+       }
+-      // Don't disable reasoning for models that require it
+-      if (
+-        isGrokReasoningModel(model) ||
+-        isOpenAIReasoningModel(model) ||
+-        isQwenAlwaysThinkModel(model) ||
+-        model.id.includes('seed-oss') ||
+-        model.id.includes('minimax-m2')
+-      ) {
+-        return {}
+-      }
+       return { reasoning: { enabled: false, exclude: true } }
+     }
+ 
+@@ -101,11 +91,6 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { enable_thinking: false }
+     }
+ 
+-    // claude
+-    if (isSupportedThinkingTokenClaudeModel(model)) {
+-      return {}
+-    }
+-
+     // gemini
+     if (isSupportedThinkingTokenGeminiModel(model)) {
+       if (GEMINI_FLASH_MODEL_REGEX.test(model.id)) {
+@@ -118,8 +103,10 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+             }
+           }
+         }
++      } else {
++        logger.warn(`Model ${model.id} cannot disable reasoning. Fallback to empty reasoning param.`)
++        return {}
+       }
+-      return {}
+     }
+ 
+     // use thinking, doubao, zhipu, etc.
+@@ -139,6 +126,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       }
+     }
+ 
++    logger.warn(`Model ${model.id} doesn't match any disable reasoning behavior. Fallback to empty reasoning param.`)
+     return {}
+   }
+ 
+@@ -262,9 +250,25 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+             enable_thinking: true,
+             incremental_output: true
+           }
++        // TODO: 支持 new-api类型
++        case SystemProviderIds['new-api']:
++        case SystemProviderIds.cherryin: {
++          return {
++            extra_body: {
++              thinking: {
++                type: 'enabled' // auto is invalid
++              }
++            }
++          }
++        }
+         case SystemProviderIds.hunyuan:
+         case SystemProviderIds['tencent-cloud-ti']:
+         case SystemProviderIds.doubao:
++        case SystemProviderIds.deepseek:
++        case SystemProviderIds.aihubmix:
++        case SystemProviderIds.sophnet:
++        case SystemProviderIds.ppio:
++        case SystemProviderIds.dmxapi:
+           return {
+             thinking: {
+               type: 'enabled' // auto is invalid
+@@ -286,13 +290,12 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+           logger.warn(
+             `Skipping thinking options for provider ${provider.name} as DeepSeek v3.1 thinking control method is unknown`
+           )
+-        case SystemProviderIds.silicon:
+-        // specially handled before
+       }
+     }
+   }
+ 
+   // OpenRouter models, use reasoning
++  // FIXME: duplicated openrouter handling. remove one
+   if (model.provider === SystemProviderIds.openrouter) {
+     if (isSupportedReasoningEffortModel(model) || isSupportedThinkingTokenModel(model)) {
+       return {
+@@ -684,6 +687,10 @@ export function getCustomParameters(assistant: Assistant): Record<string, any> {
+       if (!param.name?.trim()) {
+         return acc
+       }
++      // Parse JSON type parameters
++      // Related: src/renderer/src/pages/settings/AssistantSettings/AssistantModelSettings.tsx:133-148
++      // The UI stores JSON type params as strings (e.g., '{"key":"value"}')
++      // This function parses them into objects before sending to the API
+       if (param.type === 'json') {
+         const value = param.value as string
+         if (value === 'undefined') {
