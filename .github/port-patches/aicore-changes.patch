@@ -1,0 +1,2133 @@
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index ed92d4d..5c84a72 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -7,10 +7,10 @@
+  * 2. 暂时保持接口兼容性
+  */
+ 
+-import type { GatewayLanguageModelEntry } from '@ai-sdk/gateway'
+ import { createExecutor } from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
++import { normalizeGatewayModels, normalizeSdkModels } from '@renderer/services/models/ModelAdapter'
+ import { addSpan, endSpan } from '@renderer/services/SpanManagerService'
+ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+ import { type Assistant, type GenerateImageParams, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+@@ -91,7 +91,9 @@ export default class ModernAiProvider {
+     if (this.isModel(modelOrProvider)) {
+       // 传入的是 Model
+       this.model = modelOrProvider
+-      this.actualProvider = provider ? adaptProvider({ provider }) : getActualProvider(modelOrProvider)
++      this.actualProvider = provider
++        ? adaptProvider({ provider, model: modelOrProvider })
++        : getActualProvider(modelOrProvider)
+       // 只保存配置，不预先创建executor
+       this.config = providerToAiSdkConfig(this.actualProvider, modelOrProvider)
+     } else {
+@@ -120,9 +122,12 @@ export default class ModernAiProvider {
+       throw new Error('Model is required for completions. Please use constructor with model parameter.')
+     }
+ 
+-    // 每次请求时重新生成配置以确保API key轮换生效
+-    this.config = providerToAiSdkConfig(this.actualProvider, this.model)
+-    logger.debug('Generated provider config for completions', this.config)
++    // Config is now set in constructor, ApiService handles key rotation before passing provider
++    if (!this.config) {
++      // If config wasn't set in constructor (when provider only), generate it now
++      this.config = providerToAiSdkConfig(this.actualProvider, this.model!)
++    }
++    logger.debug('Using provider config for completions', this.config)
+ 
+     // 检查 config 是否存在
+     if (!this.config) {
+@@ -189,7 +194,7 @@ export default class ModernAiProvider {
+     config: ModernAiProviderConfig
+   ): Promise<CompletionsResult> {
+     // ai-gateway不是image/generation 端点，所以就先不走legacy了
+-    if (config.isImageGenerationEndpoint && this.getActualProvider().id !== SystemProviderIds['ai-gateway']) {
++    if (config.isImageGenerationEndpoint && this.getActualProvider().id !== SystemProviderIds.gateway) {
+       // 使用 legacy 实现处理图像生成（支持图片编辑等高级功能）
+       if (!config.uiMessages) {
+         throw new Error('uiMessages is required for image generation endpoint')
+@@ -480,19 +485,12 @@ export default class ModernAiProvider {
+ 
+   // 代理其他方法到原有实现
+   public async models() {
+-    if (this.actualProvider.id === SystemProviderIds['ai-gateway']) {
+-      const formatModel = function (models: GatewayLanguageModelEntry[]): Model[] {
+-        return models.map((m) => ({
+-          id: m.id,
+-          name: m.name,
+-          provider: 'gateway',
+-          group: m.id.split('/')[0],
+-          description: m.description ?? undefined
+-        }))
+-      }
+-      return formatModel((await gateway.getAvailableModels()).models)
++    if (this.actualProvider.id === SystemProviderIds.gateway) {
++      const gatewayModels = (await gateway.getAvailableModels()).models
++      return normalizeGatewayModels(this.actualProvider, gatewayModels)
+     }
+-    return this.legacyProvider.models()
++    const sdkModels = await this.legacyProvider.models()
++    return normalizeSdkModels(this.actualProvider, sdkModels)
+   }
+ 
+   public async getEmbeddingDimensions(model: Model): Promise<number> {
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index e755ce3..5d435b9 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -2,13 +2,15 @@ import { loggerService } from '@logger'
+ import {
+   getModelSupportedVerbosity,
+   isFunctionCallingModel,
+-  isNotSupportTemperatureAndTopP,
+   isOpenAIModel,
+-  isSupportFlexServiceTierModel
++  isSupportFlexServiceTierModel,
++  isSupportTemperatureModel,
++  isSupportTopPModel
+ } from '@renderer/config/models'
+ import { REFERENCE_PROMPT } from '@renderer/config/prompts'
+ import { getLMStudioKeepAliveTime } from '@renderer/hooks/useLMStudio'
+ import { getAssistantSettings } from '@renderer/services/AssistantService'
++import type { RootState } from '@renderer/store'
+ import type {
+   Assistant,
+   GenerateImageParams,
+@@ -199,7 +201,7 @@ export abstract class BaseApiClient<
+   }
+ 
+   public getTemperature(assistant: Assistant, model: Model): number | undefined {
+-    if (isNotSupportTemperatureAndTopP(model)) {
++    if (!isSupportTemperatureModel(model)) {
+       return undefined
+     }
+     const assistantSettings = getAssistantSettings(assistant)
+@@ -207,7 +209,7 @@ export abstract class BaseApiClient<
+   }
+ 
+   public getTopP(assistant: Assistant, model: Model): number | undefined {
+-    if (isNotSupportTemperatureAndTopP(model)) {
++    if (!isSupportTopPModel(model)) {
+       return undefined
+     }
+     const assistantSettings = getAssistantSettings(assistant)
+@@ -245,23 +247,20 @@ export abstract class BaseApiClient<
+ 
+   protected getVerbosity(model?: Model): OpenAIVerbosity {
+     try {
+-      const state = window.store?.getState()
++      const state = window.store?.getState() as RootState
+       const verbosity = state?.settings?.openAI?.verbosity
+ 
+-      if (verbosity && ['low', 'medium', 'high'].includes(verbosity)) {
+-        // If model is provided, check if the verbosity is supported by the model
+-        if (model) {
+-          const supportedVerbosity = getModelSupportedVerbosity(model)
+-          // Use user's verbosity if supported, otherwise use the first supported option
+-          return supportedVerbosity.includes(verbosity) ? verbosity : supportedVerbosity[0]
+-        }
+-        return verbosity
++      // If model is provided, check if the verbosity is supported by the model
++      if (model) {
++        const supportedVerbosity = getModelSupportedVerbosity(model)
++        // Use user's verbosity if supported, otherwise use the first supported option
++        return supportedVerbosity.includes(verbosity) ? verbosity : supportedVerbosity[0]
+       }
++      return verbosity
+     } catch (error) {
+-      logger.warn('Failed to get verbosity from state:', error as Error)
++      logger.warn('Failed to get verbosity from state. Fallback to undefined.', error as Error)
++      return undefined
+     }
+-
+-    return 'medium'
+   }
+ 
+   protected getTimeout(model: Model) {
+diff --git a/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts b/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
+index 15f3cf1..9b63b77 100644
+--- a/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
++++ b/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
+@@ -124,7 +124,8 @@ export class AnthropicAPIClient extends BaseApiClient<
+ 
+   override async listModels(): Promise<Anthropic.ModelInfo[]> {
+     const sdk = (await this.getSdkInstance()) as Anthropic
+-    const response = await sdk.models.list()
++    // prevent auto appended /v1. It's included in baseUrl.
++    const response = await sdk.models.list({ path: '/models' })
+     return response.data
+   }
+ 
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index 9c930a3..ac10106 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -173,13 +173,15 @@ export class GeminiAPIClient extends BaseApiClient<
+       return this.sdkInstance
+     }
+ 
++    const apiVersion = this.getApiVersion()
++
+     this.sdkInstance = new GoogleGenAI({
+       vertexai: false,
+       apiKey: this.apiKey,
+-      apiVersion: this.getApiVersion(),
++      apiVersion,
+       httpOptions: {
+         baseUrl: this.getBaseURL(),
+-        apiVersion: this.getApiVersion(),
++        apiVersion,
+         headers: {
+           ...this.provider.extra_headers
+         }
+@@ -200,7 +202,7 @@ export class GeminiAPIClient extends BaseApiClient<
+       return trailingVersion
+     }
+ 
+-    return 'v1beta'
++    return ''
+   }
+ 
+   /**
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index ea50680..cfc9087 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -32,7 +32,6 @@ import {
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+   isSupportedThinkingTokenZhipuModel,
+-  isSupportVerbosityModel,
+   isVisionModel,
+   MODEL_SUPPORTED_REASONING_EFFORT,
+   ZHIPU_RESULT_TOKENS
+@@ -714,13 +713,8 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+           ...modalities,
+           // groq 有不同的 service tier 配置，不符合 openai 接口类型
+           service_tier: this.getServiceTier(model) as OpenAIServiceTier,
+-          ...(isSupportVerbosityModel(model)
+-            ? {
+-                text: {
+-                  verbosity: this.getVerbosity(model)
+-                }
+-              }
+-            : {}),
++          // verbosity. getVerbosity ensures the returned value is valid.
++          verbosity: this.getVerbosity(model),
+           ...this.getProviderSpecificParameters(assistant, model),
+           ...reasoningEffort,
+           // ...getOpenAIWebSearchParams(model, enableWebSearch),
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index 9a8d5f8..c51f8aa 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -11,7 +11,7 @@ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { SettingsState } from '@renderer/store/settings'
+-import type { Assistant, GenerateImageParams, Model, Provider } from '@renderer/types'
++import { type Assistant, type GenerateImageParams, type Model, type Provider } from '@renderer/types'
+ import type {
+   OpenAIResponseSdkMessageParam,
+   OpenAIResponseSdkParams,
+@@ -25,7 +25,8 @@ import type {
+   OpenAISdkRawOutput,
+   ReasoningEffortOptionalParams
+ } from '@renderer/types/sdk'
+-import { formatApiHost } from '@renderer/utils/api'
++import { withoutTrailingSlash } from '@renderer/utils/api'
++import { isOllamaProvider } from '@renderer/utils/provider'
+ 
+ import { BaseApiClient } from '../BaseApiClient'
+ 
+@@ -48,8 +49,9 @@ export abstract class OpenAIBaseClient<
+   }
+ 
+   // 仅适用于openai
+-  override getBaseURL(isSupportedAPIVerion: boolean = true): string {
+-    return formatApiHost(this.provider.apiHost, isSupportedAPIVerion)
++  override getBaseURL(): string {
++    // apiHost is formatted when called by AiProvider
++    return this.provider.apiHost
+   }
+ 
+   override async generateImage({
+@@ -99,6 +101,17 @@ export abstract class OpenAIBaseClient<
+   override async listModels(): Promise<OpenAI.Models.Model[]> {
+     try {
+       const sdk = await this.getSdkInstance()
++      if (this.provider.id === 'openrouter') {
++        // https://openrouter.ai/docs/api/api-reference/embeddings/list-embeddings-models
++        const embedBaseUrl = 'https://openrouter.ai/api/v1/embeddings'
++        const embedSdk = sdk.withOptions({ baseURL: embedBaseUrl })
++        const modelPromise = sdk.models.list()
++        const embedModelPromise = embedSdk.models.list()
++        const [modelResponse, embedModelResponse] = await Promise.all([modelPromise, embedModelPromise])
++        const models = [...modelResponse.data, ...embedModelResponse.data]
++        const uniqueModels = Array.from(new Map(models.map((model) => [model.id, model])).values())
++        return uniqueModels.filter(isSupportedModel)
++      }
+       if (this.provider.id === 'github') {
+         // GitHub Models 其 models 和 chat completions 两个接口的 baseUrl 不一样
+         const baseUrl = 'https://models.github.ai/catalog/'
+@@ -115,6 +128,34 @@ export abstract class OpenAIBaseClient<
+           }))
+           .filter(isSupportedModel)
+       }
++
++      if (isOllamaProvider(this.provider)) {
++        const baseUrl = withoutTrailingSlash(this.getBaseURL())
++          .replace(/\/v1$/, '')
++          .replace(/\/api$/, '')
++        const response = await fetch(`${baseUrl}/api/tags`, {
++          headers: {
++            Authorization: `Bearer ${this.apiKey}`,
++            ...this.defaultHeaders(),
++            ...this.provider.extra_headers
++          }
++        })
++
++        if (!response.ok) {
++          throw new Error(`Ollama server returned ${response.status} ${response.statusText}`)
++        }
++
++        const data = await response.json()
++        if (!data?.models || !Array.isArray(data.models)) {
++          throw new Error('Invalid response from Ollama API: missing models array')
++        }
++
++        return data.models.map((model) => ({
++          id: model.name,
++          object: 'model',
++          owned_by: 'ollama'
++        }))
++      }
+       const response = await sdk.models.list()
+       if (this.provider.id === 'together') {
+         // @ts-ignore key is not typed
+@@ -144,6 +185,7 @@ export abstract class OpenAIBaseClient<
+ 
+     let apiKeyForSdkInstance = this.apiKey
+     let baseURLForSdkInstance = this.getBaseURL()
++    logger.debug('baseURLForSdkInstance', { baseURLForSdkInstance })
+     let headersForSdkInstance = {
+       ...this.defaultHeaders(),
+       ...this.provider.extra_headers
+@@ -155,7 +197,7 @@ export abstract class OpenAIBaseClient<
+       // this.provider.apiKey不允许修改
+       // this.provider.apiKey = token
+       apiKeyForSdkInstance = token
+-      baseURLForSdkInstance = this.getBaseURL(false)
++      baseURLForSdkInstance = this.getBaseURL()
+       headersForSdkInstance = {
+         ...headersForSdkInstance,
+         ...COPILOT_DEFAULT_HEADERS
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+index 8356826..b4f63e2 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+@@ -122,6 +122,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+     if (this.sdkInstance) {
+       return this.sdkInstance
+     }
++    const baseUrl = this.getBaseURL()
+ 
+     if (this.provider.id === 'azure-openai' || this.provider.type === 'azure-openai') {
+       return new AzureOpenAI({
+@@ -134,7 +135,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+       return new OpenAI({
+         dangerouslyAllowBrowser: true,
+         apiKey: this.apiKey,
+-        baseURL: this.getBaseURL(),
++        baseURL: baseUrl,
+         defaultHeaders: {
+           ...this.defaultHeaders(),
+           ...this.provider.extra_headers
+diff --git a/src/aiCore/legacy/clients/ovms/OVMSClient.ts b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+index 179bb54..02ac6de 100644
+--- a/src/aiCore/legacy/clients/ovms/OVMSClient.ts
++++ b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+@@ -3,6 +3,7 @@ import { loggerService } from '@logger'
+ import { isSupportedModel } from '@renderer/config/models'
+ import type { Provider } from '@renderer/types'
+ import { objectKeys } from '@renderer/types'
++import { formatApiHost, withoutTrailingApiVersion } from '@renderer/utils'
+ 
+ import { OpenAIAPIClient } from '../openai/OpenAIApiClient'
+ 
+@@ -16,11 +17,8 @@ export class OVMSClient extends OpenAIAPIClient {
+   override async listModels(): Promise<OpenAI.Models.Model[]> {
+     try {
+       const sdk = await this.getSdkInstance()
+-
+-      const chatModelsResponse = await sdk.request({
+-        method: 'get',
+-        path: '../v1/config'
+-      })
++      const url = formatApiHost(withoutTrailingApiVersion(this.getBaseURL()), true, 'v1')
++      const chatModelsResponse = await sdk.withOptions({ baseURL: url }).get('/config')
+       logger.debug(`Chat models response: ${JSON.stringify(chatModelsResponse)}`)
+ 
+       // Parse the config response to extract model information
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+index b314ddd..10a4d59 100644
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+@@ -4,7 +4,7 @@ import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/con
+ import type { MCPTool } from '@renderer/types'
+ import { type Assistant, type Message, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+-import { isSupportEnableThinkingProvider } from '@renderer/utils/provider'
++import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import type { LanguageModelMiddleware } from 'ai'
+ import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+ import { isEmpty } from 'lodash'
+@@ -240,6 +240,7 @@ function addModelSpecificMiddlewares(builder: AiSdkMiddlewareBuilder, config: Ai
+   // Use /think or /no_think suffix to control thinking mode
+   if (
+     config.provider &&
++    !isOllamaProvider(config.provider) &&
+     isSupportedThinkingTokenQwenModel(config.model) &&
+     !isSupportEnableThinkingProvider(config.provider)
+   ) {
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 8a1d53a..34c3418 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -4,60 +4,81 @@
+  */
+ 
+ import {
+-  isClaude45ReasoningModel,
+   isClaudeReasoningModel,
+   isMaxTemperatureOneModel,
+-  isNotSupportTemperatureAndTopP,
+   isSupportedFlexServiceTier,
+-  isSupportedThinkingTokenClaudeModel
++  isSupportedThinkingTokenClaudeModel,
++  isSupportTemperatureModel,
++  isSupportTopPModel,
++  isTemperatureTopPMutuallyExclusiveModel
+ } from '@renderer/config/models'
+-import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
++import {
++  DEFAULT_ASSISTANT_SETTINGS,
++  getAssistantSettings,
++  getProviderByModel
++} from '@renderer/services/AssistantService'
+ import type { Assistant, Model } from '@renderer/types'
+ import { defaultTimeout } from '@shared/config/constant'
+ 
+ import { getAnthropicThinkingBudget } from '../utils/reasoning'
+ 
+ /**
+- * Claude 4.5 推理模型:
+- * - 只启用 temperature → 使用 temperature
+- * - 只启用 top_p → 使用 top_p
+- * - 同时启用 → temperature 生效,top_p 被忽略
+- * - 都不启用 → 都不使用
+- * 获取温度参数
++ * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Claude reasoning models when reasoning effort is set.
++ * - Disabled for models that do not support temperature.
++ * - Disabled for Claude 4.5 reasoning models when TopP is enabled and temperature is disabled.
++ * Otherwise, returns the temperature value if the assistant has temperature enabled.
+  */
+ export function getTemperature(assistant: Assistant, model: Model): number | undefined {
+   if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
+     return undefined
+   }
++
++  if (!isSupportTemperatureModel(model)) {
++    return undefined
++  }
++
+   if (
+-    isNotSupportTemperatureAndTopP(model) ||
+-    (isClaude45ReasoningModel(model) && assistant.settings?.enableTopP && !assistant.settings?.enableTemperature)
++    isTemperatureTopPMutuallyExclusiveModel(model) &&
++    assistant.settings?.enableTopP &&
++    !assistant.settings?.enableTemperature
+   ) {
+     return undefined
+   }
++
+   const assistantSettings = getAssistantSettings(assistant)
+   let temperature = assistantSettings?.temperature
+   if (temperature && isMaxTemperatureOneModel(model)) {
+     temperature = Math.min(1, temperature)
+   }
+-  return assistantSettings?.enableTemperature ? temperature : undefined
++
++  // FIXME: assistant.settings.enableTemperature should be always a boolean value.
++  const enableTemperature = assistantSettings?.enableTemperature ?? DEFAULT_ASSISTANT_SETTINGS.enableTemperature
++  return enableTemperature ? temperature : undefined
+ }
+ 
+ /**
+- * 获取 TopP 参数
++ * Retrieves the TopP parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Claude reasoning models when reasoning effort is set.
++ * - Disabled for models that do not support TopP.
++ * - Disabled for Claude 4.5 reasoning models when temperature is explicitly enabled.
++ * Otherwise, returns the TopP value if the assistant has TopP enabled.
+  */
+ export function getTopP(assistant: Assistant, model: Model): number | undefined {
+   if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
+     return undefined
+   }
+-  if (
+-    isNotSupportTemperatureAndTopP(model) ||
+-    (isClaude45ReasoningModel(model) && assistant.settings?.enableTemperature)
+-  ) {
++  if (!isSupportTopPModel(model)) {
+     return undefined
+   }
++  if (isTemperatureTopPMutuallyExclusiveModel(model) && assistant.settings?.enableTemperature) {
++    return undefined
++  }
++
+   const assistantSettings = getAssistantSettings(assistant)
+-  return assistantSettings?.enableTopP ? assistantSettings?.topP : undefined
++  // FIXME: assistant.settings.enableTopP should be always a boolean value.
++  const enableTopP = assistantSettings.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
++  return enableTopP ? assistantSettings?.topP : undefined
+ }
+ 
+ /**
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 6eccbf8..cba7fcd 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -11,12 +11,16 @@ import { vertex } from '@ai-sdk/google-vertex/edge'
+ import { combineHeaders } from '@ai-sdk/provider-utils'
+ import type { AnthropicSearchConfig, WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugins'
+ import { isBaseProvider } from '@cherrystudio/ai-core/core/providers/schemas'
++import type { BaseProviderId } from '@cherrystudio/ai-core/provider'
+ import { loggerService } from '@logger'
+ import {
+   isAnthropicModel,
++  isFixedReasoningModel,
++  isGeminiModel,
+   isGenerateImageModel,
++  isGrokModel,
++  isOpenAIModel,
+   isOpenRouterBuiltInWebSearchModel,
+-  isReasoningModel,
+   isSupportedReasoningEffortModel,
+   isSupportedThinkingTokenModel,
+   isWebSearchModel
+@@ -24,11 +28,12 @@ import {
+ import { getDefaultModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+-import { type Assistant, type MCPTool, type Provider } from '@renderer/types'
++import type { Model } from '@renderer/types'
++import { type Assistant, type MCPTool, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
+-import { isAwsBedrockProvider } from '@renderer/utils/provider'
++import { isAIGatewayProvider, isAwsBedrockProvider } from '@renderer/utils/provider'
+ import type { ModelMessage, Tool } from 'ai'
+ import { stepCountIs } from 'ai'
+ 
+@@ -43,6 +48,25 @@ const logger = loggerService.withContext('parameterBuilder')
+ 
+ type ProviderDefinedTool = Extract<Tool<any, any>, { type: 'provider-defined' }>
+ 
++function mapVertexAIGatewayModelToProviderId(model: Model): BaseProviderId | undefined {
++  if (isAnthropicModel(model)) {
++    return 'anthropic'
++  }
++  if (isGeminiModel(model)) {
++    return 'google'
++  }
++  if (isGrokModel(model)) {
++    return 'xai'
++  }
++  if (isOpenAIModel(model)) {
++    return 'openai'
++  }
++  logger.warn(
++    `[mapVertexAIGatewayModelToProviderId] Unknown model type for AI Gateway: ${model.id}. Web search will not be enabled.`
++  )
++  return undefined
++}
++
+ /**
+  * 构建 AI SDK 流式参数
+  * 这是主要的参数构建函数，整合所有转换逻辑
+@@ -83,7 +107,7 @@ export async function buildStreamTextParams(
+   const enableReasoning =
+     ((isSupportedThinkingTokenModel(model) || isSupportedReasoningEffortModel(model)) &&
+       assistant.settings?.reasoning_effort !== undefined) ||
+-    (isReasoningModel(model) && (!isSupportedThinkingTokenModel(model) || !isSupportedReasoningEffortModel(model)))
++    isFixedReasoningModel(model)
+ 
+   // 判断是否使用内置搜索
+   // 条件：没有外部搜索提供商 && (用户开启了内置搜索 || 模型强制使用内置搜索)
+@@ -117,6 +141,11 @@ export async function buildStreamTextParams(
+   if (enableWebSearch) {
+     if (isBaseProvider(aiSdkProviderId)) {
+       webSearchPluginConfig = buildProviderBuiltinWebSearchConfig(aiSdkProviderId, webSearchConfig, model)
++    } else if (isAIGatewayProvider(provider) || SystemProviderIds.gateway === provider.id) {
++      const aiSdkProviderId = mapVertexAIGatewayModelToProviderId(model)
++      if (aiSdkProviderId) {
++        webSearchPluginConfig = buildProviderBuiltinWebSearchConfig(aiSdkProviderId, webSearchConfig, model)
++      }
+     }
+     if (!tools) {
+       tools = {}
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index 430ff52..20aa78d 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -22,11 +22,15 @@ vi.mock('@renderer/services/AssistantService', () => ({
+   })
+ }))
+ 
+-vi.mock('@renderer/store', () => ({
+-  default: {
+-    getState: () => ({ copilot: { defaultHeaders: {} } })
++vi.mock('@renderer/store', () => {
++  const mockGetState = vi.fn()
++  return {
++    default: {
++      getState: mockGetState
++    },
++    __mockGetState: mockGetState
+   }
+-}))
++})
+ 
+ vi.mock('@renderer/utils/api', () => ({
+   formatApiHost: vi.fn((host, isSupportedAPIVersion = true) => {
+@@ -38,7 +42,8 @@ vi.mock('@renderer/utils/api', () => ({
+   routeToEndpoint: vi.fn((host) => ({
+     baseURL: host,
+     endpoint: '/chat/completions'
+-  }))
++  })),
++  isWithTrailingSharp: vi.fn((host) => host?.endsWith('#') || false)
+ }))
+ 
+ vi.mock('@renderer/utils/provider', async (importOriginal) => {
+@@ -79,6 +84,8 @@ import { isCherryAIProvider, isPerplexityProvider } from '@renderer/utils/provid
+ import { COPILOT_DEFAULT_HEADERS, COPILOT_EDITOR_VERSION, isCopilotResponsesModel } from '../constants'
+ import { getActualProvider, providerToAiSdkConfig } from '../providerConfig'
+ 
++const { __mockGetState: mockGetState } = vi.mocked(await import('@renderer/store')) as any
++
+ const createWindowKeyv = () => {
+   const store = new Map<string, string>()
+   return {
+@@ -132,6 +139,16 @@ describe('Copilot responses routing', () => {
+       ...(globalThis as any).window,
+       keyv: createWindowKeyv()
+     }
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
+   })
+ 
+   it('detects official GPT-5 Codex identifiers case-insensitively', () => {
+@@ -167,6 +184,16 @@ describe('CherryAI provider configuration', () => {
+       ...(globalThis as any).window,
+       keyv: createWindowKeyv()
+     }
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
+     vi.clearAllMocks()
+   })
+ 
+@@ -201,12 +228,19 @@ describe('CherryAI provider configuration', () => {
+     // Mock the functions to simulate non-CherryAI provider
+     vi.mocked(isCherryAIProvider).mockReturnValue(false)
+     vi.mocked(getProviderByModel).mockReturnValue(provider)
++    // Mock isWithTrailingSharp to return false for this test
++    vi.mocked(formatApiHost as any).mockImplementation((host, isSupportedAPIVersion = true) => {
++      if (isSupportedAPIVersion === false) {
++        return host
++      }
++      return `${host}/v1`
++    })
+ 
+     // Call getActualProvider
+     const actualProvider = getActualProvider(model)
+ 
+-    // Verify that formatApiHost was called with default parameters (true)
+-    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com')
++    // Verify that formatApiHost was called with appendApiVersion parameter
++    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com', true)
+     expect(actualProvider.apiHost).toBe('https://api.openai.com/v1')
+   })
+ 
+@@ -231,6 +265,16 @@ describe('Perplexity provider configuration', () => {
+       ...(globalThis as any).window,
+       keyv: createWindowKeyv()
+     }
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
+     vi.clearAllMocks()
+   })
+ 
+@@ -267,12 +311,19 @@ describe('Perplexity provider configuration', () => {
+     vi.mocked(isCherryAIProvider).mockReturnValue(false)
+     vi.mocked(isPerplexityProvider).mockReturnValue(false)
+     vi.mocked(getProviderByModel).mockReturnValue(provider)
++    // Mock isWithTrailingSharp to return false for this test
++    vi.mocked(formatApiHost as any).mockImplementation((host, isSupportedAPIVersion = true) => {
++      if (isSupportedAPIVersion === false) {
++        return host
++      }
++      return `${host}/v1`
++    })
+ 
+     // Call getActualProvider
+     const actualProvider = getActualProvider(model)
+ 
+-    // Verify that formatApiHost was called with default parameters (true)
+-    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com')
++    // Verify that formatApiHost was called with appendApiVersion parameter
++    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com', true)
+     expect(actualProvider.apiHost).toBe('https://api.openai.com/v1')
+   })
+ 
+@@ -291,3 +342,165 @@ describe('Perplexity provider configuration', () => {
+     expect(actualProvider.apiHost).toBe('')
+   })
+ })
++
++describe('Stream options includeUsage configuration', () => {
++  beforeEach(() => {
++    ;(globalThis as any).window = {
++      ...(globalThis as any).window,
++      keyv: createWindowKeyv()
++    }
++    vi.clearAllMocks()
++  })
++
++  const createOpenAIProvider = (): Provider => ({
++    id: 'openai-compatible',
++    type: 'openai',
++    name: 'OpenAI',
++    apiKey: 'test-key',
++    apiHost: 'https://api.openai.com',
++    models: [],
++    isSystem: true
++  })
++
++  it('uses includeUsage from settings when undefined', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
++
++    const provider = createOpenAIProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'openai'))
++
++    expect(config.options.includeUsage).toBeUndefined()
++  })
++
++  it('uses includeUsage from settings when set to true', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: true
++          }
++        }
++      }
++    })
++
++    const provider = createOpenAIProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'openai'))
++
++    expect(config.options.includeUsage).toBe(true)
++  })
++
++  it('uses includeUsage from settings when set to false', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: false
++          }
++        }
++      }
++    })
++
++    const provider = createOpenAIProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'openai'))
++
++    expect(config.options.includeUsage).toBe(false)
++  })
++
++  it('respects includeUsage setting for non-supporting providers', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: true
++          }
++        }
++      }
++    })
++
++    const testProvider: Provider = {
++      id: 'test',
++      type: 'openai',
++      name: 'test',
++      apiKey: 'test-key',
++      apiHost: 'https://api.test.com',
++      models: [],
++      isSystem: false,
++      apiOptions: {
++        isNotSupportStreamOptions: true
++      }
++    }
++
++    const config = providerToAiSdkConfig(testProvider, createModel('gpt-4', 'GPT-4', 'test'))
++
++    // Even though setting is true, provider doesn't support it, so includeUsage should be undefined
++    expect(config.options.includeUsage).toBeUndefined()
++  })
++
++  it('uses includeUsage from settings for Copilot provider when set to false', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: false
++          }
++        }
++      }
++    })
++
++    const provider = createCopilotProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'copilot'))
++
++    expect(config.options.includeUsage).toBe(false)
++    expect(config.providerId).toBe('github-copilot-openai-compatible')
++  })
++
++  it('uses includeUsage from settings for Copilot provider when set to true', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: true
++          }
++        }
++      }
++    })
++
++    const provider = createCopilotProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'copilot'))
++
++    expect(config.options.includeUsage).toBe(true)
++    expect(config.providerId).toBe('github-copilot-openai-compatible')
++  })
++
++  it('uses includeUsage from settings for Copilot provider when undefined', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
++
++    const provider = createCopilotProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'copilot'))
++
++    expect(config.options.includeUsage).toBeUndefined()
++    expect(config.providerId).toBe('github-copilot-openai-compatible')
++  })
++})
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index 9760839..ff10005 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -56,6 +56,7 @@ function tryResolveProviderId(identifier: string): ProviderId | null {
+ /**
+  * 获取AI SDK Provider ID
+  * 简化版：减少重复逻辑，利用通用解析函数
++ * TODO: 整理函数逻辑
+  */
+ export function getAiSdkProviderId(provider: Provider): string {
+   // 1. 尝试解析provider.id
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 3ed3633..33b03a9 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -11,17 +11,27 @@ import { createVertexProvider, isVertexAIConfigured } from '@renderer/hooks/useV
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import { isSystemProvider, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+-import { formatApiHost, formatAzureOpenAIApiHost, formatVertexApiHost, routeToEndpoint } from '@renderer/utils/api'
++import type { OpenAICompletionsStreamOptions } from '@renderer/types/aiCoreTypes'
++import {
++  formatApiHost,
++  formatAzureOpenAIApiHost,
++  formatOllamaApiHost,
++  formatVertexApiHost,
++  isWithTrailingSharp,
++  routeToEndpoint
++} from '@renderer/utils/api'
+ import {
+   isAnthropicProvider,
+   isAzureOpenAIProvider,
+   isCherryAIProvider,
+   isGeminiProvider,
+   isNewApiProvider,
++  isOllamaProvider,
+   isPerplexityProvider,
++  isSupportStreamOptionsProvider,
+   isVertexProvider
+ } from '@renderer/utils/provider'
+-import { cloneDeep } from 'lodash'
++import { cloneDeep, isEmpty } from 'lodash'
+ 
+ import type { AiSdkConfig } from '../types'
+ import { aihubmixProviderCreator, newApiResolverCreator, vertexAnthropicProviderCreator } from './config'
+@@ -29,32 +39,6 @@ import { azureAnthropicProviderCreator } from './config/azure-anthropic'
+ import { COPILOT_DEFAULT_HEADERS } from './constants'
+ import { getAiSdkProviderId } from './factory'
+ 
+-/**
+- * 获取轮询的API key
+- * 复用legacy架构的多key轮询逻辑
+- */
+-function getRotatedApiKey(provider: Provider): string {
+-  const keys = provider.apiKey.split(',').map((key) => key.trim())
+-  const keyName = `provider:${provider.id}:last_used_key`
+-
+-  if (keys.length === 1) {
+-    return keys[0]
+-  }
+-
+-  const lastUsedKey = window.keyv.get(keyName)
+-  if (!lastUsedKey) {
+-    window.keyv.set(keyName, keys[0])
+-    return keys[0]
+-  }
+-
+-  const currentIndex = keys.indexOf(lastUsedKey)
+-  const nextIndex = (currentIndex + 1) % keys.length
+-  const nextKey = keys[nextIndex]
+-  window.keyv.set(keyName, nextKey)
+-
+-  return nextKey
+-}
+-
+ /**
+  * 处理特殊provider的转换逻辑
+  */
+@@ -86,21 +70,24 @@ function handleSpecialProviders(model: Model, provider: Provider): Provider {
+  */
+ export function formatProviderApiHost(provider: Provider): Provider {
+   const formatted = { ...provider }
++  const appendApiVersion = !isWithTrailingSharp(provider.apiHost)
+   if (formatted.anthropicApiHost) {
+-    formatted.anthropicApiHost = formatApiHost(formatted.anthropicApiHost)
++    formatted.anthropicApiHost = formatApiHost(formatted.anthropicApiHost, appendApiVersion)
+   }
+ 
+   if (isAnthropicProvider(provider)) {
+     const baseHost = formatted.anthropicApiHost || formatted.apiHost
+     // AI SDK needs /v1 in baseURL, Anthropic SDK will strip it in getSdkClient
+-    formatted.apiHost = formatApiHost(baseHost)
++    formatted.apiHost = formatApiHost(baseHost, appendApiVersion)
+     if (!formatted.anthropicApiHost) {
+       formatted.anthropicApiHost = formatted.apiHost
+     }
+   } else if (formatted.id === SystemProviderIds.copilot || formatted.id === SystemProviderIds.github) {
+     formatted.apiHost = formatApiHost(formatted.apiHost, false)
++  } else if (isOllamaProvider(formatted)) {
++    formatted.apiHost = formatOllamaApiHost(formatted.apiHost)
+   } else if (isGeminiProvider(formatted)) {
+-    formatted.apiHost = formatApiHost(formatted.apiHost, true, 'v1beta')
++    formatted.apiHost = formatApiHost(formatted.apiHost, appendApiVersion, 'v1beta')
+   } else if (isAzureOpenAIProvider(formatted)) {
+     formatted.apiHost = formatAzureOpenAIApiHost(formatted.apiHost)
+   } else if (isVertexProvider(formatted)) {
+@@ -110,7 +97,7 @@ export function formatProviderApiHost(provider: Provider): Provider {
+   } else if (isPerplexityProvider(formatted)) {
+     formatted.apiHost = formatApiHost(formatted.apiHost, false)
+   } else {
+-    formatted.apiHost = formatApiHost(formatted.apiHost)
++    formatted.apiHost = formatApiHost(formatted.apiHost, appendApiVersion)
+   }
+   return formatted
+ }
+@@ -161,7 +148,11 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+   const { baseURL, endpoint } = routeToEndpoint(actualProvider.apiHost)
+   const baseConfig = {
+     baseURL: baseURL,
+-    apiKey: getRotatedApiKey(actualProvider)
++    apiKey: actualProvider.apiKey
++  }
++  let includeUsage: OpenAICompletionsStreamOptions['include_usage'] = undefined
++  if (isSupportStreamOptionsProvider(actualProvider)) {
++    includeUsage = store.getState().settings.openAI?.streamOptions?.includeUsage
+   }
+ 
+   const isCopilotProvider = actualProvider.id === SystemProviderIds.copilot
+@@ -174,7 +165,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+         ...actualProvider.extra_headers
+       },
+       name: actualProvider.id,
+-      includeUsage: true
++      includeUsage
+     })
+ 
+     return {
+@@ -183,6 +174,19 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
++  if (isOllamaProvider(actualProvider)) {
++    return {
++      providerId: 'ollama',
++      options: {
++        ...baseConfig,
++        headers: {
++          ...actualProvider.extra_headers,
++          Authorization: !isEmpty(baseConfig.apiKey) ? `Bearer ${baseConfig.apiKey}` : undefined
++        }
++      }
++    }
++  }
++
+   // 处理OpenAI模式
+   const extraOptions: any = {}
+   extraOptions.endpoint = endpoint
+@@ -264,7 +268,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+       ...options,
+       name: actualProvider.id,
+       ...extraOptions,
+-      includeUsage: true
++      includeUsage
+     }
+   }
+ }
+@@ -336,7 +340,6 @@ export async function prepareSpecialProviderConfig(
+             ...(config.options.headers ? config.options.headers : {}),
+             'Content-Type': 'application/json',
+             'anthropic-version': '2023-06-01',
+-            'anthropic-beta': 'oauth-2025-04-20',
+             Authorization: `Bearer ${oauthToken}`
+           },
+           baseURL: 'https://api.anthropic.com/v1',
+diff --git a/src/aiCore/provider/providerInitialization.ts b/src/aiCore/provider/providerInitialization.ts
+index 2e4b9fc..51176c1 100644
+--- a/src/aiCore/provider/providerInitialization.ts
++++ b/src/aiCore/provider/providerInitialization.ts
+@@ -1,5 +1,6 @@
+ import { type ProviderConfig, registerMultipleProviderConfigs } from '@cherrystudio/ai-core/provider'
+ import { loggerService } from '@logger'
++import * as z from 'zod'
+ 
+ const logger = loggerService.withContext('ProviderConfigs')
+ 
+@@ -81,12 +82,12 @@ export const NEW_PROVIDER_CONFIGS: ProviderConfig[] = [
+     aliases: ['hf', 'hugging-face']
+   },
+   {
+-    id: 'ai-gateway',
+-    name: 'AI Gateway',
++    id: 'gateway',
++    name: 'Vercel AI Gateway',
+     import: () => import('@ai-sdk/gateway'),
+     creatorFunctionName: 'createGateway',
+     supportsImageGeneration: true,
+-    aliases: ['gateway']
++    aliases: ['ai-gateway']
+   },
+   {
+     id: 'cerebras',
+@@ -94,9 +95,19 @@ export const NEW_PROVIDER_CONFIGS: ProviderConfig[] = [
+     import: () => import('@ai-sdk/cerebras'),
+     creatorFunctionName: 'createCerebras',
+     supportsImageGeneration: false
++  },
++  {
++    id: 'ollama',
++    name: 'Ollama',
++    import: () => import('ollama-ai-provider-v2'),
++    creatorFunctionName: 'createOllama',
++    supportsImageGeneration: false
+   }
+ ] as const
+ 
++export const registeredNewProviderIds = NEW_PROVIDER_CONFIGS.map((config) => config.id)
++export const registeredNewProviderIdSchema = z.enum(registeredNewProviderIds)
++
+ /**
+  * 初始化新的Providers
+  * 使用aiCore的动态注册功能
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index ca6b883..9eeeac7 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -27,7 +27,8 @@ vi.mock('@cherrystudio/ai-core/provider', async (importOriginal) => {
+           'xai',
+           'deepseek',
+           'openrouter',
+-          'openai-compatible'
++          'openai-compatible',
++          'cherryin'
+         ]
+         if (baseProviders.includes(id)) {
+           return { success: true, data: id }
+@@ -37,7 +38,15 @@ vi.mock('@cherrystudio/ai-core/provider', async (importOriginal) => {
+     },
+     customProviderIdSchema: {
+       safeParse: vi.fn((id) => {
+-        const customProviders = ['google-vertex', 'google-vertex-anthropic', 'bedrock']
++        const customProviders = [
++          'google-vertex',
++          'google-vertex-anthropic',
++          'bedrock',
++          'gateway',
++          'aihubmix',
++          'newapi',
++          'ollama'
++        ]
+         if (customProviders.includes(id)) {
+           return { success: true, data: id }
+         }
+@@ -47,20 +56,7 @@ vi.mock('@cherrystudio/ai-core/provider', async (importOriginal) => {
+   }
+ })
+ 
+-vi.mock('../provider/factory', () => ({
+-  getAiSdkProviderId: vi.fn((provider) => {
+-    // Simulate the provider ID mapping
+-    const mapping: Record<string, string> = {
+-      [SystemProviderIds.gemini]: 'google',
+-      [SystemProviderIds.openai]: 'openai',
+-      [SystemProviderIds.anthropic]: 'anthropic',
+-      [SystemProviderIds.grok]: 'xai',
+-      [SystemProviderIds.deepseek]: 'deepseek',
+-      [SystemProviderIds.openrouter]: 'openrouter'
+-    }
+-    return mapping[provider.id] || provider.id
+-  })
+-}))
++// Don't mock getAiSdkProviderId - use real implementation for more accurate tests
+ 
+ vi.mock('@renderer/config/models', async (importOriginal) => ({
+   ...(await importOriginal()),
+@@ -179,8 +175,11 @@ describe('options utils', () => {
+     provider: SystemProviderIds.openai
+   } as Model
+ 
+-  beforeEach(() => {
++  beforeEach(async () => {
+     vi.clearAllMocks()
++    // Reset getCustomParameters to return empty object by default
++    const { getCustomParameters } = await import('../reasoning')
++    vi.mocked(getCustomParameters).mockReturnValue({})
+   })
+ 
+   describe('buildProviderOptions', () => {
+@@ -391,7 +390,6 @@ describe('options utils', () => {
+           enableWebSearch: false,
+           enableGenerateImage: false
+         })
+-
+         expect(result.providerOptions).toHaveProperty('deepseek')
+         expect(result.providerOptions.deepseek).toBeDefined()
+       })
+@@ -461,10 +459,14 @@ describe('options utils', () => {
+           }
+         )
+ 
+-        expect(result.providerOptions.openai).toHaveProperty('custom_param')
+-        expect(result.providerOptions.openai.custom_param).toBe('custom_value')
+-        expect(result.providerOptions.openai).toHaveProperty('another_param')
+-        expect(result.providerOptions.openai.another_param).toBe(123)
++        expect(result.providerOptions).toStrictEqual({
++          openai: {
++            custom_param: 'custom_value',
++            another_param: 123,
++            serviceTier: undefined,
++            textVerbosity: undefined
++          }
++        })
+       })
+ 
+       it('should extract AI SDK standard params from custom parameters', async () => {
+@@ -696,5 +698,459 @@ describe('options utils', () => {
+         })
+       })
+     })
++
++    describe('AI Gateway provider', () => {
++      const gatewayProvider: Provider = {
++        id: SystemProviderIds.gateway,
++        name: 'Vercel AI Gateway',
++        type: 'gateway',
++        apiKey: 'test-key',
++        apiHost: 'https://gateway.vercel.com',
++        isSystem: true
++      } as Provider
++
++      it('should build OpenAI options for OpenAI models through gateway', () => {
++        const openaiModel: Model = {
++          id: 'openai/gpt-4',
++          name: 'GPT-4',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, openaiModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('openai')
++        expect(result.providerOptions.openai).toBeDefined()
++      })
++
++      it('should build Anthropic options for Anthropic models through gateway', () => {
++        const anthropicModel: Model = {
++          id: 'anthropic/claude-3-5-sonnet-20241022',
++          name: 'Claude 3.5 Sonnet',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, anthropicModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('anthropic')
++        expect(result.providerOptions.anthropic).toBeDefined()
++      })
++
++      it('should build Google options for Gemini models through gateway', () => {
++        const geminiModel: Model = {
++          id: 'google/gemini-2.0-flash-exp',
++          name: 'Gemini 2.0 Flash',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, geminiModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('google')
++        expect(result.providerOptions.google).toBeDefined()
++      })
++
++      it('should build xAI options for Grok models through gateway', () => {
++        const grokModel: Model = {
++          id: 'xai/grok-2-latest',
++          name: 'Grok 2',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, grokModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('xai')
++        expect(result.providerOptions.xai).toBeDefined()
++      })
++
++      it('should include reasoning parameters for Anthropic models when enabled', () => {
++        const anthropicModel: Model = {
++          id: 'anthropic/claude-3-5-sonnet-20241022',
++          name: 'Claude 3.5 Sonnet',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, anthropicModel, gatewayProvider, {
++          enableReasoning: true,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions.anthropic).toHaveProperty('thinking')
++        expect(result.providerOptions.anthropic.thinking).toEqual({
++          type: 'enabled',
++          budgetTokens: 5000
++        })
++      })
++
++      it('should merge gateway routing options from custom parameters', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        vi.mocked(getCustomParameters).mockReturnValue({
++          gateway: {
++            order: ['vertex', 'anthropic'],
++            only: ['vertex', 'anthropic']
++          }
++        })
++
++        const anthropicModel: Model = {
++          id: 'anthropic/claude-3-5-sonnet-20241022',
++          name: 'Claude 3.5 Sonnet',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, anthropicModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should have both anthropic provider options and gateway routing options
++        expect(result.providerOptions).toHaveProperty('anthropic')
++        expect(result.providerOptions).toHaveProperty('gateway')
++        expect(result.providerOptions.gateway).toEqual({
++          order: ['vertex', 'anthropic'],
++          only: ['vertex', 'anthropic']
++        })
++      })
++
++      it('should combine provider-specific options with gateway routing options', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        vi.mocked(getCustomParameters).mockReturnValue({
++          gateway: {
++            order: ['openai', 'anthropic']
++          }
++        })
++
++        const openaiModel: Model = {
++          id: 'openai/gpt-4',
++          name: 'GPT-4',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, openaiModel, gatewayProvider, {
++          enableReasoning: true,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should have OpenAI provider options with reasoning
++        expect(result.providerOptions.openai).toBeDefined()
++        expect(result.providerOptions.openai).toHaveProperty('reasoningEffort')
++
++        // Should also have gateway routing options
++        expect(result.providerOptions.gateway).toBeDefined()
++        expect(result.providerOptions.gateway.order).toEqual(['openai', 'anthropic'])
++      })
++
++      it('should build generic options for unknown model types through gateway', () => {
++        const unknownModel: Model = {
++          id: 'unknown-provider/model-name',
++          name: 'Unknown Model',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        const result = buildProviderOptions(mockAssistant, unknownModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('openai-compatible')
++        expect(result.providerOptions['openai-compatible']).toBeDefined()
++      })
++    })
++
++    describe('Proxy provider custom parameters mapping', () => {
++      it('should map cherryin provider ID to actual AI SDK provider ID (Google)', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        // Mock Cherry In provider that uses Google SDK
++        const cherryinProvider = {
++          id: 'cherryin',
++          name: 'Cherry In',
++          type: 'gemini', // Using Google SDK
++          apiKey: 'test-key',
++          apiHost: 'https://cherryin.com',
++          models: [] as Model[]
++        } as Provider
++
++        const geminiModel: Model = {
++          id: 'gemini-2.0-flash-exp',
++          name: 'Gemini 2.0 Flash',
++          provider: 'cherryin'
++        } as Model
++
++        // User provides custom parameters with Cherry Studio provider ID
++        vi.mocked(getCustomParameters).mockReturnValue({
++          cherryin: {
++            customOption1: 'value1',
++            customOption2: 'value2'
++          }
++        })
++
++        const result = buildProviderOptions(mockAssistant, geminiModel, cherryinProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should map to 'google' AI SDK provider, not 'cherryin'
++        expect(result.providerOptions).toHaveProperty('google')
++        expect(result.providerOptions).not.toHaveProperty('cherryin')
++        expect(result.providerOptions.google).toMatchObject({
++          customOption1: 'value1',
++          customOption2: 'value2'
++        })
++      })
++
++      it('should map cherryin provider ID to actual AI SDK provider ID (OpenAI)', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        // Mock Cherry In provider that uses OpenAI SDK
++        const cherryinProvider = {
++          id: 'cherryin',
++          name: 'Cherry In',
++          type: 'openai-response', // Using OpenAI SDK
++          apiKey: 'test-key',
++          apiHost: 'https://cherryin.com',
++          models: [] as Model[]
++        } as Provider
++
++        const openaiModel: Model = {
++          id: 'gpt-4',
++          name: 'GPT-4',
++          provider: 'cherryin'
++        } as Model
++
++        // User provides custom parameters with Cherry Studio provider ID
++        vi.mocked(getCustomParameters).mockReturnValue({
++          cherryin: {
++            customOpenAIOption: 'openai_value'
++          }
++        })
++
++        const result = buildProviderOptions(mockAssistant, openaiModel, cherryinProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should map to 'openai' AI SDK provider, not 'cherryin'
++        expect(result.providerOptions).toHaveProperty('openai')
++        expect(result.providerOptions).not.toHaveProperty('cherryin')
++        expect(result.providerOptions.openai).toMatchObject({
++          customOpenAIOption: 'openai_value'
++        })
++      })
++
++      it('should allow direct AI SDK provider ID in custom parameters', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        const geminiProvider = {
++          id: SystemProviderIds.gemini,
++          name: 'Google',
++          type: 'gemini',
++          apiKey: 'test-key',
++          apiHost: 'https://generativelanguage.googleapis.com',
++          models: [] as Model[]
++        } as Provider
++
++        const geminiModel: Model = {
++          id: 'gemini-2.0-flash-exp',
++          name: 'Gemini 2.0 Flash',
++          provider: SystemProviderIds.gemini
++        } as Model
++
++        // User provides custom parameters directly with AI SDK provider ID
++        vi.mocked(getCustomParameters).mockReturnValue({
++          google: {
++            directGoogleOption: 'google_value'
++          }
++        })
++
++        const result = buildProviderOptions(mockAssistant, geminiModel, geminiProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should merge directly to 'google' provider
++        expect(result.providerOptions.google).toMatchObject({
++          directGoogleOption: 'google_value'
++        })
++      })
++
++      it('should map gateway provider custom parameters to actual AI SDK provider', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        const gatewayProvider: Provider = {
++          id: SystemProviderIds.gateway,
++          name: 'Vercel AI Gateway',
++          type: 'gateway',
++          apiKey: 'test-key',
++          apiHost: 'https://gateway.vercel.com',
++          isSystem: true
++        } as Provider
++
++        const anthropicModel: Model = {
++          id: 'anthropic/claude-3-5-sonnet-20241022',
++          name: 'Claude 3.5 Sonnet',
++          provider: SystemProviderIds.gateway
++        } as Model
++
++        // User provides both gateway routing options and gateway-scoped custom parameters
++        vi.mocked(getCustomParameters).mockReturnValue({
++          gateway: {
++            order: ['vertex', 'anthropic'],
++            only: ['vertex']
++          },
++          customParam: 'should_go_to_anthropic'
++        })
++
++        const result = buildProviderOptions(mockAssistant, anthropicModel, gatewayProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Gateway routing options should be preserved
++        expect(result.providerOptions.gateway).toEqual({
++          order: ['vertex', 'anthropic'],
++          only: ['vertex']
++        })
++
++        // Custom parameters should go to the actual AI SDK provider (anthropic)
++        expect(result.providerOptions.anthropic).toMatchObject({
++          customParam: 'should_go_to_anthropic'
++        })
++      })
++
++      it('should handle mixed custom parameters (AI SDK provider ID + custom params)', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        const openaiProvider: Provider = {
++          id: SystemProviderIds.openai,
++          name: 'OpenAI',
++          type: 'openai-response',
++          apiKey: 'test-key',
++          apiHost: 'https://api.openai.com/v1',
++          isSystem: true
++        } as Provider
++
++        // User provides both direct AI SDK provider params and custom params
++        vi.mocked(getCustomParameters).mockReturnValue({
++          openai: {
++            providerSpecific: 'value1'
++          },
++          customParam1: 'value2',
++          customParam2: 123
++        })
++
++        const result = buildProviderOptions(mockAssistant, mockModel, openaiProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should merge both into 'openai' provider options
++        expect(result.providerOptions.openai).toMatchObject({
++          providerSpecific: 'value1',
++          customParam1: 'value2',
++          customParam2: 123
++        })
++      })
++
++      // Note: For proxy providers like aihubmix/newapi, users should write AI SDK provider ID (google/anthropic)
++      // instead of the Cherry Studio provider ID for custom parameters to work correctly
++
++      it('should handle cherryin fallback to openai-compatible with custom parameters', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        // Mock cherryin provider that falls back to openai-compatible (default case)
++        const cherryinProvider = {
++          id: 'cherryin',
++          name: 'Cherry In',
++          type: 'openai',
++          apiKey: 'test-key',
++          apiHost: 'https://cherryin.com',
++          models: [] as Model[]
++        } as Provider
++
++        const testModel: Model = {
++          id: 'some-model',
++          name: 'Some Model',
++          provider: 'cherryin'
++        } as Model
++
++        // User provides custom parameters with cherryin provider ID
++        vi.mocked(getCustomParameters).mockReturnValue({
++          customCherryinOption: 'cherryin_value'
++        })
++
++        const result = buildProviderOptions(mockAssistant, testModel, cherryinProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // When cherryin falls back to default case, it should use rawProviderId (cherryin)
++        // User's cherryin params should merge with the provider options
++        expect(result.providerOptions).toHaveProperty('cherryin')
++        expect(result.providerOptions.cherryin).toMatchObject({
++          customCherryinOption: 'cherryin_value'
++        })
++      })
++
++      it('should handle cross-provider configurations', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        const openaiProvider: Provider = {
++          id: SystemProviderIds.openai,
++          name: 'OpenAI',
++          type: 'openai-response',
++          apiKey: 'test-key',
++          apiHost: 'https://api.openai.com/v1',
++          isSystem: true
++        } as Provider
++
++        // User provides parameters for multiple providers
++        // In real usage, anthropic/google params would be treated as regular params for openai provider
++        vi.mocked(getCustomParameters).mockReturnValue({
++          openai: {
++            openaiSpecific: 'openai_value'
++          },
++          customParam: 'value'
++        })
++
++        const result = buildProviderOptions(mockAssistant, mockModel, openaiProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Should have openai provider options with both scoped and custom params
++        expect(result.providerOptions).toHaveProperty('openai')
++        expect(result.providerOptions.openai).toMatchObject({
++          openaiSpecific: 'openai_value',
++          customParam: 'value'
++        })
++      })
++    })
+   })
+ })
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index a1352a8..8ec46c9 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -1,5 +1,5 @@
+ import type { BedrockProviderOptions } from '@ai-sdk/amazon-bedrock'
+-import type { AnthropicProviderOptions } from '@ai-sdk/anthropic'
++import { type AnthropicProviderOptions } from '@ai-sdk/anthropic'
+ import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
+ import type { OpenAIResponsesProviderOptions } from '@ai-sdk/openai'
+ import type { XaiProviderOptions } from '@ai-sdk/xai'
+@@ -7,6 +7,9 @@ import { baseProviderIdSchema, customProviderIdSchema } from '@cherrystudio/ai-c
+ import { loggerService } from '@logger'
+ import {
+   getModelSupportedVerbosity,
++  isAnthropicModel,
++  isGeminiModel,
++  isGrokModel,
+   isOpenAIModel,
+   isQwenMTModel,
+   isSupportFlexServiceTierModel,
+@@ -29,12 +32,14 @@ import {
+   type OpenAIServiceTier,
+   OpenAIServiceTiers,
+   type Provider,
+-  type ServiceTier
++  type ServiceTier,
++  SystemProviderIds
+ } from '@renderer/types'
+ import { type AiSdkParam, isAiSdkParam, type OpenAIVerbosity } from '@renderer/types/aiCoreTypes'
+ import { isSupportServiceTierProvider, isSupportVerbosityProvider } from '@renderer/utils/provider'
+ import type { JSONValue } from 'ai'
+ import { t } from 'i18next'
++import type { OllamaCompletionProviderOptions } from 'ollama-ai-provider-v2'
+ 
+ import { addAnthropicHeaders } from '../prepareParams/header'
+ import { getAiSdkProviderId } from '../provider/factory'
+@@ -156,8 +161,8 @@ export function buildProviderOptions(
+   providerOptions: Record<string, Record<string, JSONValue>>
+   standardParams: Partial<Record<AiSdkParam, any>>
+ } {
+-  logger.debug('buildProviderOptions', { assistant, model, actualProvider, capabilities })
+   const rawProviderId = getAiSdkProviderId(actualProvider)
++  logger.debug('buildProviderOptions', { assistant, model, actualProvider, capabilities, rawProviderId })
+   // 构建 provider 特定的选项
+   let providerSpecificOptions: Record<string, any> = {}
+   const serviceTier = getServiceTier(model, actualProvider)
+@@ -172,14 +177,13 @@ export function buildProviderOptions(
+       case 'azure':
+       case 'azure-responses':
+         {
+-          const options: OpenAIResponsesProviderOptions = buildOpenAIProviderOptions(
++          providerSpecificOptions = buildOpenAIProviderOptions(
+             assistant,
+             model,
+             capabilities,
+             serviceTier,
+             textVerbosity
+           )
+-          providerSpecificOptions = options
+         }
+         break
+       case 'anthropic':
+@@ -197,10 +201,13 @@ export function buildProviderOptions(
+       case 'openrouter':
+       case 'openai-compatible': {
+         // 对于其他 provider，使用通用的构建逻辑
++        const genericOptions = buildGenericProviderOptions(rawProviderId, assistant, model, capabilities)
+         providerSpecificOptions = {
+-          ...buildGenericProviderOptions(assistant, model, capabilities),
+-          serviceTier,
+-          textVerbosity
++          [rawProviderId]: {
++            ...genericOptions[rawProviderId],
++            serviceTier,
++            textVerbosity
++          }
+         }
+         break
+       }
+@@ -236,48 +243,108 @@ export function buildProviderOptions(
+         case 'huggingface':
+           providerSpecificOptions = buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier)
+           break
++        case SystemProviderIds.ollama:
++          providerSpecificOptions = buildOllamaProviderOptions(assistant, capabilities)
++          break
++        case SystemProviderIds.gateway:
++          providerSpecificOptions = buildAIGatewayOptions(assistant, model, capabilities, serviceTier, textVerbosity)
++          break
+         default:
+           // 对于其他 provider，使用通用的构建逻辑
++          providerSpecificOptions = buildGenericProviderOptions(rawProviderId, assistant, model, capabilities)
++          // Merge serviceTier and textVerbosity
+           providerSpecificOptions = {
+-            ...buildGenericProviderOptions(assistant, model, capabilities),
+-            serviceTier,
+-            textVerbosity
++            ...providerSpecificOptions,
++            [rawProviderId]: {
++              ...providerSpecificOptions[rawProviderId],
++              serviceTier,
++              textVerbosity
++            }
+           }
+       }
+     } else {
+       throw error
+     }
+   }
+-
+-  // 获取自定义参数并分离标准参数和 provider 特定参数
++  logger.debug('Built providerSpecificOptions', { providerSpecificOptions })
++  /**
++   * Retrieve custom parameters and separate standard parameters from provider-specific parameters.
++   */
+   const customParams = getCustomParameters(assistant)
+   const { standardParams, providerParams } = extractAiSdkStandardParams(customParams)
+-
+-  // 合并 provider 特定的自定义参数到 providerSpecificOptions
+-  providerSpecificOptions = {
+-    ...providerSpecificOptions,
+-    ...providerParams
+-  }
+-
+-  let rawProviderKey =
+-    {
+-      'google-vertex': 'google',
+-      'google-vertex-anthropic': 'anthropic',
+-      'azure-anthropic': 'anthropic',
+-      'ai-gateway': 'gateway',
+-      azure: 'openai',
+-      'azure-responses': 'openai'
+-    }[rawProviderId] || rawProviderId
+-
+-  if (rawProviderKey === 'cherryin') {
+-    rawProviderKey = { gemini: 'google', ['openai-response']: 'openai' }[actualProvider.type] || actualProvider.type
++  logger.debug('Extracted standardParams and providerParams', { standardParams, providerParams })
++
++  /**
++   * Get the actual AI SDK provider ID(s) from the already-built providerSpecificOptions.
++   * For proxy providers (cherryin, aihubmix, newapi), this will be the actual SDK provider (e.g., 'google', 'openai', 'anthropic')
++   * For regular providers, this will be the provider itself
++   */
++  const actualAiSdkProviderIds = Object.keys(providerSpecificOptions)
++  const primaryAiSdkProviderId = actualAiSdkProviderIds[0] // Use the first one as primary for non-scoped params
++
++  /**
++   * Merge custom parameters into providerSpecificOptions.
++   * Simple logic:
++   * 1. If key is in actualAiSdkProviderIds → merge directly (user knows the actual AI SDK provider ID)
++   * 2. If key == rawProviderId:
++   *    - If it's gateway/ollama → preserve (they need their own config for routing/options)
++   *    - Otherwise → map to primary (this is a proxy provider like cherryin)
++   * 3. Otherwise → treat as regular parameter, merge to primary provider
++   *
++   * Example:
++   * - User writes `cherryin: { opt: 'val' }` → mapped to `google: { opt: 'val' }` (case 2, proxy)
++   * - User writes `gateway: { order: [...] }` → stays as `gateway: { order: [...] }` (case 2, routing config)
++   * - User writes `google: { opt: 'val' }` → stays as `google: { opt: 'val' }` (case 1)
++   * - User writes `customKey: 'val'` → merged to `google: { customKey: 'val' }` (case 3)
++   */
++  for (const key of Object.keys(providerParams)) {
++    if (actualAiSdkProviderIds.includes(key)) {
++      // Case 1: Key is an actual AI SDK provider ID - merge directly
++      providerSpecificOptions = {
++        ...providerSpecificOptions,
++        [key]: {
++          ...providerSpecificOptions[key],
++          ...providerParams[key]
++        }
++      }
++    } else if (key === rawProviderId && !actualAiSdkProviderIds.includes(rawProviderId)) {
++      // Case 2: Key is the current provider (not in actualAiSdkProviderIds, so it's a proxy or special provider)
++      // Gateway is special: it needs routing config preserved
++      if (key === SystemProviderIds.gateway) {
++        // Preserve gateway config for routing
++        providerSpecificOptions = {
++          ...providerSpecificOptions,
++          [key]: {
++            ...providerSpecificOptions[key],
++            ...providerParams[key]
++          }
++        }
++      } else {
++        // Proxy provider (cherryin, etc.) - map to actual AI SDK provider
++        providerSpecificOptions = {
++          ...providerSpecificOptions,
++          [primaryAiSdkProviderId]: {
++            ...providerSpecificOptions[primaryAiSdkProviderId],
++            ...providerParams[key]
++          }
++        }
++      }
++    } else {
++      // Case 3: Regular parameter - merge to primary provider
++      providerSpecificOptions = {
++        ...providerSpecificOptions,
++        [primaryAiSdkProviderId]: {
++          ...providerSpecificOptions[primaryAiSdkProviderId],
++          [key]: providerParams[key]
++        }
++      }
++    }
+   }
++  logger.debug('Final providerSpecificOptions after merging providerParams', { providerSpecificOptions })
+ 
+   // 返回 AI Core SDK 要求的格式：{ 'providerId': providerOptions } 以及提取的标准参数
+   return {
+-    providerOptions: {
+-      [rawProviderKey]: providerSpecificOptions
+-    },
++    providerOptions: providerSpecificOptions,
+     standardParams
+   }
+ }
+@@ -295,7 +362,7 @@ function buildOpenAIProviderOptions(
+   },
+   serviceTier: OpenAIServiceTier,
+   textVerbosity?: OpenAIVerbosity
+-): OpenAIResponsesProviderOptions {
++): Record<string, OpenAIResponsesProviderOptions> {
+   const { enableReasoning } = capabilities
+   let providerOptions: OpenAIResponsesProviderOptions = {}
+   // OpenAI 推理参数
+@@ -334,7 +401,9 @@ function buildOpenAIProviderOptions(
+     textVerbosity
+   }
+ 
+-  return providerOptions
++  return {
++    openai: providerOptions
++  }
+ }
+ 
+ /**
+@@ -348,7 +417,7 @@ function buildAnthropicProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   }
+-): AnthropicProviderOptions {
++): Record<string, AnthropicProviderOptions> {
+   const { enableReasoning } = capabilities
+   let providerOptions: AnthropicProviderOptions = {}
+ 
+@@ -361,7 +430,11 @@ function buildAnthropicProviderOptions(
+     }
+   }
+ 
+-  return providerOptions
++  return {
++    anthropic: {
++      ...providerOptions
++    }
++  }
+ }
+ 
+ /**
+@@ -375,7 +448,7 @@ function buildGeminiProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   }
+-): GoogleGenerativeAIProviderOptions {
++): Record<string, GoogleGenerativeAIProviderOptions> {
+   const { enableReasoning, enableGenerateImage } = capabilities
+   let providerOptions: GoogleGenerativeAIProviderOptions = {}
+ 
+@@ -395,7 +468,11 @@ function buildGeminiProviderOptions(
+     }
+   }
+ 
+-  return providerOptions
++  return {
++    google: {
++      ...providerOptions
++    }
++  }
+ }
+ 
+ function buildXAIProviderOptions(
+@@ -406,7 +483,7 @@ function buildXAIProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   }
+-): XaiProviderOptions {
++): Record<string, XaiProviderOptions> {
+   const { enableReasoning } = capabilities
+   let providerOptions: Record<string, any> = {}
+ 
+@@ -418,7 +495,11 @@ function buildXAIProviderOptions(
+     }
+   }
+ 
+-  return providerOptions
++  return {
++    xai: {
++      ...providerOptions
++    }
++  }
+ }
+ 
+ function buildCherryInProviderOptions(
+@@ -432,19 +513,20 @@ function buildCherryInProviderOptions(
+   actualProvider: Provider,
+   serviceTier: OpenAIServiceTier,
+   textVerbosity: OpenAIVerbosity
+-): OpenAIResponsesProviderOptions | AnthropicProviderOptions | GoogleGenerativeAIProviderOptions {
++): Record<string, OpenAIResponsesProviderOptions | AnthropicProviderOptions | GoogleGenerativeAIProviderOptions> {
+   switch (actualProvider.type) {
+     case 'openai':
++      return buildGenericProviderOptions('cherryin', assistant, model, capabilities)
+     case 'openai-response':
+       return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+-
+     case 'anthropic':
+       return buildAnthropicProviderOptions(assistant, model, capabilities)
+-
+     case 'gemini':
+       return buildGeminiProviderOptions(assistant, model, capabilities)
++
++    default:
++      return buildGenericProviderOptions('cherryin', assistant, model, capabilities)
+   }
+-  return {}
+ }
+ 
+ /**
+@@ -458,7 +540,7 @@ function buildBedrockProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   }
+-): BedrockProviderOptions {
++): Record<string, BedrockProviderOptions> {
+   const { enableReasoning } = capabilities
+   let providerOptions: BedrockProviderOptions = {}
+ 
+@@ -475,13 +557,35 @@ function buildBedrockProviderOptions(
+     providerOptions.anthropicBeta = betaHeaders
+   }
+ 
+-  return providerOptions
++  return {
++    bedrock: providerOptions
++  }
++}
++
++function buildOllamaProviderOptions(
++  assistant: Assistant,
++  capabilities: {
++    enableReasoning: boolean
++    enableWebSearch: boolean
++    enableGenerateImage: boolean
++  }
++): Record<string, OllamaCompletionProviderOptions> {
++  const { enableReasoning } = capabilities
++  const providerOptions: OllamaCompletionProviderOptions = {}
++  const reasoningEffort = assistant.settings?.reasoning_effort
++  if (enableReasoning) {
++    providerOptions.think = !['none', undefined].includes(reasoningEffort)
++  }
++  return {
++    ollama: providerOptions
++  }
+ }
+ 
+ /**
+  * 构建通用的 providerOptions（用于其他 provider）
+  */
+ function buildGenericProviderOptions(
++  providerId: string,
+   assistant: Assistant,
+   model: Model,
+   capabilities: {
+@@ -524,5 +628,37 @@ function buildGenericProviderOptions(
+     }
+   }
+ 
+-  return providerOptions
++  return {
++    [providerId]: providerOptions
++  }
++}
++
++function buildAIGatewayOptions(
++  assistant: Assistant,
++  model: Model,
++  capabilities: {
++    enableReasoning: boolean
++    enableWebSearch: boolean
++    enableGenerateImage: boolean
++  },
++  serviceTier: OpenAIServiceTier,
++  textVerbosity?: OpenAIVerbosity
++): Record<
++  string,
++  | OpenAIResponsesProviderOptions
++  | AnthropicProviderOptions
++  | GoogleGenerativeAIProviderOptions
++  | Record<string, unknown>
++> {
++  if (isAnthropicModel(model)) {
++    return buildAnthropicProviderOptions(assistant, model, capabilities)
++  } else if (isOpenAIModel(model)) {
++    return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
++  } else if (isGeminiModel(model)) {
++    return buildGeminiProviderOptions(assistant, model, capabilities)
++  } else if (isGrokModel(model)) {
++    return buildXAIProviderOptions(assistant, model, capabilities)
++  } else {
++    return buildGenericProviderOptions('openai-compatible', assistant, model, capabilities)
++  }
+ }
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index f320a9f..1e74db2 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -37,7 +37,7 @@ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
+ import type { Assistant, Model } from '@renderer/types'
+ import { EFFORT_RATIO, isSystemProvider, SystemProviderIds } from '@renderer/types'
+-import type { OpenAISummaryText } from '@renderer/types/aiCoreTypes'
++import type { OpenAIReasoningSummary } from '@renderer/types/aiCoreTypes'
+ import type { ReasoningEffortOptionalParams } from '@renderer/types/sdk'
+ import { isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import { toInteger } from 'lodash'
+@@ -250,9 +250,25 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+             enable_thinking: true,
+             incremental_output: true
+           }
++        // TODO: 支持 new-api类型
++        case SystemProviderIds['new-api']:
++        case SystemProviderIds.cherryin: {
++          return {
++            extra_body: {
++              thinking: {
++                type: 'enabled' // auto is invalid
++              }
++            }
++          }
++        }
+         case SystemProviderIds.hunyuan:
+         case SystemProviderIds['tencent-cloud-ti']:
+         case SystemProviderIds.doubao:
++        case SystemProviderIds.deepseek:
++        case SystemProviderIds.aihubmix:
++        case SystemProviderIds.sophnet:
++        case SystemProviderIds.ppio:
++        case SystemProviderIds.dmxapi:
+           return {
+             thinking: {
+               type: 'enabled' // auto is invalid
+@@ -274,8 +290,6 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+           logger.warn(
+             `Skipping thinking options for provider ${provider.name} as DeepSeek v3.1 thinking control method is unknown`
+           )
+-        case SystemProviderIds.silicon:
+-        // specially handled before
+       }
+     }
+   }
+@@ -434,7 +448,7 @@ export function getOpenAIReasoningParams(
+   const openAI = getStoreSetting('openAI')
+   const summaryText = openAI.summaryText
+ 
+-  let reasoningSummary: OpenAISummaryText = undefined
++  let reasoningSummary: OpenAIReasoningSummary = undefined
+ 
+   if (model.id.includes('o1-pro')) {
+     reasoningSummary = undefined
