@@ -1,0 +1,763 @@
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index 4379547..5c84a72 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -91,7 +91,9 @@ export default class ModernAiProvider {
+     if (this.isModel(modelOrProvider)) {
+       // 传入的是 Model
+       this.model = modelOrProvider
+-      this.actualProvider = provider ? adaptProvider({ provider }) : getActualProvider(modelOrProvider)
++      this.actualProvider = provider
++        ? adaptProvider({ provider, model: modelOrProvider })
++        : getActualProvider(modelOrProvider)
+       // 只保存配置，不预先创建executor
+       this.config = providerToAiSdkConfig(this.actualProvider, modelOrProvider)
+     } else {
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index 92f24b4..5d435b9 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -2,9 +2,10 @@ import { loggerService } from '@logger'
+ import {
+   getModelSupportedVerbosity,
+   isFunctionCallingModel,
+-  isNotSupportTemperatureAndTopP,
+   isOpenAIModel,
+-  isSupportFlexServiceTierModel
++  isSupportFlexServiceTierModel,
++  isSupportTemperatureModel,
++  isSupportTopPModel
+ } from '@renderer/config/models'
+ import { REFERENCE_PROMPT } from '@renderer/config/prompts'
+ import { getLMStudioKeepAliveTime } from '@renderer/hooks/useLMStudio'
+@@ -200,7 +201,7 @@ export abstract class BaseApiClient<
+   }
+ 
+   public getTemperature(assistant: Assistant, model: Model): number | undefined {
+-    if (isNotSupportTemperatureAndTopP(model)) {
++    if (!isSupportTemperatureModel(model)) {
+       return undefined
+     }
+     const assistantSettings = getAssistantSettings(assistant)
+@@ -208,7 +209,7 @@ export abstract class BaseApiClient<
+   }
+ 
+   public getTopP(assistant: Assistant, model: Model): number | undefined {
+-    if (isNotSupportTemperatureAndTopP(model)) {
++    if (!isSupportTopPModel(model)) {
+       return undefined
+     }
+     const assistantSettings = getAssistantSettings(assistant)
+diff --git a/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts b/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
+index 15f3cf1..9b63b77 100644
+--- a/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
++++ b/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
+@@ -124,7 +124,8 @@ export class AnthropicAPIClient extends BaseApiClient<
+ 
+   override async listModels(): Promise<Anthropic.ModelInfo[]> {
+     const sdk = (await this.getSdkInstance()) as Anthropic
+-    const response = await sdk.models.list()
++    // prevent auto appended /v1. It's included in baseUrl.
++    const response = await sdk.models.list({ path: '/models' })
+     return response.data
+   }
+ 
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index 9c930a3..ac10106 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -173,13 +173,15 @@ export class GeminiAPIClient extends BaseApiClient<
+       return this.sdkInstance
+     }
+ 
++    const apiVersion = this.getApiVersion()
++
+     this.sdkInstance = new GoogleGenAI({
+       vertexai: false,
+       apiKey: this.apiKey,
+-      apiVersion: this.getApiVersion(),
++      apiVersion,
+       httpOptions: {
+         baseUrl: this.getBaseURL(),
+-        apiVersion: this.getApiVersion(),
++        apiVersion,
+         headers: {
+           ...this.provider.extra_headers
+         }
+@@ -200,7 +202,7 @@ export class GeminiAPIClient extends BaseApiClient<
+       return trailingVersion
+     }
+ 
+-    return 'v1beta'
++    return ''
+   }
+ 
+   /**
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index dc97e74..c51f8aa 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -25,7 +25,7 @@ import type {
+   OpenAISdkRawOutput,
+   ReasoningEffortOptionalParams
+ } from '@renderer/types/sdk'
+-import { formatApiHost, withoutTrailingSlash } from '@renderer/utils/api'
++import { withoutTrailingSlash } from '@renderer/utils/api'
+ import { isOllamaProvider } from '@renderer/utils/provider'
+ 
+ import { BaseApiClient } from '../BaseApiClient'
+@@ -49,8 +49,9 @@ export abstract class OpenAIBaseClient<
+   }
+ 
+   // 仅适用于openai
+-  override getBaseURL(isSupportedAPIVerion: boolean = true): string {
+-    return formatApiHost(this.provider.apiHost, isSupportedAPIVerion)
++  override getBaseURL(): string {
++    // apiHost is formatted when called by AiProvider
++    return this.provider.apiHost
+   }
+ 
+   override async generateImage({
+@@ -100,6 +101,17 @@ export abstract class OpenAIBaseClient<
+   override async listModels(): Promise<OpenAI.Models.Model[]> {
+     try {
+       const sdk = await this.getSdkInstance()
++      if (this.provider.id === 'openrouter') {
++        // https://openrouter.ai/docs/api/api-reference/embeddings/list-embeddings-models
++        const embedBaseUrl = 'https://openrouter.ai/api/v1/embeddings'
++        const embedSdk = sdk.withOptions({ baseURL: embedBaseUrl })
++        const modelPromise = sdk.models.list()
++        const embedModelPromise = embedSdk.models.list()
++        const [modelResponse, embedModelResponse] = await Promise.all([modelPromise, embedModelPromise])
++        const models = [...modelResponse.data, ...embedModelResponse.data]
++        const uniqueModels = Array.from(new Map(models.map((model) => [model.id, model])).values())
++        return uniqueModels.filter(isSupportedModel)
++      }
+       if (this.provider.id === 'github') {
+         // GitHub Models 其 models 和 chat completions 两个接口的 baseUrl 不一样
+         const baseUrl = 'https://models.github.ai/catalog/'
+@@ -118,7 +130,7 @@ export abstract class OpenAIBaseClient<
+       }
+ 
+       if (isOllamaProvider(this.provider)) {
+-        const baseUrl = withoutTrailingSlash(this.getBaseURL(false))
++        const baseUrl = withoutTrailingSlash(this.getBaseURL())
+           .replace(/\/v1$/, '')
+           .replace(/\/api$/, '')
+         const response = await fetch(`${baseUrl}/api/tags`, {
+@@ -173,6 +185,7 @@ export abstract class OpenAIBaseClient<
+ 
+     let apiKeyForSdkInstance = this.apiKey
+     let baseURLForSdkInstance = this.getBaseURL()
++    logger.debug('baseURLForSdkInstance', { baseURLForSdkInstance })
+     let headersForSdkInstance = {
+       ...this.defaultHeaders(),
+       ...this.provider.extra_headers
+@@ -184,7 +197,7 @@ export abstract class OpenAIBaseClient<
+       // this.provider.apiKey不允许修改
+       // this.provider.apiKey = token
+       apiKeyForSdkInstance = token
+-      baseURLForSdkInstance = this.getBaseURL(false)
++      baseURLForSdkInstance = this.getBaseURL()
+       headersForSdkInstance = {
+         ...headersForSdkInstance,
+         ...COPILOT_DEFAULT_HEADERS
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+index 8356826..b4f63e2 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+@@ -122,6 +122,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+     if (this.sdkInstance) {
+       return this.sdkInstance
+     }
++    const baseUrl = this.getBaseURL()
+ 
+     if (this.provider.id === 'azure-openai' || this.provider.type === 'azure-openai') {
+       return new AzureOpenAI({
+@@ -134,7 +135,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+       return new OpenAI({
+         dangerouslyAllowBrowser: true,
+         apiKey: this.apiKey,
+-        baseURL: this.getBaseURL(),
++        baseURL: baseUrl,
+         defaultHeaders: {
+           ...this.defaultHeaders(),
+           ...this.provider.extra_headers
+diff --git a/src/aiCore/legacy/clients/ovms/OVMSClient.ts b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+index 179bb54..02ac6de 100644
+--- a/src/aiCore/legacy/clients/ovms/OVMSClient.ts
++++ b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+@@ -3,6 +3,7 @@ import { loggerService } from '@logger'
+ import { isSupportedModel } from '@renderer/config/models'
+ import type { Provider } from '@renderer/types'
+ import { objectKeys } from '@renderer/types'
++import { formatApiHost, withoutTrailingApiVersion } from '@renderer/utils'
+ 
+ import { OpenAIAPIClient } from '../openai/OpenAIApiClient'
+ 
+@@ -16,11 +17,8 @@ export class OVMSClient extends OpenAIAPIClient {
+   override async listModels(): Promise<OpenAI.Models.Model[]> {
+     try {
+       const sdk = await this.getSdkInstance()
+-
+-      const chatModelsResponse = await sdk.request({
+-        method: 'get',
+-        path: '../v1/config'
+-      })
++      const url = formatApiHost(withoutTrailingApiVersion(this.getBaseURL()), true, 'v1')
++      const chatModelsResponse = await sdk.withOptions({ baseURL: url }).get('/config')
+       logger.debug(`Chat models response: ${JSON.stringify(chatModelsResponse)}`)
+ 
+       // Parse the config response to extract model information
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 8a1d53a..34c3418 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -4,60 +4,81 @@
+  */
+ 
+ import {
+-  isClaude45ReasoningModel,
+   isClaudeReasoningModel,
+   isMaxTemperatureOneModel,
+-  isNotSupportTemperatureAndTopP,
+   isSupportedFlexServiceTier,
+-  isSupportedThinkingTokenClaudeModel
++  isSupportedThinkingTokenClaudeModel,
++  isSupportTemperatureModel,
++  isSupportTopPModel,
++  isTemperatureTopPMutuallyExclusiveModel
+ } from '@renderer/config/models'
+-import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
++import {
++  DEFAULT_ASSISTANT_SETTINGS,
++  getAssistantSettings,
++  getProviderByModel
++} from '@renderer/services/AssistantService'
+ import type { Assistant, Model } from '@renderer/types'
+ import { defaultTimeout } from '@shared/config/constant'
+ 
+ import { getAnthropicThinkingBudget } from '../utils/reasoning'
+ 
+ /**
+- * Claude 4.5 推理模型:
+- * - 只启用 temperature → 使用 temperature
+- * - 只启用 top_p → 使用 top_p
+- * - 同时启用 → temperature 生效,top_p 被忽略
+- * - 都不启用 → 都不使用
+- * 获取温度参数
++ * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Claude reasoning models when reasoning effort is set.
++ * - Disabled for models that do not support temperature.
++ * - Disabled for Claude 4.5 reasoning models when TopP is enabled and temperature is disabled.
++ * Otherwise, returns the temperature value if the assistant has temperature enabled.
+  */
+ export function getTemperature(assistant: Assistant, model: Model): number | undefined {
+   if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
+     return undefined
+   }
++
++  if (!isSupportTemperatureModel(model)) {
++    return undefined
++  }
++
+   if (
+-    isNotSupportTemperatureAndTopP(model) ||
+-    (isClaude45ReasoningModel(model) && assistant.settings?.enableTopP && !assistant.settings?.enableTemperature)
++    isTemperatureTopPMutuallyExclusiveModel(model) &&
++    assistant.settings?.enableTopP &&
++    !assistant.settings?.enableTemperature
+   ) {
+     return undefined
+   }
++
+   const assistantSettings = getAssistantSettings(assistant)
+   let temperature = assistantSettings?.temperature
+   if (temperature && isMaxTemperatureOneModel(model)) {
+     temperature = Math.min(1, temperature)
+   }
+-  return assistantSettings?.enableTemperature ? temperature : undefined
++
++  // FIXME: assistant.settings.enableTemperature should be always a boolean value.
++  const enableTemperature = assistantSettings?.enableTemperature ?? DEFAULT_ASSISTANT_SETTINGS.enableTemperature
++  return enableTemperature ? temperature : undefined
+ }
+ 
+ /**
+- * 获取 TopP 参数
++ * Retrieves the TopP parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Claude reasoning models when reasoning effort is set.
++ * - Disabled for models that do not support TopP.
++ * - Disabled for Claude 4.5 reasoning models when temperature is explicitly enabled.
++ * Otherwise, returns the TopP value if the assistant has TopP enabled.
+  */
+ export function getTopP(assistant: Assistant, model: Model): number | undefined {
+   if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
+     return undefined
+   }
+-  if (
+-    isNotSupportTemperatureAndTopP(model) ||
+-    (isClaude45ReasoningModel(model) && assistant.settings?.enableTemperature)
+-  ) {
++  if (!isSupportTopPModel(model)) {
+     return undefined
+   }
++  if (isTemperatureTopPMutuallyExclusiveModel(model) && assistant.settings?.enableTemperature) {
++    return undefined
++  }
++
+   const assistantSettings = getAssistantSettings(assistant)
+-  return assistantSettings?.enableTopP ? assistantSettings?.topP : undefined
++  // FIXME: assistant.settings.enableTopP should be always a boolean value.
++  const enableTopP = assistantSettings.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
++  return enableTopP ? assistantSettings?.topP : undefined
+ }
+ 
+ /**
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index 430ff52..20aa78d 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -22,11 +22,15 @@ vi.mock('@renderer/services/AssistantService', () => ({
+   })
+ }))
+ 
+-vi.mock('@renderer/store', () => ({
+-  default: {
+-    getState: () => ({ copilot: { defaultHeaders: {} } })
++vi.mock('@renderer/store', () => {
++  const mockGetState = vi.fn()
++  return {
++    default: {
++      getState: mockGetState
++    },
++    __mockGetState: mockGetState
+   }
+-}))
++})
+ 
+ vi.mock('@renderer/utils/api', () => ({
+   formatApiHost: vi.fn((host, isSupportedAPIVersion = true) => {
+@@ -38,7 +42,8 @@ vi.mock('@renderer/utils/api', () => ({
+   routeToEndpoint: vi.fn((host) => ({
+     baseURL: host,
+     endpoint: '/chat/completions'
+-  }))
++  })),
++  isWithTrailingSharp: vi.fn((host) => host?.endsWith('#') || false)
+ }))
+ 
+ vi.mock('@renderer/utils/provider', async (importOriginal) => {
+@@ -79,6 +84,8 @@ import { isCherryAIProvider, isPerplexityProvider } from '@renderer/utils/provid
+ import { COPILOT_DEFAULT_HEADERS, COPILOT_EDITOR_VERSION, isCopilotResponsesModel } from '../constants'
+ import { getActualProvider, providerToAiSdkConfig } from '../providerConfig'
+ 
++const { __mockGetState: mockGetState } = vi.mocked(await import('@renderer/store')) as any
++
+ const createWindowKeyv = () => {
+   const store = new Map<string, string>()
+   return {
+@@ -132,6 +139,16 @@ describe('Copilot responses routing', () => {
+       ...(globalThis as any).window,
+       keyv: createWindowKeyv()
+     }
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
+   })
+ 
+   it('detects official GPT-5 Codex identifiers case-insensitively', () => {
+@@ -167,6 +184,16 @@ describe('CherryAI provider configuration', () => {
+       ...(globalThis as any).window,
+       keyv: createWindowKeyv()
+     }
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
+     vi.clearAllMocks()
+   })
+ 
+@@ -201,12 +228,19 @@ describe('CherryAI provider configuration', () => {
+     // Mock the functions to simulate non-CherryAI provider
+     vi.mocked(isCherryAIProvider).mockReturnValue(false)
+     vi.mocked(getProviderByModel).mockReturnValue(provider)
++    // Mock isWithTrailingSharp to return false for this test
++    vi.mocked(formatApiHost as any).mockImplementation((host, isSupportedAPIVersion = true) => {
++      if (isSupportedAPIVersion === false) {
++        return host
++      }
++      return `${host}/v1`
++    })
+ 
+     // Call getActualProvider
+     const actualProvider = getActualProvider(model)
+ 
+-    // Verify that formatApiHost was called with default parameters (true)
+-    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com')
++    // Verify that formatApiHost was called with appendApiVersion parameter
++    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com', true)
+     expect(actualProvider.apiHost).toBe('https://api.openai.com/v1')
+   })
+ 
+@@ -231,6 +265,16 @@ describe('Perplexity provider configuration', () => {
+       ...(globalThis as any).window,
+       keyv: createWindowKeyv()
+     }
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
+     vi.clearAllMocks()
+   })
+ 
+@@ -267,12 +311,19 @@ describe('Perplexity provider configuration', () => {
+     vi.mocked(isCherryAIProvider).mockReturnValue(false)
+     vi.mocked(isPerplexityProvider).mockReturnValue(false)
+     vi.mocked(getProviderByModel).mockReturnValue(provider)
++    // Mock isWithTrailingSharp to return false for this test
++    vi.mocked(formatApiHost as any).mockImplementation((host, isSupportedAPIVersion = true) => {
++      if (isSupportedAPIVersion === false) {
++        return host
++      }
++      return `${host}/v1`
++    })
+ 
+     // Call getActualProvider
+     const actualProvider = getActualProvider(model)
+ 
+-    // Verify that formatApiHost was called with default parameters (true)
+-    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com')
++    // Verify that formatApiHost was called with appendApiVersion parameter
++    expect(formatApiHost).toHaveBeenCalledWith('https://api.openai.com', true)
+     expect(actualProvider.apiHost).toBe('https://api.openai.com/v1')
+   })
+ 
+@@ -291,3 +342,165 @@ describe('Perplexity provider configuration', () => {
+     expect(actualProvider.apiHost).toBe('')
+   })
+ })
++
++describe('Stream options includeUsage configuration', () => {
++  beforeEach(() => {
++    ;(globalThis as any).window = {
++      ...(globalThis as any).window,
++      keyv: createWindowKeyv()
++    }
++    vi.clearAllMocks()
++  })
++
++  const createOpenAIProvider = (): Provider => ({
++    id: 'openai-compatible',
++    type: 'openai',
++    name: 'OpenAI',
++    apiKey: 'test-key',
++    apiHost: 'https://api.openai.com',
++    models: [],
++    isSystem: true
++  })
++
++  it('uses includeUsage from settings when undefined', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
++
++    const provider = createOpenAIProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'openai'))
++
++    expect(config.options.includeUsage).toBeUndefined()
++  })
++
++  it('uses includeUsage from settings when set to true', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: true
++          }
++        }
++      }
++    })
++
++    const provider = createOpenAIProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'openai'))
++
++    expect(config.options.includeUsage).toBe(true)
++  })
++
++  it('uses includeUsage from settings when set to false', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: false
++          }
++        }
++      }
++    })
++
++    const provider = createOpenAIProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'openai'))
++
++    expect(config.options.includeUsage).toBe(false)
++  })
++
++  it('respects includeUsage setting for non-supporting providers', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: true
++          }
++        }
++      }
++    })
++
++    const testProvider: Provider = {
++      id: 'test',
++      type: 'openai',
++      name: 'test',
++      apiKey: 'test-key',
++      apiHost: 'https://api.test.com',
++      models: [],
++      isSystem: false,
++      apiOptions: {
++        isNotSupportStreamOptions: true
++      }
++    }
++
++    const config = providerToAiSdkConfig(testProvider, createModel('gpt-4', 'GPT-4', 'test'))
++
++    // Even though setting is true, provider doesn't support it, so includeUsage should be undefined
++    expect(config.options.includeUsage).toBeUndefined()
++  })
++
++  it('uses includeUsage from settings for Copilot provider when set to false', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: false
++          }
++        }
++      }
++    })
++
++    const provider = createCopilotProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'copilot'))
++
++    expect(config.options.includeUsage).toBe(false)
++    expect(config.providerId).toBe('github-copilot-openai-compatible')
++  })
++
++  it('uses includeUsage from settings for Copilot provider when set to true', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: true
++          }
++        }
++      }
++    })
++
++    const provider = createCopilotProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'copilot'))
++
++    expect(config.options.includeUsage).toBe(true)
++    expect(config.providerId).toBe('github-copilot-openai-compatible')
++  })
++
++  it('uses includeUsage from settings for Copilot provider when undefined', () => {
++    mockGetState.mockReturnValue({
++      copilot: { defaultHeaders: {} },
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
++
++    const provider = createCopilotProvider()
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4', 'GPT-4', 'copilot'))
++
++    expect(config.options.includeUsage).toBeUndefined()
++    expect(config.providerId).toBe('github-copilot-openai-compatible')
++  })
++})
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 0be69bd..3c4af65 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -9,13 +9,16 @@ import {
+ } from '@renderer/hooks/useAwsBedrock'
+ import { createVertexProvider, isVertexAIConfigured } from '@renderer/hooks/useVertexAI'
+ import { getProviderByModel } from '@renderer/services/AssistantService'
++import { getProviderById } from '@renderer/services/ProviderService'
+ import store from '@renderer/store'
+ import { isSystemProvider, type Model, type Provider, SystemProviderIds } from '@renderer/types'
++import type { OpenAICompletionsStreamOptions } from '@renderer/types/aiCoreTypes'
+ import {
+   formatApiHost,
+   formatAzureOpenAIApiHost,
+   formatOllamaApiHost,
+   formatVertexApiHost,
++  isWithTrailingSharp,
+   routeToEndpoint
+ } from '@renderer/utils/api'
+ import {
+@@ -68,14 +71,15 @@ function handleSpecialProviders(model: Model, provider: Provider): Provider {
+  */
+ export function formatProviderApiHost(provider: Provider): Provider {
+   const formatted = { ...provider }
++  const appendApiVersion = !isWithTrailingSharp(provider.apiHost)
+   if (formatted.anthropicApiHost) {
+-    formatted.anthropicApiHost = formatApiHost(formatted.anthropicApiHost)
++    formatted.anthropicApiHost = formatApiHost(formatted.anthropicApiHost, appendApiVersion)
+   }
+ 
+   if (isAnthropicProvider(provider)) {
+     const baseHost = formatted.anthropicApiHost || formatted.apiHost
+     // AI SDK needs /v1 in baseURL, Anthropic SDK will strip it in getSdkClient
+-    formatted.apiHost = formatApiHost(baseHost)
++    formatted.apiHost = formatApiHost(baseHost, appendApiVersion)
+     if (!formatted.anthropicApiHost) {
+       formatted.anthropicApiHost = formatted.apiHost
+     }
+@@ -84,7 +88,7 @@ export function formatProviderApiHost(provider: Provider): Provider {
+   } else if (isOllamaProvider(formatted)) {
+     formatted.apiHost = formatOllamaApiHost(formatted.apiHost)
+   } else if (isGeminiProvider(formatted)) {
+-    formatted.apiHost = formatApiHost(formatted.apiHost, true, 'v1beta')
++    formatted.apiHost = formatApiHost(formatted.apiHost, appendApiVersion, 'v1beta')
+   } else if (isAzureOpenAIProvider(formatted)) {
+     formatted.apiHost = formatAzureOpenAIApiHost(formatted.apiHost)
+   } else if (isVertexProvider(formatted)) {
+@@ -94,7 +98,7 @@ export function formatProviderApiHost(provider: Provider): Provider {
+   } else if (isPerplexityProvider(formatted)) {
+     formatted.apiHost = formatApiHost(formatted.apiHost, false)
+   } else {
+-    formatted.apiHost = formatApiHost(formatted.apiHost)
++    formatted.apiHost = formatApiHost(formatted.apiHost, appendApiVersion)
+   }
+   return formatted
+ }
+@@ -147,6 +151,10 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     baseURL: baseURL,
+     apiKey: actualProvider.apiKey
+   }
++  let includeUsage: OpenAICompletionsStreamOptions['include_usage'] = undefined
++  if (isSupportStreamOptionsProvider(actualProvider)) {
++    includeUsage = store.getState().settings.openAI?.streamOptions?.includeUsage
++  }
+ 
+   const isCopilotProvider = actualProvider.id === SystemProviderIds.copilot
+   if (isCopilotProvider) {
+@@ -158,7 +166,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+         ...actualProvider.extra_headers
+       },
+       name: actualProvider.id,
+-      includeUsage: true
++      includeUsage
+     })
+ 
+     return {
+@@ -243,6 +251,12 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     if (model.endpoint_type) {
+       extraOptions.endpointType = model.endpoint_type
+     }
++    // CherryIN API Host
++    const cherryinProvider = getProviderById(SystemProviderIds.cherryin)
++    if (cherryinProvider) {
++      extraOptions.anthropicBaseURL = cherryinProvider.anthropicApiHost
++      extraOptions.geminiBaseURL = cherryinProvider.apiHost + '/v1beta/models'
++    }
+   }
+ 
+   if (hasProviderConfig(aiSdkProviderId) && aiSdkProviderId !== 'openai-compatible') {
+@@ -261,7 +275,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+       ...options,
+       name: actualProvider.id,
+       ...extraOptions,
+-      includeUsage: isSupportStreamOptionsProvider(actualProvider)
++      includeUsage
+     }
+   }
+ }
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 36253e5..fec4d19 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -754,7 +754,8 @@ describe('reasoning utils', () => {
+       const result = getGeminiReasoningParams(assistant, model)
+       expect(result).toEqual({
+         thinkingConfig: {
+-          includeThoughts: true
++          includeThoughts: true,
++          thinkingBudget: -1
+         }
+       })
+     })
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 46350b0..6d93a2e 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -37,7 +37,7 @@ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
+ import type { Assistant, Model } from '@renderer/types'
+ import { EFFORT_RATIO, isSystemProvider, SystemProviderIds } from '@renderer/types'
+-import type { OpenAISummaryText } from '@renderer/types/aiCoreTypes'
++import type { OpenAIReasoningSummary } from '@renderer/types/aiCoreTypes'
+ import type { ReasoningEffortOptionalParams } from '@renderer/types/sdk'
+ import { isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import { toInteger } from 'lodash'
+@@ -448,7 +448,7 @@ export function getOpenAIReasoningParams(
+   const openAI = getStoreSetting('openAI')
+   const summaryText = openAI.summaryText
+ 
+-  let reasoningSummary: OpenAISummaryText = undefined
++  let reasoningSummary: OpenAIReasoningSummary = undefined
+ 
+   if (model.id.includes('o1-pro')) {
+     reasoningSummary = undefined
+@@ -589,6 +589,7 @@ export function getGeminiReasoningParams(
+     if (effortRatio > 1) {
+       return {
+         thinkingConfig: {
++          thinkingBudget: -1,
+           includeThoughts: true
+         }
+       }
