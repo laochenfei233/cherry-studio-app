@@ -1,0 +1,942 @@
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index cfc9087..d839da8 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -10,7 +10,7 @@ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+ import {
+   findTokenLimit,
+   GEMINI_FLASH_MODEL_REGEX,
+-  getThinkModelType,
++  getModelSupportedReasoningEffortOptions,
+   isDeepSeekHybridInferenceModel,
+   isDoubaoThinkingAutoModel,
+   isGPT5SeriesModel,
+@@ -33,7 +33,6 @@ import {
+   isSupportedThinkingTokenQwenModel,
+   isSupportedThinkingTokenZhipuModel,
+   isVisionModel,
+-  MODEL_SUPPORTED_REASONING_EFFORT,
+   ZHIPU_RESULT_TOKENS
+ } from '@renderer/config/models'
+ import { mapLanguageToQwenMTModel } from '@renderer/config/translate'
+@@ -304,16 +303,15 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+     // Grok models/Perplexity models/OpenAI models
+     if (isSupportedReasoningEffortModel(model)) {
+       // 检查模型是否支持所选选项
+-      const modelType = getThinkModelType(model)
+-      const supportedOptions = MODEL_SUPPORTED_REASONING_EFFORT[modelType]
+-      if (supportedOptions.includes(reasoningEffort)) {
++      const supportedOptions = getModelSupportedReasoningEffortOptions(model)
++      if (supportedOptions?.includes(reasoningEffort)) {
+         return {
+           reasoning_effort: reasoningEffort
+         }
+       } else {
+         // 如果不支持，fallback到第一个支持的值
+         return {
+-          reasoning_effort: supportedOptions[0]
++          reasoning_effort: supportedOptions?.[0]
+         }
+       }
+     }
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index c51f8aa..937827d 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -88,7 +88,11 @@ export abstract class OpenAIBaseClient<
+   }
+ 
+   override async getEmbeddingDimensions(model: Model): Promise<number> {
+-    const sdk = await this.getSdkInstance()
++    let sdk: OpenAI = await this.getSdkInstance()
++    if (isOllamaProvider(this.provider)) {
++      const embedBaseUrl = `${this.provider.apiHost.replace(/(\/(api|v1))\/?$/, '')}/v1`
++      sdk = sdk.withOptions({ baseURL: embedBaseUrl })
++    }
+ 
+     const data = await sdk.embeddings.create({
+       model: model.id,
+diff --git a/src/aiCore/legacy/index.ts b/src/aiCore/legacy/index.ts
+index da6cdb6..7c5f521 100644
+--- a/src/aiCore/legacy/index.ts
++++ b/src/aiCore/legacy/index.ts
+@@ -2,7 +2,6 @@ import { loggerService } from '@logger'
+ import { ApiClientFactory } from '@renderer/aiCore/legacy/clients/ApiClientFactory'
+ import type { BaseApiClient } from '@renderer/aiCore/legacy/clients/BaseApiClient'
+ import { isDedicatedImageGenerationModel, isFunctionCallingModel } from '@renderer/config/models'
+-import { getProviderByModel } from '@renderer/services/AssistantService'
+ import { withSpanResult } from '@renderer/services/SpanManagerService'
+ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+ import type { GenerateImageParams, Model, Provider } from '@renderer/types'
+@@ -160,9 +159,6 @@ export default class AiProvider {
+   public async getEmbeddingDimensions(model: Model): Promise<number> {
+     try {
+       // Use the SDK instance to test embedding capabilities
+-      if (this.apiClient instanceof OpenAIResponseAPIClient && getProviderByModel(model).type === 'azure-openai') {
+-        this.apiClient = this.apiClient.getClient(model) as BaseApiClient
+-      }
+       const dimensions = await this.apiClient.getEmbeddingDimensions(model)
+       return dimensions
+     } catch (error) {
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+index 10a4d59..b2a796b 100644
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+@@ -7,7 +7,6 @@ import type { Chunk } from '@renderer/types/chunk'
+ import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import type { LanguageModelMiddleware } from 'ai'
+ import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+-import { isEmpty } from 'lodash'
+ 
+ import { getAiSdkProviderId } from '../provider/factory'
+ import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
+@@ -16,7 +15,6 @@ import { openrouterGenerateImageMiddleware } from './openrouterGenerateImageMidd
+ import { openrouterReasoningMiddleware } from './openrouterReasoningMiddleware'
+ import { qwenThinkingMiddleware } from './qwenThinkingMiddleware'
+ import { skipGeminiThoughtSignatureMiddleware } from './skipGeminiThoughtSignatureMiddleware'
+-import { toolChoiceMiddleware } from './toolChoiceMiddleware'
+ 
+ const logger = loggerService.withContext('AiSdkMiddlewareBuilder')
+ 
+@@ -136,15 +134,6 @@ export class AiSdkMiddlewareBuilder {
+ export function buildAiSdkMiddlewares(config: AiSdkMiddlewareConfig): LanguageModelMiddleware[] {
+   const builder = new AiSdkMiddlewareBuilder()
+ 
+-  // 0. 知识库强制调用中间件（必须在最前面，确保第一轮强制调用知识库）
+-  if (!isEmpty(config.assistant?.knowledge_bases?.map((base) => base.id)) && config.knowledgeRecognition !== 'on') {
+-    builder.add({
+-      name: 'force-knowledge-first',
+-      middleware: toolChoiceMiddleware('builtin_knowledge_search')
+-    })
+-    logger.debug('Added toolChoice middleware to force knowledge base search on first round')
+-  }
+-
+   // 1. 根据provider添加特定中间件
+   if (config.provider) {
+     addProviderSpecificMiddlewares(builder, config)
+diff --git a/src/aiCore/plugins/searchOrchestrationPlugin.ts b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+index 6be577f..5b095a4 100644
+--- a/src/aiCore/plugins/searchOrchestrationPlugin.ts
++++ b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+@@ -31,7 +31,7 @@ import { webSearchToolWithPreExtractedKeywords } from '../tools/WebSearchTool'
+ 
+ const logger = loggerService.withContext('SearchOrchestrationPlugin')
+ 
+-const getMessageContent = (message: ModelMessage) => {
++export const getMessageContent = (message: ModelMessage) => {
+   if (typeof message.content === 'string') return message.content
+   return message.content.reduce((acc, part) => {
+     if (part.type === 'text') {
+@@ -266,14 +266,14 @@ export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string)
+         // 判断是否需要各种搜索
+         const knowledgeBaseIds = assistant.knowledge_bases?.map((base) => base.id)
+         const hasKnowledgeBase = !isEmpty(knowledgeBaseIds)
+-        const knowledgeRecognition = assistant.knowledgeRecognition || 'on'
++        const knowledgeRecognition = assistant.knowledgeRecognition || 'off'
+         const globalMemoryEnabled = selectGlobalMemoryEnabled(store.getState())
+         const shouldWebSearch = !!assistant.webSearchProviderId
+         const shouldKnowledgeSearch = hasKnowledgeBase && knowledgeRecognition === 'on'
+         const shouldMemorySearch = globalMemoryEnabled && assistant.enableMemory
+ 
+         // 执行意图分析
+-        if (shouldWebSearch || hasKnowledgeBase) {
++        if (shouldWebSearch || shouldKnowledgeSearch) {
+           const analysisResult = await analyzeSearchIntent(lastUserMessage, assistant, {
+             shouldWebSearch,
+             shouldKnowledgeSearch,
+@@ -330,41 +330,25 @@ export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string)
+         // 📚 知识库搜索工具配置
+         const knowledgeBaseIds = assistant.knowledge_bases?.map((base) => base.id)
+         const hasKnowledgeBase = !isEmpty(knowledgeBaseIds)
+-        const knowledgeRecognition = assistant.knowledgeRecognition || 'on'
++        const knowledgeRecognition = assistant.knowledgeRecognition || 'off'
++        const shouldKnowledgeSearch = hasKnowledgeBase && knowledgeRecognition === 'on'
++
++        if (shouldKnowledgeSearch) {
++          // on 模式：根据意图识别结果决定是否添加工具
++          const needsKnowledgeSearch =
++            analysisResult?.knowledge &&
++            analysisResult.knowledge.question &&
++            analysisResult.knowledge.question[0] !== 'not_needed'
+ 
+-        if (hasKnowledgeBase) {
+-          if (knowledgeRecognition === 'off') {
+-            // off 模式：直接添加知识库搜索工具，使用用户消息作为搜索关键词
++          if (needsKnowledgeSearch && analysisResult.knowledge) {
++            // logger.info('📚 Adding knowledge search tool (intent-based)')
+             const userMessage = userMessages[context.requestId]
+-            const fallbackKeywords = {
+-              question: [getMessageContent(userMessage) || 'search'],
+-              rewrite: getMessageContent(userMessage) || 'search'
+-            }
+-            // logger.info('📚 Adding knowledge search tool (force mode)')
+             params.tools['builtin_knowledge_search'] = knowledgeSearchTool(
+               assistant,
+-              fallbackKeywords,
++              analysisResult.knowledge,
+               getMessageContent(userMessage),
+               topicId
+             )
+-            // params.toolChoice = { type: 'tool', toolName: 'builtin_knowledge_search' }
+-          } else {
+-            // on 模式：根据意图识别结果决定是否添加工具
+-            const needsKnowledgeSearch =
+-              analysisResult?.knowledge &&
+-              analysisResult.knowledge.question &&
+-              analysisResult.knowledge.question[0] !== 'not_needed'
+-
+-            if (needsKnowledgeSearch && analysisResult.knowledge) {
+-              // logger.info('📚 Adding knowledge search tool (intent-based)')
+-              const userMessage = userMessages[context.requestId]
+-              params.tools['builtin_knowledge_search'] = knowledgeSearchTool(
+-                assistant,
+-                analysisResult.knowledge,
+-                getMessageContent(userMessage),
+-                topicId
+-              )
+-            }
+           }
+         }
+ 
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index 2433192..2a69f3b 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -109,6 +109,20 @@ const createImageBlock = (
+   ...overrides
+ })
+ 
++const createThinkingBlock = (
++  messageId: string,
++  overrides: Partial<Omit<ThinkingMessageBlock, 'type' | 'messageId'>> = {}
++): ThinkingMessageBlock => ({
++  id: overrides.id ?? `thinking-block-${++blockCounter}`,
++  messageId,
++  type: MessageBlockType.THINKING,
++  createdAt: overrides.createdAt ?? new Date(2024, 0, 1, 0, 0, blockCounter).toISOString(),
++  status: overrides.status ?? MessageBlockStatus.SUCCESS,
++  content: overrides.content ?? 'Let me think...',
++  thinking_millsec: overrides.thinking_millsec ?? 1000,
++  ...overrides
++})
++
+ describe('messageConverter', () => {
+   beforeEach(() => {
+     convertFileBlockToFilePartMock.mockReset()
+@@ -137,6 +151,73 @@ describe('messageConverter', () => {
+       })
+     })
+ 
++    it('extracts base64 data from data URLs and preserves mediaType', async () => {
++      const model = createModel()
++      const message = createMessage('user')
++      message.__mockContent = 'Check this image'
++      message.__mockImageBlocks = [createImageBlock(message.id, { url: 'data:image/png;base64,iVBORw0KGgoAAAANS' })]
++
++      const result = await convertMessageToSdkParam(message, true, model)
++
++      expect(result).toEqual({
++        role: 'user',
++        content: [
++          { type: 'text', text: 'Check this image' },
++          { type: 'image', image: 'iVBORw0KGgoAAAANS', mediaType: 'image/png' }
++        ]
++      })
++    })
++
++    it('handles data URLs without mediaType gracefully', async () => {
++      const model = createModel()
++      const message = createMessage('user')
++      message.__mockContent = 'Check this'
++      message.__mockImageBlocks = [createImageBlock(message.id, { url: 'data:;base64,AAABBBCCC' })]
++
++      const result = await convertMessageToSdkParam(message, true, model)
++
++      expect(result).toEqual({
++        role: 'user',
++        content: [
++          { type: 'text', text: 'Check this' },
++          { type: 'image', image: 'AAABBBCCC' }
++        ]
++      })
++    })
++
++    it('skips malformed data URLs without comma separator', async () => {
++      const model = createModel()
++      const message = createMessage('user')
++      message.__mockContent = 'Malformed data url'
++      message.__mockImageBlocks = [createImageBlock(message.id, { url: 'data:image/pngAAABBB' })]
++
++      const result = await convertMessageToSdkParam(message, true, model)
++
++      expect(result).toEqual({
++        role: 'user',
++        content: [
++          { type: 'text', text: 'Malformed data url' }
++          // Malformed data URL is excluded from the content
++        ]
++      })
++    })
++
++    it('handles multiple large base64 images without stack overflow', async () => {
++      const model = createModel()
++      const message = createMessage('user')
++      // Create large base64 strings (~500KB each) to simulate real-world large images
++      const largeBase64 = 'A'.repeat(500_000)
++      message.__mockContent = 'Check these images'
++      message.__mockImageBlocks = [
++        createImageBlock(message.id, { url: `data:image/png;base64,${largeBase64}` }),
++        createImageBlock(message.id, { url: `data:image/png;base64,${largeBase64}` }),
++        createImageBlock(message.id, { url: `data:image/png;base64,${largeBase64}` })
++      ]
++
++      // Should not throw RangeError: Maximum call stack size exceeded
++      await expect(convertMessageToSdkParam(message, true, model)).resolves.toBeDefined()
++    })
++
+     it('returns file instructions as a system message when native uploads succeed', async () => {
+       const model = createModel()
+       const message = createMessage('user')
+@@ -162,10 +243,27 @@ describe('messageConverter', () => {
+         }
+       ])
+     })
++
++    it('includes reasoning parts for assistant messages with thinking blocks', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = 'Here is my answer'
++      message.__mockThinkingBlocks = [createThinkingBlock(message.id, { content: 'Let me think...' })]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [
++          { type: 'text', text: 'Here is my answer' },
++          { type: 'reasoning', text: 'Let me think...' }
++        ]
++      })
++    })
+   })
+ 
+   describe('convertMessagesToSdkMessages', () => {
+-    it('appends assistant images to the final user message for image enhancement models', async () => {
++    it('collapses to [system?, user(image)] for image enhancement models', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const initialUser = createMessage('user')
+       initialUser.__mockContent = 'Start editing'
+@@ -180,14 +278,6 @@ describe('messageConverter', () => {
+       const result = await convertMessagesToSdkMessages([initialUser, assistant, finalUser], model)
+ 
+       expect(result).toEqual([
+-        {
+-          role: 'user',
+-          content: [{ type: 'text', text: 'Start editing' }]
+-        },
+-        {
+-          role: 'assistant',
+-          content: [{ type: 'text', text: 'Here is the current preview' }]
+-        },
+         {
+           role: 'user',
+           content: [
+@@ -198,7 +288,7 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
+-    it('preserves preceding system instructions when building enhancement payloads', async () => {
++    it('preserves system messages and collapses others for enhancement payloads', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const fileUser = createMessage('user')
+       fileUser.__mockContent = 'Use this document as inspiration'
+@@ -221,11 +311,6 @@ describe('messageConverter', () => {
+ 
+       expect(result).toEqual([
+         { role: 'system', content: 'fileid://reference' },
+-        { role: 'user', content: [{ type: 'text', text: 'Use this document as inspiration' }] },
+-        {
+-          role: 'assistant',
+-          content: [{ type: 'text', text: 'Generated previews ready' }]
+-        },
+         {
+           role: 'user',
+           content: [
+@@ -235,5 +320,120 @@ describe('messageConverter', () => {
+         }
+       ])
+     })
++
++    it('handles no previous assistant message with images', async () => {
++      const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
++      const user1 = createMessage('user')
++      user1.__mockContent = 'Start'
++
++      const user2 = createMessage('user')
++      user2.__mockContent = 'Continue without images'
++
++      const result = await convertMessagesToSdkMessages([user1, user2], model)
++
++      expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Continue without images' }]
++        }
++      ])
++    })
++
++    it('handles assistant message without images', async () => {
++      const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
++      const user1 = createMessage('user')
++      user1.__mockContent = 'Start'
++
++      const assistant = createMessage('assistant')
++      assistant.__mockContent = 'Text only response'
++      assistant.__mockImageBlocks = []
++
++      const user2 = createMessage('user')
++      user2.__mockContent = 'Follow up'
++
++      const result = await convertMessagesToSdkMessages([user1, assistant, user2], model)
++
++      expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Follow up' }]
++        }
++      ])
++    })
++
++    it('handles multiple assistant messages by using the most recent one', async () => {
++      const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
++      const user1 = createMessage('user')
++      user1.__mockContent = 'Start'
++
++      const assistant1 = createMessage('assistant')
++      assistant1.__mockContent = 'First response'
++      assistant1.__mockImageBlocks = [createImageBlock(assistant1.id, { url: 'https://example.com/old.png' })]
++
++      const user2 = createMessage('user')
++      user2.__mockContent = 'Continue'
++
++      const assistant2 = createMessage('assistant')
++      assistant2.__mockContent = 'Second response'
++      assistant2.__mockImageBlocks = [createImageBlock(assistant2.id, { url: 'https://example.com/new.png' })]
++
++      const user3 = createMessage('user')
++      user3.__mockContent = 'Final request'
++
++      const result = await convertMessagesToSdkMessages([user1, assistant1, user2, assistant2, user3], model)
++
++      expect(result).toEqual([
++        {
++          role: 'user',
++          content: [
++            { type: 'text', text: 'Final request' },
++            { type: 'image', image: 'https://example.com/new.png' }
++          ]
++        }
++      ])
++    })
++
++    it('handles conversation ending with assistant message', async () => {
++      const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
++      const user = createMessage('user')
++      user.__mockContent = 'Start'
++
++      const assistant = createMessage('assistant')
++      assistant.__mockContent = 'Response with image'
++      assistant.__mockImageBlocks = [createImageBlock(assistant.id, { url: 'https://example.com/image.png' })]
++
++      const result = await convertMessagesToSdkMessages([user, assistant], model)
++
++      // The user message is the last user message, but since the assistant comes after,
++      // there's no "previous" assistant message (search starts from messages.length-2 backwards)
++      expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start' }]
++        }
++      ])
++    })
++
++    it('handles empty content in last user message', async () => {
++      const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
++      const user1 = createMessage('user')
++      user1.__mockContent = 'Start'
++
++      const assistant = createMessage('assistant')
++      assistant.__mockContent = 'Here is the preview'
++      assistant.__mockImageBlocks = [createImageBlock(assistant.id, { url: 'https://example.com/preview.png' })]
++
++      const user2 = createMessage('user')
++      user2.__mockContent = ''
++
++      const result = await convertMessagesToSdkMessages([user1, assistant, user2], model)
++
++      expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'image', image: 'https://example.com/preview.png' }]
++        }
++      ])
++    })
+   })
+ })
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index b0c432e..c3798c1 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -3,10 +3,12 @@
+  * 将 Cherry Studio 消息格式转换为 AI SDK 消息格式
+  */
+ 
++import type { ReasoningPart } from '@ai-sdk/provider-utils'
+ import { loggerService } from '@logger'
+ import { isImageEnhancementModel, isVisionModel } from '@renderer/config/models'
+ import type { Message, Model } from '@renderer/types'
+ import type { FileMessageBlock, ImageMessageBlock, ThinkingMessageBlock } from '@renderer/types/newMessage'
++import { parseDataUrlMediaType } from '@renderer/utils/image'
+ import {
+   findFileBlocks,
+   findImageBlocks,
+@@ -59,23 +61,29 @@ async function convertImageBlockToImagePart(imageBlocks: ImageMessageBlock[]): P
+           mediaType: image.mime
+         })
+       } catch (error) {
+-        logger.warn('Failed to load image:', error as Error)
++        logger.error('Failed to load image file, image will be excluded from message:', {
++          fileId: imageBlock.file.id,
++          fileName: imageBlock.file.origin_name,
++          error: error as Error
++        })
+       }
+     } else if (imageBlock.url) {
+-      const isBase64 = imageBlock.url.startsWith('data:')
+-      if (isBase64) {
+-        const base64 = imageBlock.url.match(/^data:[^;]*;base64,(.+)$/)![1]
+-        const mimeMatch = imageBlock.url.match(/^data:([^;]+)/)
+-        parts.push({
+-          type: 'image',
+-          image: base64,
+-          mediaType: mimeMatch ? mimeMatch[1] : 'image/png'
+-        })
++      const url = imageBlock.url
++      const isDataUrl = url.startsWith('data:')
++      if (isDataUrl) {
++        const { mediaType } = parseDataUrlMediaType(url)
++        const commaIndex = url.indexOf(',')
++        if (commaIndex === -1) {
++          logger.error('Malformed data URL detected (missing comma separator), image will be excluded:', {
++            urlPrefix: url.slice(0, 50) + '...'
++          })
++          continue
++        }
++        const base64Data = url.slice(commaIndex + 1)
++        parts.push({ type: 'image', image: base64Data, ...(mediaType ? { mediaType } : {}) })
+       } else {
+-        parts.push({
+-          type: 'image',
+-          image: imageBlock.url
+-        })
++        // For remote URLs we keep payload minimal to match existing expectations.
++        parts.push({ type: 'image', image: url })
+       }
+     }
+   }
+@@ -156,13 +164,13 @@ async function convertMessageToAssistantModelMessage(
+   thinkingBlocks: ThinkingMessageBlock[],
+   model?: Model
+ ): Promise<AssistantModelMessage> {
+-  const parts: Array<TextPart | FilePart> = []
++  const parts: Array<TextPart | ReasoningPart | FilePart> = []
+   if (content) {
+     parts.push({ type: 'text', text: content })
+   }
+ 
+   for (const thinkingBlock of thinkingBlocks) {
+-    parts.push({ type: 'text', text: thinkingBlock.content })
++    parts.push({ type: 'reasoning', text: thinkingBlock.content })
+   }
+ 
+   for (const fileBlock of fileBlocks) {
+@@ -194,17 +202,20 @@ async function convertMessageToAssistantModelMessage(
+  * This function processes messages and transforms them into the format required by the SDK.
+  * It handles special cases for vision models and image enhancement models.
+  *
+- * @param messages - Array of messages to convert. Must contain at least 3 messages when using image enhancement models for special handling.
++ * @param messages - Array of messages to convert.
+  * @param model - The model configuration that determines conversion behavior
+  *
+  * @returns A promise that resolves to an array of SDK-compatible model messages
+  *
+  * @remarks
+- * For image enhancement models with 3+ messages:
+- * - Examines the last 2 messages to find an assistant message containing image blocks
+- * - If found, extracts images from the assistant message and appends them to the last user message content
+- * - Returns all converted messages (not just the last two) with the images merged into the user message
+- * - Typical pattern: [system?, assistant(image), user] -> [system?, assistant, user(image)]
++ * For image enhancement models:
++ * - Collapses the conversation into [system?, user(image)] format
++ * - Searches backwards through all messages to find the most recent assistant message with images
++ * - Preserves all system messages (including ones generated from file uploads like 'fileid://...')
++ * - Extracts the last user message content and merges images from the previous assistant message
++ * - Returns only the collapsed messages: system messages (if any) followed by a single user message
++ * - If no user message is found, returns only system messages
++ * - Typical pattern: [system?, user, assistant(image), user] -> [system?, user(image)]
+  *
+  * For other models:
+  * - Returns all converted messages in order without special image handling
+@@ -220,25 +231,66 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+     sdkMessages.push(...(Array.isArray(sdkMessage) ? sdkMessage : [sdkMessage]))
+   }
+   // Special handling for image enhancement models
+-  // Only merge images into the user message
+-  // [system?, assistant(image), user] -> [system?, assistant, user(image)]
+-  if (isImageEnhancementModel(model) && messages.length >= 3) {
+-    const needUpdatedMessages = messages.slice(-2)
+-    const assistantMessage = needUpdatedMessages.find((m) => m.role === 'assistant')
+-    const userSdkMessage = sdkMessages[sdkMessages.length - 1]
+-
+-    if (assistantMessage && userSdkMessage?.role === 'user') {
+-      const imageBlocks = findImageBlocks(assistantMessage)
+-      const imageParts = await convertImageBlockToImagePart(imageBlocks)
++  // Target behavior: Collapse the conversation into [system?, user(image)].
++  // Explanation of why we don't simply use slice:
++  // 1) We need to preserve all system messages: During the convertMessageToSdkParam process, native file uploads may insert `system(fileid://...)`.
++  // Directly slicing the original messages or already converted sdkMessages could easily result in missing these system instructions.
++  // Therefore, we first perform a full conversion and then aggregate the system messages afterward.
++  // 2) The conversion process may split messages: A single user message might be broken into two SDK messages—[system, user].
++  // Slicing either side could lead to obtaining semantically incorrect fragments (e.g., only the split-out system message).
++  // 3) The “previous assistant message” is not necessarily the second-to-last one: There might be system messages or other message blocks inserted in between,
++  // making a simple slice(-2) assumption too rigid. Here, we trace back from the end of the original messages to locate the most recent assistant message, which better aligns with business semantics.
++  // 4) This is a “collapse” rather than a simple “slice”: Ultimately, we need to synthesize a new user message
++  // (with text from the last user message and images from the previous assistant message). Using slice can only extract subarrays,
++  // which still require reassembly; constructing directly according to the target structure is clearer and more reliable.
++  if (isImageEnhancementModel(model)) {
++    // Collect all system messages (including ones generated from file uploads)
++    const systemMessages = sdkMessages.filter((m): m is SystemModelMessage => m.role === 'system')
++
++    // Find the last user message (SDK converted)
++    const lastUserSdkIndex = (() => {
++      for (let i = sdkMessages.length - 1; i >= 0; i--) {
++        if (sdkMessages[i].role === 'user') return i
++      }
++      return -1
++    })()
++
++    const lastUserSdk = lastUserSdkIndex >= 0 ? (sdkMessages[lastUserSdkIndex] as UserModelMessage) : null
+ 
++    // Find the nearest preceding assistant message in original messages
++    let prevAssistant: Message | null = null
++    for (let i = messages.length - 2; i >= 0; i--) {
++      if (messages[i].role === 'assistant') {
++        prevAssistant = messages[i]
++        break
++      }
++    }
++
++    // Build the final user content parts
++    let finalUserParts: Array<TextPart | FilePart | ImagePart> = []
++    if (lastUserSdk) {
++      if (typeof lastUserSdk.content === 'string') {
++        finalUserParts.push({ type: 'text', text: lastUserSdk.content })
++      } else if (Array.isArray(lastUserSdk.content)) {
++        finalUserParts = [...lastUserSdk.content]
++      }
++    }
++
++    // Append images from the previous assistant message if any
++    if (prevAssistant) {
++      const imageBlocks = findImageBlocks(prevAssistant)
++      const imageParts = await convertImageBlockToImagePart(imageBlocks)
+       if (imageParts.length > 0) {
+-        if (typeof userSdkMessage.content === 'string') {
+-          userSdkMessage.content = [{ type: 'text', text: userSdkMessage.content }, ...imageParts]
+-        } else if (Array.isArray(userSdkMessage.content)) {
+-          userSdkMessage.content.push(...imageParts)
+-        }
++        finalUserParts.push(...imageParts)
+       }
+     }
++
++    // If we couldn't find a last user message, fall back to returning collected system messages only
++    if (!lastUserSdk) {
++      return systemMessages
++    }
++
++    return [...systemMessages, { role: 'user', content: finalUserParts }]
+   }
+ 
+   return sdkMessages
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 34c3418..58b4834 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -28,13 +28,14 @@ import { getAnthropicThinkingBudget } from '../utils/reasoning'
+  * - Disabled for models that do not support temperature.
+  * - Disabled for Claude 4.5 reasoning models when TopP is enabled and temperature is disabled.
+  * Otherwise, returns the temperature value if the assistant has temperature enabled.
++
+  */
+ export function getTemperature(assistant: Assistant, model: Model): number | undefined {
+   if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
+     return undefined
+   }
+ 
+-  if (!isSupportTemperatureModel(model)) {
++  if (!isSupportTemperatureModel(model, assistant)) {
+     return undefined
+   }
+ 
+@@ -46,6 +47,10 @@ export function getTemperature(assistant: Assistant, model: Model): number | und
+     return undefined
+   }
+ 
++  return getTemperatureValue(assistant, model)
++}
++
++function getTemperatureValue(assistant: Assistant, model: Model): number | undefined {
+   const assistantSettings = getAssistantSettings(assistant)
+   let temperature = assistantSettings?.temperature
+   if (temperature && isMaxTemperatureOneModel(model)) {
+@@ -68,13 +73,17 @@ export function getTopP(assistant: Assistant, model: Model): number | undefined
+   if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
+     return undefined
+   }
+-  if (!isSupportTopPModel(model)) {
++  if (!isSupportTopPModel(model, assistant)) {
+     return undefined
+   }
+   if (isTemperatureTopPMutuallyExclusiveModel(model) && assistant.settings?.enableTemperature) {
+     return undefined
+   }
+ 
++  return getTopPValue(assistant)
++}
++
++function getTopPValue(assistant: Assistant): number | undefined {
+   const assistantSettings = getAssistantSettings(assistant)
+   // FIXME: assistant.settings.enableTopP should be always a boolean value.
+   const enableTopP = assistantSettings.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index dabcd14..556b870 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -32,6 +32,7 @@ import {
+   isSupportStreamOptionsProvider,
+   isVertexProvider
+ } from '@renderer/utils/provider'
++import { defaultAppHeaders } from '@shared/utils'
+ import { cloneDeep, isEmpty } from 'lodash'
+ 
+ import type { AiSdkConfig } from '../types'
+@@ -197,18 +198,13 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     extraOptions.mode = 'chat'
+   }
+ 
+-  // 添加额外headers
+-  if (actualProvider.extra_headers) {
+-    extraOptions.headers = actualProvider.extra_headers
+-    // copy from openaiBaseClient/openaiResponseApiClient
+-    if (aiSdkProviderId === 'openai') {
+-      extraOptions.headers = {
+-        ...extraOptions.headers,
+-        'HTTP-Referer': 'https://cherry-ai.com',
+-        'X-Title': 'Cherry Studio',
+-        'X-Api-Key': baseConfig.apiKey
+-      }
+-    }
++  extraOptions.headers = {
++    ...defaultAppHeaders(),
++    ...actualProvider.extra_headers
++  }
++
++  if (aiSdkProviderId === 'openai') {
++    extraOptions.headers['X-Api-Key'] = baseConfig.apiKey
+   }
+   // azure
+   // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
+@@ -254,8 +250,8 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     // CherryIN API Host
+     const cherryinProvider = getProviderById(SystemProviderIds.cherryin)
+     if (cherryinProvider) {
+-      extraOptions.anthropicBaseURL = cherryinProvider.anthropicApiHost
+-      extraOptions.geminiBaseURL = cherryinProvider.apiHost + '/gemini/v1beta'
++      extraOptions.anthropicBaseURL = cherryinProvider.anthropicApiHost + '/v1'
++      extraOptions.geminiBaseURL = cherryinProvider.apiHost + '/v1beta/models'
+     }
+   }
+ 
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 36253e5..fec4d19 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -754,7 +754,8 @@ describe('reasoning utils', () => {
+       const result = getGeminiReasoningParams(assistant, model)
+       expect(result).toEqual({
+         thinkingConfig: {
+-          includeThoughts: true
++          includeThoughts: true,
++          thinkingBudget: -1
+         }
+       })
+     })
+diff --git a/src/aiCore/utils/__tests__/websearch.test.ts b/src/aiCore/utils/__tests__/websearch.test.ts
+index fa5e3c3..5c95a66 100644
+--- a/src/aiCore/utils/__tests__/websearch.test.ts
++++ b/src/aiCore/utils/__tests__/websearch.test.ts
+@@ -259,7 +259,7 @@ describe('websearch utils', () => {
+ 
+         expect(result).toEqual({
+           xai: {
+-            maxSearchResults: 50,
++            maxSearchResults: 30,
+             returnCitations: true,
+             sources: [{ type: 'web', excludedWebsites: [] }, { type: 'news' }, { type: 'x' }],
+             mode: 'on'
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 8ec46c9..fd9bc59 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -11,6 +11,7 @@ import {
+   isGeminiModel,
+   isGrokModel,
+   isOpenAIModel,
++  isOpenAIOpenWeightModel,
+   isQwenMTModel,
+   isSupportFlexServiceTierModel,
+   isSupportVerbosityModel
+@@ -244,7 +245,7 @@ export function buildProviderOptions(
+           providerSpecificOptions = buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier)
+           break
+         case SystemProviderIds.ollama:
+-          providerSpecificOptions = buildOllamaProviderOptions(assistant, capabilities)
++          providerSpecificOptions = buildOllamaProviderOptions(assistant, model, capabilities)
+           break
+         case SystemProviderIds.gateway:
+           providerSpecificOptions = buildAIGatewayOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+@@ -564,6 +565,7 @@ function buildBedrockProviderOptions(
+ 
+ function buildOllamaProviderOptions(
+   assistant: Assistant,
++  model: Model,
+   capabilities: {
+     enableReasoning: boolean
+     enableWebSearch: boolean
+@@ -574,7 +576,12 @@ function buildOllamaProviderOptions(
+   const providerOptions: OllamaCompletionProviderOptions = {}
+   const reasoningEffort = assistant.settings?.reasoning_effort
+   if (enableReasoning) {
+-    providerOptions.think = !['none', undefined].includes(reasoningEffort)
++    if (isOpenAIOpenWeightModel(model)) {
++      // @ts-ignore upstream type error
++      providerOptions.think = reasoningEffort as any
++    } else {
++      providerOptions.think = !['none', undefined].includes(reasoningEffort)
++    }
+   }
+   return {
+     ollama: providerOptions
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 1e74db2..f182405 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -8,16 +8,16 @@ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+ import {
+   findTokenLimit,
+   GEMINI_FLASH_MODEL_REGEX,
+-  getThinkModelType,
++  getModelSupportedReasoningEffortOptions,
+   isDeepSeekHybridInferenceModel,
+   isDoubaoSeedAfter251015,
+   isDoubaoThinkingAutoModel,
+   isGemini3ThinkingTokenModel,
+-  isGPT5SeriesModel,
+   isGPT51SeriesModel,
+   isGrok4FastReasoningModel,
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
++  isOpenAIReasoningModel,
+   isQwenAlwaysThinkModel,
+   isQwenReasoningModel,
+   isReasoningModel,
+@@ -30,8 +30,7 @@ import {
+   isSupportedThinkingTokenHunyuanModel,
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+-  isSupportedThinkingTokenZhipuModel,
+-  MODEL_SUPPORTED_REASONING_EFFORT
++  isSupportedThinkingTokenZhipuModel
+ } from '@renderer/config/models'
+ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
+@@ -134,8 +133,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   // https://creator.poe.com/docs/external-applications/openai-compatible-api#additional-considerations
+   // Poe provider - supports custom bot parameters via extra_body
+   if (provider.id === SystemProviderIds.poe) {
+-    // GPT-5 series models use reasoning_effort parameter in extra_body
+-    if (isGPT5SeriesModel(model) || isGPT51SeriesModel(model)) {
++    if (isOpenAIReasoningModel(model)) {
+       return {
+         extra_body: {
+           reasoning_effort: reasoningEffort === 'auto' ? 'medium' : reasoningEffort
+@@ -331,16 +329,15 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   // Grok models/Perplexity models/OpenAI models, use reasoning_effort
+   if (isSupportedReasoningEffortModel(model)) {
+     // 检查模型是否支持所选选项
+-    const modelType = getThinkModelType(model)
+-    const supportedOptions = MODEL_SUPPORTED_REASONING_EFFORT[modelType]
+-    if (supportedOptions.includes(reasoningEffort)) {
++    const supportedOptions = getModelSupportedReasoningEffortOptions(model)
++    if (supportedOptions?.includes(reasoningEffort)) {
+       return {
+         reasoningEffort
+       }
+     } else {
+       // 如果不支持，fallback到第一个支持的值
+       return {
+-        reasoningEffort: supportedOptions[0]
++        reasoningEffort: supportedOptions?.[0]
+       }
+     }
+   }
+@@ -589,6 +586,7 @@ export function getGeminiReasoningParams(
+     if (effortRatio > 1) {
+       return {
+         thinkingConfig: {
++          thinkingBudget: -1,
+           includeThoughts: true
+         }
+       }
+@@ -634,6 +632,8 @@ export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<
+     case 'low':
+     case 'high':
+       return { reasoningEffort }
++    case 'xhigh':
++      return { reasoningEffort: 'high' }
+   }
+ }
+ 
+diff --git a/src/aiCore/utils/websearch.ts b/src/aiCore/utils/websearch.ts
+index 127636a..14a9913 100644
+--- a/src/aiCore/utils/websearch.ts
++++ b/src/aiCore/utils/websearch.ts
+@@ -9,6 +9,8 @@ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+ import type { Model } from '@renderer/types'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ 
++const X_AI_MAX_SEARCH_RESULT = 30
++
+ export function getWebSearchParams(model: Model): Record<string, any> {
+   if (model.provider === 'hunyuan') {
+     return { enable_enhancement: true, citation: true, search_info: true }
+@@ -82,7 +84,7 @@ export function buildProviderBuiltinWebSearchConfig(
+       const excludeDomains = mapRegexToPatterns(webSearchConfig.excludeDomains)
+       return {
+         xai: {
+-          maxSearchResults: webSearchConfig.maxResults,
++          maxSearchResults: Math.min(webSearchConfig.maxResults, X_AI_MAX_SEARCH_RESULT),
+           returnCitations: true,
+           sources: [
+             {
