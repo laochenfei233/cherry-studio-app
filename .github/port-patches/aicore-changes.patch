@@ -1,0 +1,976 @@
+diff --git a/src/aiCore/legacy/clients/__tests__/OpenAIBaseClient.azureEndpoint.test.ts b/src/aiCore/legacy/clients/__tests__/OpenAIBaseClient.azureEndpoint.test.ts
+new file mode 100644
+index 0000000..e3b2ef2
+--- /dev/null
++++ b/src/aiCore/legacy/clients/__tests__/OpenAIBaseClient.azureEndpoint.test.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, it } from 'vitest'
++
++import { normalizeAzureOpenAIEndpoint } from '../openai/azureOpenAIEndpoint'
++
++describe('normalizeAzureOpenAIEndpoint', () => {
++  it.each([
++    {
++      apiHost: 'https://example.openai.azure.com/openai',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    },
++    {
++      apiHost: 'https://example.openai.azure.com/openai/',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    },
++    {
++      apiHost: 'https://example.openai.azure.com/openai/v1',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    },
++    {
++      apiHost: 'https://example.openai.azure.com/openai/v1/',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    },
++    {
++      apiHost: 'https://example.openai.azure.com',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    },
++    {
++      apiHost: 'https://example.openai.azure.com/',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    },
++    {
++      apiHost: 'https://example.openai.azure.com/OPENAI/V1',
++      expectedEndpoint: 'https://example.openai.azure.com'
++    }
++  ])('strips trailing /openai from $apiHost', ({ apiHost, expectedEndpoint }) => {
++    expect(normalizeAzureOpenAIEndpoint(apiHost)).toBe(expectedEndpoint)
++  })
++})
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index cfc9087..73a5bed 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -10,7 +10,7 @@ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+ import {
+   findTokenLimit,
+   GEMINI_FLASH_MODEL_REGEX,
+-  getThinkModelType,
++  getModelSupportedReasoningEffortOptions,
+   isDeepSeekHybridInferenceModel,
+   isDoubaoThinkingAutoModel,
+   isGPT5SeriesModel,
+@@ -33,7 +33,6 @@ import {
+   isSupportedThinkingTokenQwenModel,
+   isSupportedThinkingTokenZhipuModel,
+   isVisionModel,
+-  MODEL_SUPPORTED_REASONING_EFFORT,
+   ZHIPU_RESULT_TOKENS
+ } from '@renderer/config/models'
+ import { mapLanguageToQwenMTModel } from '@renderer/config/translate'
+@@ -143,6 +142,10 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+       return { thinking: { type: reasoningEffort ? 'enabled' : 'disabled' } }
+     }
+ 
++    if (reasoningEffort === 'default') {
++      return {}
++    }
++
+     if (!reasoningEffort) {
+       // DeepSeek hybrid inference models, v3.1 and maybe more in the future
+       // 不同的 provider 有不同的思考控制方式，在这里统一解决
+@@ -304,16 +307,15 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+     // Grok models/Perplexity models/OpenAI models
+     if (isSupportedReasoningEffortModel(model)) {
+       // 检查模型是否支持所选选项
+-      const modelType = getThinkModelType(model)
+-      const supportedOptions = MODEL_SUPPORTED_REASONING_EFFORT[modelType]
+-      if (supportedOptions.includes(reasoningEffort)) {
++      const supportedOptions = getModelSupportedReasoningEffortOptions(model)?.filter((option) => option !== 'default')
++      if (supportedOptions?.includes(reasoningEffort)) {
+         return {
+           reasoning_effort: reasoningEffort
+         }
+       } else {
+         // 如果不支持，fallback到第一个支持的值
+         return {
+-          reasoning_effort: supportedOptions[0]
++          reasoning_effort: supportedOptions?.[0]
+         }
+       }
+     }
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index 937827d..efc3f4f 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -29,6 +29,7 @@ import { withoutTrailingSlash } from '@renderer/utils/api'
+ import { isOllamaProvider } from '@renderer/utils/provider'
+ 
+ import { BaseApiClient } from '../BaseApiClient'
++import { normalizeAzureOpenAIEndpoint } from './azureOpenAIEndpoint'
+ 
+ const logger = loggerService.withContext('OpenAIBaseClient')
+ 
+@@ -69,7 +70,7 @@ export abstract class OpenAIBaseClient<
+     const sdk = await this.getSdkInstance()
+     const response = (await sdk.request({
+       method: 'post',
+-      path: '/images/generations',
++      path: '/v1/images/generations',
+       signal,
+       body: {
+         model,
+@@ -213,7 +214,7 @@ export abstract class OpenAIBaseClient<
+         dangerouslyAllowBrowser: true,
+         apiKey: apiKeyForSdkInstance,
+         apiVersion: this.provider.apiVersion,
+-        endpoint: this.provider.apiHost
++        endpoint: normalizeAzureOpenAIEndpoint(this.provider.apiHost)
+       }) as TSdkInstance
+     } else {
+       this.sdkInstance = new OpenAI({
+diff --git a/src/aiCore/legacy/clients/openai/azureOpenAIEndpoint.ts b/src/aiCore/legacy/clients/openai/azureOpenAIEndpoint.ts
+new file mode 100644
+index 0000000..777dbe7
+--- /dev/null
++++ b/src/aiCore/legacy/clients/openai/azureOpenAIEndpoint.ts
+@@ -0,0 +1,4 @@
++export function normalizeAzureOpenAIEndpoint(apiHost: string): string {
++  const normalizedHost = apiHost.replace(/\/+$/, '')
++  return normalizedHost.replace(/\/openai(?:\/v1)?$/i, '')
++}
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+index 10a4d59..b2a796b 100644
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+@@ -7,7 +7,6 @@ import type { Chunk } from '@renderer/types/chunk'
+ import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import type { LanguageModelMiddleware } from 'ai'
+ import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+-import { isEmpty } from 'lodash'
+ 
+ import { getAiSdkProviderId } from '../provider/factory'
+ import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
+@@ -16,7 +15,6 @@ import { openrouterGenerateImageMiddleware } from './openrouterGenerateImageMidd
+ import { openrouterReasoningMiddleware } from './openrouterReasoningMiddleware'
+ import { qwenThinkingMiddleware } from './qwenThinkingMiddleware'
+ import { skipGeminiThoughtSignatureMiddleware } from './skipGeminiThoughtSignatureMiddleware'
+-import { toolChoiceMiddleware } from './toolChoiceMiddleware'
+ 
+ const logger = loggerService.withContext('AiSdkMiddlewareBuilder')
+ 
+@@ -136,15 +134,6 @@ export class AiSdkMiddlewareBuilder {
+ export function buildAiSdkMiddlewares(config: AiSdkMiddlewareConfig): LanguageModelMiddleware[] {
+   const builder = new AiSdkMiddlewareBuilder()
+ 
+-  // 0. 知识库强制调用中间件（必须在最前面，确保第一轮强制调用知识库）
+-  if (!isEmpty(config.assistant?.knowledge_bases?.map((base) => base.id)) && config.knowledgeRecognition !== 'on') {
+-    builder.add({
+-      name: 'force-knowledge-first',
+-      middleware: toolChoiceMiddleware('builtin_knowledge_search')
+-    })
+-    logger.debug('Added toolChoice middleware to force knowledge base search on first round')
+-  }
+-
+   // 1. 根据provider添加特定中间件
+   if (config.provider) {
+     addProviderSpecificMiddlewares(builder, config)
+diff --git a/src/aiCore/plugins/searchOrchestrationPlugin.ts b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+index 6be577f..5b095a4 100644
+--- a/src/aiCore/plugins/searchOrchestrationPlugin.ts
++++ b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+@@ -31,7 +31,7 @@ import { webSearchToolWithPreExtractedKeywords } from '../tools/WebSearchTool'
+ 
+ const logger = loggerService.withContext('SearchOrchestrationPlugin')
+ 
+-const getMessageContent = (message: ModelMessage) => {
++export const getMessageContent = (message: ModelMessage) => {
+   if (typeof message.content === 'string') return message.content
+   return message.content.reduce((acc, part) => {
+     if (part.type === 'text') {
+@@ -266,14 +266,14 @@ export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string)
+         // 判断是否需要各种搜索
+         const knowledgeBaseIds = assistant.knowledge_bases?.map((base) => base.id)
+         const hasKnowledgeBase = !isEmpty(knowledgeBaseIds)
+-        const knowledgeRecognition = assistant.knowledgeRecognition || 'on'
++        const knowledgeRecognition = assistant.knowledgeRecognition || 'off'
+         const globalMemoryEnabled = selectGlobalMemoryEnabled(store.getState())
+         const shouldWebSearch = !!assistant.webSearchProviderId
+         const shouldKnowledgeSearch = hasKnowledgeBase && knowledgeRecognition === 'on'
+         const shouldMemorySearch = globalMemoryEnabled && assistant.enableMemory
+ 
+         // 执行意图分析
+-        if (shouldWebSearch || hasKnowledgeBase) {
++        if (shouldWebSearch || shouldKnowledgeSearch) {
+           const analysisResult = await analyzeSearchIntent(lastUserMessage, assistant, {
+             shouldWebSearch,
+             shouldKnowledgeSearch,
+@@ -330,41 +330,25 @@ export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string)
+         // 📚 知识库搜索工具配置
+         const knowledgeBaseIds = assistant.knowledge_bases?.map((base) => base.id)
+         const hasKnowledgeBase = !isEmpty(knowledgeBaseIds)
+-        const knowledgeRecognition = assistant.knowledgeRecognition || 'on'
++        const knowledgeRecognition = assistant.knowledgeRecognition || 'off'
++        const shouldKnowledgeSearch = hasKnowledgeBase && knowledgeRecognition === 'on'
++
++        if (shouldKnowledgeSearch) {
++          // on 模式：根据意图识别结果决定是否添加工具
++          const needsKnowledgeSearch =
++            analysisResult?.knowledge &&
++            analysisResult.knowledge.question &&
++            analysisResult.knowledge.question[0] !== 'not_needed'
+ 
+-        if (hasKnowledgeBase) {
+-          if (knowledgeRecognition === 'off') {
+-            // off 模式：直接添加知识库搜索工具，使用用户消息作为搜索关键词
++          if (needsKnowledgeSearch && analysisResult.knowledge) {
++            // logger.info('📚 Adding knowledge search tool (intent-based)')
+             const userMessage = userMessages[context.requestId]
+-            const fallbackKeywords = {
+-              question: [getMessageContent(userMessage) || 'search'],
+-              rewrite: getMessageContent(userMessage) || 'search'
+-            }
+-            // logger.info('📚 Adding knowledge search tool (force mode)')
+             params.tools['builtin_knowledge_search'] = knowledgeSearchTool(
+               assistant,
+-              fallbackKeywords,
++              analysisResult.knowledge,
+               getMessageContent(userMessage),
+               topicId
+             )
+-            // params.toolChoice = { type: 'tool', toolName: 'builtin_knowledge_search' }
+-          } else {
+-            // on 模式：根据意图识别结果决定是否添加工具
+-            const needsKnowledgeSearch =
+-              analysisResult?.knowledge &&
+-              analysisResult.knowledge.question &&
+-              analysisResult.knowledge.question[0] !== 'not_needed'
+-
+-            if (needsKnowledgeSearch && analysisResult.knowledge) {
+-              // logger.info('📚 Adding knowledge search tool (intent-based)')
+-              const userMessage = userMessages[context.requestId]
+-              params.tools['builtin_knowledge_search'] = knowledgeSearchTool(
+-                assistant,
+-                analysisResult.knowledge,
+-                getMessageContent(userMessage),
+-                topicId
+-              )
+-            }
+           }
+         }
+ 
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index cb0c5cf..2a69f3b 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -109,6 +109,20 @@ const createImageBlock = (
+   ...overrides
+ })
+ 
++const createThinkingBlock = (
++  messageId: string,
++  overrides: Partial<Omit<ThinkingMessageBlock, 'type' | 'messageId'>> = {}
++): ThinkingMessageBlock => ({
++  id: overrides.id ?? `thinking-block-${++blockCounter}`,
++  messageId,
++  type: MessageBlockType.THINKING,
++  createdAt: overrides.createdAt ?? new Date(2024, 0, 1, 0, 0, blockCounter).toISOString(),
++  status: overrides.status ?? MessageBlockStatus.SUCCESS,
++  content: overrides.content ?? 'Let me think...',
++  thinking_millsec: overrides.thinking_millsec ?? 1000,
++  ...overrides
++})
++
+ describe('messageConverter', () => {
+   beforeEach(() => {
+     convertFileBlockToFilePartMock.mockReset()
+@@ -229,6 +243,23 @@ describe('messageConverter', () => {
+         }
+       ])
+     })
++
++    it('includes reasoning parts for assistant messages with thinking blocks', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = 'Here is my answer'
++      message.__mockThinkingBlocks = [createThinkingBlock(message.id, { content: 'Let me think...' })]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [
++          { type: 'text', text: 'Here is my answer' },
++          { type: 'reasoning', text: 'Let me think...' }
++        ]
++      })
++    })
+   })
+ 
+   describe('convertMessagesToSdkMessages', () => {
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index 70b4ac8..a4f345e 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -18,7 +18,7 @@ vi.mock('@renderer/services/AssistantService', () => ({
+     toolUseMode: assistant.settings?.toolUseMode ?? 'prompt',
+     defaultModel: assistant.defaultModel,
+     customParameters: assistant.settings?.customParameters ?? [],
+-    reasoning_effort: assistant.settings?.reasoning_effort,
++    reasoning_effort: assistant.settings?.reasoning_effort ?? 'default',
+     reasoning_effort_cache: assistant.settings?.reasoning_effort_cache,
+     qwenThinkMode: assistant.settings?.qwenThinkMode
+   })
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index 328a10b..c3798c1 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -3,6 +3,7 @@
+  * 将 Cherry Studio 消息格式转换为 AI SDK 消息格式
+  */
+ 
++import type { ReasoningPart } from '@ai-sdk/provider-utils'
+ import { loggerService } from '@logger'
+ import { isImageEnhancementModel, isVisionModel } from '@renderer/config/models'
+ import type { Message, Model } from '@renderer/types'
+@@ -163,13 +164,13 @@ async function convertMessageToAssistantModelMessage(
+   thinkingBlocks: ThinkingMessageBlock[],
+   model?: Model
+ ): Promise<AssistantModelMessage> {
+-  const parts: Array<TextPart | FilePart> = []
++  const parts: Array<TextPart | ReasoningPart | FilePart> = []
+   if (content) {
+     parts.push({ type: 'text', text: content })
+   }
+ 
+   for (const thinkingBlock of thinkingBlocks) {
+-    parts.push({ type: 'text', text: thinkingBlock.content })
++    parts.push({ type: 'reasoning', text: thinkingBlock.content })
+   }
+ 
+   for (const fileBlock of fileBlocks) {
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index cba7fcd..52234c5 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -21,6 +21,7 @@ import {
+   isGrokModel,
+   isOpenAIModel,
+   isOpenRouterBuiltInWebSearchModel,
++  isPureGenerateImageModel,
+   isSupportedReasoningEffortModel,
+   isSupportedThinkingTokenModel,
+   isWebSearchModel
+@@ -33,7 +34,7 @@ import { type Assistant, type MCPTool, type Provider, SystemProviderIds } from '
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
+-import { isAIGatewayProvider, isAwsBedrockProvider } from '@renderer/utils/provider'
++import { isAIGatewayProvider, isAwsBedrockProvider, isSupportUrlContextProvider } from '@renderer/utils/provider'
+ import type { ModelMessage, Tool } from 'ai'
+ import { stepCountIs } from 'ai'
+ 
+@@ -118,7 +119,13 @@ export async function buildStreamTextParams(
+       isOpenRouterBuiltInWebSearchModel(model) ||
+       model.id.includes('sonar'))
+ 
+-  const enableUrlContext = assistant.enableUrlContext || false
++  // Validate provider and model support to prevent stale state from triggering urlContext
++  const enableUrlContext = !!(
++    assistant.enableUrlContext &&
++    isSupportUrlContextProvider(provider) &&
++    !isPureGenerateImageModel(model) &&
++    (isGeminiModel(model) || isAnthropicModel(model))
++  )
+ 
+   const enableGenerateImage = !!(isGenerateImageModel(model) && assistant.enableGenerateImage)
+ 
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index 20aa78d..b1d8e34 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -79,7 +79,7 @@ vi.mock('@renderer/services/AssistantService', () => ({
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+ import type { Model, Provider } from '@renderer/types'
+ import { formatApiHost } from '@renderer/utils/api'
+-import { isCherryAIProvider, isPerplexityProvider } from '@renderer/utils/provider'
++import { isAzureOpenAIProvider, isCherryAIProvider, isPerplexityProvider } from '@renderer/utils/provider'
+ 
+ import { COPILOT_DEFAULT_HEADERS, COPILOT_EDITOR_VERSION, isCopilotResponsesModel } from '../constants'
+ import { getActualProvider, providerToAiSdkConfig } from '../providerConfig'
+@@ -133,6 +133,17 @@ const createPerplexityProvider = (): Provider => ({
+   isSystem: false
+ })
+ 
++const createAzureProvider = (apiVersion: string): Provider => ({
++  id: 'azure-openai',
++  type: 'azure-openai',
++  name: 'Azure OpenAI',
++  apiKey: 'test-key',
++  apiHost: 'https://example.openai.azure.com/openai',
++  apiVersion,
++  models: [],
++  isSystem: true
++})
++
+ describe('Copilot responses routing', () => {
+   beforeEach(() => {
+     ;(globalThis as any).window = {
+@@ -504,3 +515,46 @@ describe('Stream options includeUsage configuration', () => {
+     expect(config.providerId).toBe('github-copilot-openai-compatible')
+   })
+ })
++
++describe('Azure OpenAI traditional API routing', () => {
++  beforeEach(() => {
++    ;(globalThis as any).window = {
++      ...(globalThis as any).window,
++      keyv: createWindowKeyv()
++    }
++    mockGetState.mockReturnValue({
++      settings: {
++        openAI: {
++          streamOptions: {
++            includeUsage: undefined
++          }
++        }
++      }
++    })
++
++    vi.mocked(isAzureOpenAIProvider).mockImplementation((provider) => provider.type === 'azure-openai')
++  })
++
++  it('uses deployment-based URLs when apiVersion is a date version', () => {
++    const provider = createAzureProvider('2024-02-15-preview')
++    const config = providerToAiSdkConfig(provider, createModel('gpt-4o', 'GPT-4o', provider.id))
++
++    expect(config.providerId).toBe('azure')
++    expect(config.options.apiVersion).toBe('2024-02-15-preview')
++    expect(config.options.useDeploymentBasedUrls).toBe(true)
++  })
++
++  it('does not force deployment-based URLs for apiVersion v1/preview', () => {
++    const v1Provider = createAzureProvider('v1')
++    const v1Config = providerToAiSdkConfig(v1Provider, createModel('gpt-4o', 'GPT-4o', v1Provider.id))
++    expect(v1Config.providerId).toBe('azure-responses')
++    expect(v1Config.options.apiVersion).toBe('v1')
++    expect(v1Config.options.useDeploymentBasedUrls).toBeUndefined()
++
++    const previewProvider = createAzureProvider('preview')
++    const previewConfig = providerToAiSdkConfig(previewProvider, createModel('gpt-4o', 'GPT-4o', previewProvider.id))
++    expect(previewConfig.providerId).toBe('azure-responses')
++    expect(previewConfig.options.apiVersion).toBe('preview')
++    expect(previewConfig.options.useDeploymentBasedUrls).toBeUndefined()
++  })
++})
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 1c410bf..0ad15ea 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -32,6 +32,7 @@ import {
+   isSupportStreamOptionsProvider,
+   isVertexProvider
+ } from '@renderer/utils/provider'
++import { defaultAppHeaders } from '@shared/utils'
+ import { cloneDeep, isEmpty } from 'lodash'
+ 
+ import type { AiSdkConfig } from '../types'
+@@ -197,18 +198,13 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     extraOptions.mode = 'chat'
+   }
+ 
+-  // 添加额外headers
+-  if (actualProvider.extra_headers) {
+-    extraOptions.headers = actualProvider.extra_headers
+-    // copy from openaiBaseClient/openaiResponseApiClient
+-    if (aiSdkProviderId === 'openai') {
+-      extraOptions.headers = {
+-        ...extraOptions.headers,
+-        'HTTP-Referer': 'https://cherry-ai.com',
+-        'X-Title': 'Cherry Studio',
+-        'X-Api-Key': baseConfig.apiKey
+-      }
+-    }
++  extraOptions.headers = {
++    ...defaultAppHeaders(),
++    ...actualProvider.extra_headers
++  }
++
++  if (aiSdkProviderId === 'openai') {
++    extraOptions.headers['X-Api-Key'] = baseConfig.apiKey
+   }
+   // azure
+   // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
+@@ -218,6 +214,15 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+   } else if (aiSdkProviderId === 'azure') {
+     extraOptions.mode = 'chat'
+   }
++  if (isAzureOpenAIProvider(actualProvider)) {
++    const apiVersion = actualProvider.apiVersion?.trim()
++    if (apiVersion) {
++      extraOptions.apiVersion = apiVersion
++      if (!['preview', 'v1'].includes(apiVersion)) {
++        extraOptions.useDeploymentBasedUrls = true
++      }
++    }
++  }
+ 
+   // bedrock
+   if (aiSdkProviderId === 'bedrock') {
+diff --git a/src/aiCore/tools/MemorySearchTool.ts b/src/aiCore/tools/MemorySearchTool.ts
+index 20064dd..5028f2e 100644
+--- a/src/aiCore/tools/MemorySearchTool.ts
++++ b/src/aiCore/tools/MemorySearchTool.ts
+@@ -24,7 +24,8 @@ export const memorySearchTool = () => {
+       }
+ 
+       const memoryConfig = selectMemoryConfig(store.getState())
+-      if (!memoryConfig.llmApiClient || !memoryConfig.embedderApiClient) {
++
++      if (!memoryConfig.llmModel || !memoryConfig.embeddingModel) {
+         return []
+       }
+ 
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 9eeeac7..a6c9a6c 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -464,7 +464,8 @@ describe('options utils', () => {
+             custom_param: 'custom_value',
+             another_param: 123,
+             serviceTier: undefined,
+-            textVerbosity: undefined
++            textVerbosity: undefined,
++            store: false
+           }
+         })
+       })
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index fec4d19..df7d69d 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -11,6 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import {
+   getAnthropicReasoningParams,
++  getAnthropicThinkingBudget,
+   getBedrockReasoningParams,
+   getCustomParameters,
+   getGeminiReasoningParams,
+@@ -89,7 +90,8 @@ vi.mock('@renderer/config/models', async (importOriginal) => {
+     isQwenAlwaysThinkModel: vi.fn(() => false),
+     isSupportedThinkingTokenHunyuanModel: vi.fn(() => false),
+     isSupportedThinkingTokenModel: vi.fn(() => false),
+-    isGPT51SeriesModel: vi.fn(() => false)
++    isGPT51SeriesModel: vi.fn(() => false),
++    findTokenLimit: vi.fn(actual.findTokenLimit)
+   }
+ })
+ 
+@@ -596,7 +598,7 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({})
+     })
+ 
+-    it('should return disabled thinking when no reasoning effort', async () => {
++    it('should return disabled thinking when reasoning effort is none', async () => {
+       const { isReasoningModel, isSupportedThinkingTokenClaudeModel } = await import('@renderer/config/models')
+ 
+       vi.mocked(isReasoningModel).mockReturnValue(true)
+@@ -611,7 +613,9 @@ describe('reasoning utils', () => {
+       const assistant: Assistant = {
+         id: 'test',
+         name: 'Test',
+-        settings: {}
++        settings: {
++          reasoning_effort: 'none'
++        }
+       } as Assistant
+ 
+       const result = getAnthropicReasoningParams(assistant, model)
+@@ -647,7 +651,7 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({
+         thinking: {
+           type: 'enabled',
+-          budgetTokens: 2048
++          budgetTokens: 4096
+         }
+       })
+     })
+@@ -675,7 +679,7 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({})
+     })
+ 
+-    it('should disable thinking for Flash models without reasoning effort', async () => {
++    it('should disable thinking for Flash models when reasoning effort is none', async () => {
+       const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
+ 
+       vi.mocked(isReasoningModel).mockReturnValue(true)
+@@ -690,7 +694,9 @@ describe('reasoning utils', () => {
+       const assistant: Assistant = {
+         id: 'test',
+         name: 'Test',
+-        settings: {}
++        settings: {
++          reasoning_effort: 'none'
++        }
+       } as Assistant
+ 
+       const result = getGeminiReasoningParams(assistant, model)
+@@ -725,7 +731,7 @@ describe('reasoning utils', () => {
+       const result = getGeminiReasoningParams(assistant, model)
+       expect(result).toEqual({
+         thinkingConfig: {
+-          thinkingBudget: 16448,
++          thinkingBudget: expect.any(Number),
+           includeThoughts: true
+         }
+       })
+@@ -889,7 +895,7 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({
+         reasoningConfig: {
+           type: 'enabled',
+-          budgetTokens: 2048
++          budgetTokens: 4096
+         }
+       })
+     })
+@@ -990,4 +996,89 @@ describe('reasoning utils', () => {
+       })
+     })
+   })
++
++  describe('getAnthropicThinkingBudget', () => {
++    it('should return undefined when reasoningEffort is undefined', async () => {
++      const result = getAnthropicThinkingBudget(4096, undefined, 'claude-3-7-sonnet')
++      expect(result).toBeUndefined()
++    })
++
++    it('should return undefined when reasoningEffort is none', async () => {
++      const result = getAnthropicThinkingBudget(4096, 'none', 'claude-3-7-sonnet')
++      expect(result).toBeUndefined()
++    })
++
++    it('should return undefined when tokenLimit is not found', async () => {
++      const { findTokenLimit } = await import('@renderer/config/models')
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const result = getAnthropicThinkingBudget(4096, 'medium', 'unknown-model')
++      expect(result).toBeUndefined()
++    })
++
++    it('should calculate budget correctly when maxTokens is provided', async () => {
++      const { findTokenLimit } = await import('@renderer/config/models')
++      vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
++
++      const result = getAnthropicThinkingBudget(4096, 'medium', 'claude-3-7-sonnet')
++      // EFFORT_RATIO['medium'] = 0.5
++      // budget = Math.floor((32768 - 1024) * 0.5 + 1024)
++      // = Math.floor(31744 * 0.5 + 1024) = Math.floor(15872 + 1024) = 16896
++      // budgetTokens = Math.min(16896, 4096) = 4096
++      // result = Math.max(1024, 4096) = 4096
++      expect(result).toBe(4096)
++    })
++
++    it('should use tokenLimit.max when maxTokens is undefined', async () => {
++      const { findTokenLimit } = await import('@renderer/config/models')
++      vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
++
++      const result = getAnthropicThinkingBudget(undefined, 'medium', 'claude-3-7-sonnet')
++      // When maxTokens is undefined, budget is not constrained by maxTokens
++      // EFFORT_RATIO['medium'] = 0.5
++      // budget = Math.floor((32768 - 1024) * 0.5 + 1024)
++      // = Math.floor(31744 * 0.5 + 1024) = Math.floor(15872 + 1024) = 16896
++      // result = Math.max(1024, 16896) = 16896
++      expect(result).toBe(16896)
++    })
++
++    it('should enforce minimum budget of 1024', async () => {
++      const { findTokenLimit } = await import('@renderer/config/models')
++      vi.mocked(findTokenLimit).mockReturnValue({ min: 100, max: 1000 })
++
++      const result = getAnthropicThinkingBudget(500, 'low', 'claude-3-7-sonnet')
++      // EFFORT_RATIO['low'] = 0.05
++      // budget = Math.floor((1000 - 100) * 0.05 + 100)
++      // = Math.floor(900 * 0.05 + 100) = Math.floor(45 + 100) = 145
++      // budgetTokens = Math.min(145, 500) = 145
++      // result = Math.max(1024, 145) = 1024
++      expect(result).toBe(1024)
++    })
++
++    it('should respect effort ratio for high reasoning effort', async () => {
++      const { findTokenLimit } = await import('@renderer/config/models')
++      vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
++
++      const result = getAnthropicThinkingBudget(8192, 'high', 'claude-3-7-sonnet')
++      // EFFORT_RATIO['high'] = 0.8
++      // budget = Math.floor((32768 - 1024) * 0.8 + 1024)
++      // = Math.floor(31744 * 0.8 + 1024) = Math.floor(25395.2 + 1024) = 26419
++      // budgetTokens = Math.min(26419, 8192) = 8192
++      // result = Math.max(1024, 8192) = 8192
++      expect(result).toBe(8192)
++    })
++
++    it('should use full token limit when maxTokens is undefined and reasoning effort is high', async () => {
++      const { findTokenLimit } = await import('@renderer/config/models')
++      vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
++
++      const result = getAnthropicThinkingBudget(undefined, 'high', 'claude-3-7-sonnet')
++      // When maxTokens is undefined, budget is not constrained by maxTokens
++      // EFFORT_RATIO['high'] = 0.8
++      // budget = Math.floor((32768 - 1024) * 0.8 + 1024)
++      // = Math.floor(31744 * 0.8 + 1024) = Math.floor(25395.2 + 1024) = 26419
++      // result = Math.max(1024, 26419) = 26419
++      expect(result).toBe(26419)
++    })
++  })
+ })
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index fd9bc59..4d8d407 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -396,10 +396,12 @@ function buildOpenAIProviderOptions(
+     }
+   }
+ 
++  // TODO: 支持配置是否在服务端持久化
+   providerOptions = {
+     ...providerOptions,
+     serviceTier,
+-    textVerbosity
++    textVerbosity,
++    store: false
+   }
+ 
+   return {
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 996d676..a7d6028 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -8,8 +8,9 @@ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+ import {
+   findTokenLimit,
+   GEMINI_FLASH_MODEL_REGEX,
+-  getThinkModelType,
++  getModelSupportedReasoningEffortOptions,
+   isDeepSeekHybridInferenceModel,
++  isDoubaoSeed18Model,
+   isDoubaoSeedAfter251015,
+   isDoubaoThinkingAutoModel,
+   isGemini3ThinkingTokenModel,
+@@ -28,14 +29,14 @@ import {
+   isSupportedThinkingTokenDoubaoModel,
+   isSupportedThinkingTokenGeminiModel,
+   isSupportedThinkingTokenHunyuanModel,
++  isSupportedThinkingTokenMiMoModel,
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+-  isSupportedThinkingTokenZhipuModel,
+-  MODEL_SUPPORTED_REASONING_EFFORT
++  isSupportedThinkingTokenZhipuModel
+ } from '@renderer/config/models'
+ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
+-import type { Assistant, Model } from '@renderer/types'
++import type { Assistant, Model, ReasoningEffortOption } from '@renderer/types'
+ import { EFFORT_RATIO, isSystemProvider, SystemProviderIds } from '@renderer/types'
+ import type { OpenAIReasoningSummary } from '@renderer/types/aiCoreTypes'
+ import type { ReasoningEffortOptionalParams } from '@renderer/types/sdk'
+@@ -65,7 +66,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   // reasoningEffort is not set, no extra reasoning setting
+   // Generally, for every model which supports reasoning control, the reasoning effort won't be undefined.
+   // It's for some reasoning models that don't support reasoning control, such as deepseek reasoner.
+-  if (!reasoningEffort) {
++  if (!reasoningEffort || reasoningEffort === 'default') {
+     return {}
+   }
+ 
+@@ -330,16 +331,15 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   // Grok models/Perplexity models/OpenAI models, use reasoning_effort
+   if (isSupportedReasoningEffortModel(model)) {
+     // 检查模型是否支持所选选项
+-    const modelType = getThinkModelType(model)
+-    const supportedOptions = MODEL_SUPPORTED_REASONING_EFFORT[modelType]
+-    if (supportedOptions.includes(reasoningEffort)) {
++    const supportedOptions = getModelSupportedReasoningEffortOptions(model)?.filter((option) => option !== 'default')
++    if (supportedOptions?.includes(reasoningEffort)) {
+       return {
+         reasoningEffort
+       }
+     } else {
+       // 如果不支持，fallback到第一个支持的值
+       return {
+-        reasoningEffort: supportedOptions[0]
++        reasoningEffort: supportedOptions?.[0]
+       }
+     }
+   }
+@@ -391,7 +391,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+ 
+   // Use thinking, doubao, zhipu, etc.
+   if (isSupportedThinkingTokenDoubaoModel(model)) {
+-    if (isDoubaoSeedAfter251015(model)) {
++    if (isDoubaoSeedAfter251015(model) || isDoubaoSeed18Model(model)) {
+       return { reasoningEffort }
+     }
+     if (reasoningEffort === 'high') {
+@@ -410,6 +410,12 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     return { thinking: { type: 'enabled' } }
+   }
+ 
++  if (isSupportedThinkingTokenMiMoModel(model)) {
++    return {
++      thinking: { type: 'enabled' }
++    }
++  }
++
+   // Default case: no special thinking settings
+   return {}
+ }
+@@ -429,7 +435,7 @@ export function getOpenAIReasoningParams(
+ 
+   let reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  if (!reasoningEffort) {
++  if (!reasoningEffort || reasoningEffort === 'default') {
+     return {}
+   }
+ 
+@@ -481,16 +487,14 @@ export function getAnthropicThinkingBudget(
+     return undefined
+   }
+ 
+-  const budgetTokens = Math.max(
+-    1024,
+-    Math.floor(
+-      Math.min(
+-        (tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min,
+-        (maxTokens || DEFAULT_MAX_TOKENS) * effortRatio
+-      )
+-    )
+-  )
+-  return budgetTokens
++  const budget = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
++
++  let budgetTokens = budget
++  if (maxTokens !== undefined) {
++    budgetTokens = Math.min(budget, maxTokens)
++  }
++
++  return Math.max(1024, budgetTokens)
+ }
+ 
+ /**
+@@ -507,7 +511,11 @@ export function getAnthropicReasoningParams(
+ 
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  if (reasoningEffort === undefined || reasoningEffort === 'none') {
++  if (!reasoningEffort || reasoningEffort === 'default') {
++    return {}
++  }
++
++  if (reasoningEffort === 'none') {
+     return {
+       thinking: {
+         type: 'disabled'
+@@ -531,20 +539,25 @@ export function getAnthropicReasoningParams(
+   return {}
+ }
+ 
+-// type GoogleThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinkingConfig']>['thinkingLevel']
+-
+-// function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): GoogelThinkingLevel {
+-//   switch (reasoningEffort) {
+-//     case 'low':
+-//       return 'low'
+-//     case 'medium':
+-//       return 'medium'
+-//     case 'high':
+-//       return 'high'
+-//     default:
+-//       return 'medium'
+-//   }
+-// }
++type GoogleThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinkingConfig']>['thinkingLevel']
++
++function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): GoogleThinkingLevel {
++  switch (reasoningEffort) {
++    case 'default':
++      return undefined
++    case 'minimal':
++      return 'minimal'
++    case 'low':
++      return 'low'
++    case 'medium':
++      return 'medium'
++    case 'high':
++      return 'high'
++    default:
++      logger.warn('Unknown thinking level for Gemini. Fallback to medium instead.', { reasoningEffort })
++      return 'medium'
++  }
++}
+ 
+ /**
+  * 获取 Gemini 推理参数
+@@ -562,6 +575,10 @@ export function getGeminiReasoningParams(
+ 
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
++  if (!reasoningEffort || reasoningEffort === 'default') {
++    return {}
++  }
++
+   // Gemini 推理参数
+   if (isSupportedThinkingTokenGeminiModel(model)) {
+     if (reasoningEffort === undefined || reasoningEffort === 'none') {
+@@ -573,15 +590,15 @@ export function getGeminiReasoningParams(
+       }
+     }
+ 
+-    // TODO: 很多中转还不支持
+     // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
+-    // if (isGemini3ThinkingTokenModel(model)) {
+-    //   return {
+-    //     thinkingConfig: {
+-    //       thinkingLevel: mapToGeminiThinkingLevel(reasoningEffort)
+-    //     }
+-    //   }
+-    // }
++    if (isGemini3ThinkingTokenModel(model)) {
++      return {
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: mapToGeminiThinkingLevel(reasoningEffort)
++        }
++      }
++    }
+ 
+     const effortRatio = EFFORT_RATIO[reasoningEffort]
+ 
+@@ -622,10 +639,6 @@ export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<
+ 
+   const { reasoning_effort: reasoningEffort } = getAssistantSettings(assistant)
+ 
+-  if (!reasoningEffort || reasoningEffort === 'none') {
+-    return {}
+-  }
+-
+   switch (reasoningEffort) {
+     case 'auto':
+     case 'minimal':
+@@ -636,6 +649,10 @@ export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<
+       return { reasoningEffort }
+     case 'xhigh':
+       return { reasoningEffort: 'high' }
++    case 'default':
++    case 'none':
++    default:
++      return {}
+   }
+ }
+ 
+@@ -652,7 +669,7 @@ export function getBedrockReasoningParams(
+ 
+   const reasoningEffort = assistant?.settings?.reasoning_effort
+ 
+-  if (reasoningEffort === undefined) {
++  if (reasoningEffort === undefined || reasoningEffort === 'default') {
+     return {}
+   }
+ 
