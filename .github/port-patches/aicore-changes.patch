@@ -1,0 +1,206 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 5de2ac3..5d418de 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -120,6 +120,21 @@ export class AiSdkToChunkAdapter {
+     }
+   }
+ 
++  /**
++   * 如果有累积的思考内容，发送 THINKING_COMPLETE chunk 并清空
++   * @param final 包含 reasoningContent 的状态对象
++   * @returns 是否发送了 THINKING_COMPLETE chunk
++   */
++  private emitThinkingCompleteIfNeeded(final: { reasoningContent: string; [key: string]: any }) {
++    if (final.reasoningContent) {
++      this.onChunk({
++        type: ChunkType.THINKING_COMPLETE,
++        text: final.reasoningContent
++      })
++      final.reasoningContent = ''
++    }
++  }
++
+   /**
+    * 转换 AI SDK chunk 为 Cherry Studio chunk 并调用回调
+    * @param chunk AI SDK 的 chunk 数据
+@@ -145,6 +160,9 @@ export class AiSdkToChunkAdapter {
+       }
+       // === 文本相关事件 ===
+       case 'text-start':
++        // 如果有未完成的思考内容，先生成 THINKING_COMPLETE
++        // 这处理了某些提供商不发送 reasoning-end 事件的情况
++        this.emitThinkingCompleteIfNeeded(final)
+         this.onChunk({
+           type: ChunkType.TEXT_START
+         })
+@@ -215,11 +233,7 @@ export class AiSdkToChunkAdapter {
+         })
+         break
+       case 'reasoning-end':
+-        this.onChunk({
+-          type: ChunkType.THINKING_COMPLETE,
+-          text: final.reasoningContent || ''
+-        })
+-        final.reasoningContent = ''
++        this.emitThinkingCompleteIfNeeded(final)
+         break
+ 
+       // === 工具调用相关事件（原始 AI SDK 事件，如果没有被中间件处理） ===
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index ac10106..d7f1432 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -46,7 +46,6 @@ import type {
+   GeminiSdkRawOutput,
+   GeminiSdkToolCall
+ } from '@renderer/types/sdk'
+-import { getTrailingApiVersion, withoutTrailingApiVersion } from '@renderer/utils'
+ import { isToolUseModeFunction } from '@renderer/utils/assistant'
+ import {
+   geminiFunctionCallToMcpTool,
+@@ -56,6 +55,7 @@ import {
+ } from '@renderer/utils/mcp-tools'
+ import { findFileBlocks, findImageBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+ import { defaultTimeout, MB } from '@shared/config/constant'
++import { getTrailingApiVersion, withoutTrailingApiVersion } from '@shared/utils'
+ import { t } from 'i18next'
+ 
+ import type { GenericChunk } from '../../middleware/schemas'
+diff --git a/src/aiCore/legacy/clients/ovms/OVMSClient.ts b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+index 02ac6de..4936b69 100644
+--- a/src/aiCore/legacy/clients/ovms/OVMSClient.ts
++++ b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+@@ -3,7 +3,8 @@ import { loggerService } from '@logger'
+ import { isSupportedModel } from '@renderer/config/models'
+ import type { Provider } from '@renderer/types'
+ import { objectKeys } from '@renderer/types'
+-import { formatApiHost, withoutTrailingApiVersion } from '@renderer/utils'
++import { formatApiHost } from '@renderer/utils'
++import { withoutTrailingApiVersion } from '@shared/utils'
+ 
+ import { OpenAIAPIClient } from '../openai/OpenAIApiClient'
+ 
+diff --git a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+index ea6c141..9c59099 100644
+--- a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
++++ b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+@@ -66,6 +66,11 @@ export class ZhipuAPIClient extends OpenAIAPIClient {
+ 
+   public async listModels(): Promise<OpenAI.Models.Model[]> {
+     const models = [
++      'glm-4.7',
++      'glm-4.6',
++      'glm-4.6v',
++      'glm-4.6v-flash',
++      'glm-4.6v-flashx',
+       'glm-4.5',
+       'glm-4.5-x',
+       'glm-4.5-air',
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index ff10005..d18aa02 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -31,7 +31,8 @@ const STATIC_PROVIDER_MAPPING: Record<string, ProviderId> = {
+   'azure-openai': 'azure', // Azure OpenAI -> azure
+   'openai-response': 'openai', // OpenAI Responses -> openai
+   grok: 'xai', // Grok -> xai
+-  copilot: 'github-copilot-openai-compatible'
++  copilot: 'github-copilot-openai-compatible',
++  tokenflux: 'openrouter' // TokenFlux -> openrouter (fully compatible)
+ }
+ 
+ /**
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 4d8d407..8dc7a10 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -10,6 +10,7 @@ import {
+   isAnthropicModel,
+   isGeminiModel,
+   isGrokModel,
++  isInterleavedThinkingModel,
+   isOpenAIModel,
+   isOpenAIOpenWeightModel,
+   isQwenMTModel,
+@@ -579,8 +580,10 @@ function buildOllamaProviderOptions(
+   const reasoningEffort = assistant.settings?.reasoning_effort
+   if (enableReasoning) {
+     if (isOpenAIOpenWeightModel(model)) {
+-      // @ts-ignore upstream type error
+-      providerOptions.think = reasoningEffort as any
++      // For gpt-oss models, Ollama accepts: 'low' | 'medium' | 'high'
++      if (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high') {
++        providerOptions.think = reasoningEffort
++      }
+     } else {
+       providerOptions.think = !['none', undefined].includes(reasoningEffort)
+     }
+@@ -603,7 +606,7 @@ function buildGenericProviderOptions(
+     enableGenerateImage: boolean
+   }
+ ): Record<string, any> {
+-  const { enableWebSearch } = capabilities
++  const { enableWebSearch, enableReasoning } = capabilities
+   let providerOptions: Record<string, any> = {}
+ 
+   const reasoningParams = getReasoningEffort(assistant, model)
+@@ -611,6 +614,14 @@ function buildGenericProviderOptions(
+     ...providerOptions,
+     ...reasoningParams
+   }
++  if (enableReasoning) {
++    if (isInterleavedThinkingModel(model)) {
++      providerOptions = {
++        ...providerOptions,
++        sendReasoning: true
++      }
++    }
++  }
+ 
+   if (enableWebSearch) {
+     const webSearchParams = getWebSearchParams(model)
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index a7d6028..ab8a0b7 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -14,7 +14,6 @@ import {
+   isDoubaoSeedAfter251015,
+   isDoubaoThinkingAutoModel,
+   isGemini3ThinkingTokenModel,
+-  isGPT51SeriesModel,
+   isGrok4FastReasoningModel,
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+@@ -32,7 +31,8 @@ import {
+   isSupportedThinkingTokenMiMoModel,
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+-  isSupportedThinkingTokenZhipuModel
++  isSupportedThinkingTokenZhipuModel,
++  isSupportNoneReasoningEffortModel
+ } from '@renderer/config/models'
+ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings, getProviderByModel } from '@renderer/services/AssistantService'
+@@ -74,9 +74,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   if (reasoningEffort === 'none') {
+     // openrouter: use reasoning
+     if (model.provider === SystemProviderIds.openrouter) {
+-      // 'none' is not an available value for effort for now.
+-      // I think they should resolve this issue soon, so I'll just go ahead and use this value.
+-      if (isGPT51SeriesModel(model) && reasoningEffort === 'none') {
++      if (isSupportNoneReasoningEffortModel(model) && reasoningEffort === 'none') {
+         return { reasoning: { effort: 'none' } }
+       }
+       return { reasoning: { enabled: false, exclude: true } }
+@@ -120,8 +118,8 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { thinking: { type: 'disabled' } }
+     }
+ 
+-    // Specially for GPT-5.1. Suppose this is a OpenAI Compatible provider
+-    if (isGPT51SeriesModel(model)) {
++    // GPT 5.1, GPT 5.2, or newer
++    if (isSupportNoneReasoningEffortModel(model)) {
+       return {
+         reasoningEffort: 'none'
+       }
