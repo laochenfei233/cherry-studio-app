@@ -1,0 +1,280 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 5de2ac3..5d418de 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -120,6 +120,21 @@ export class AiSdkToChunkAdapter {
+     }
+   }
+ 
++  /**
++   * 如果有累积的思考内容，发送 THINKING_COMPLETE chunk 并清空
++   * @param final 包含 reasoningContent 的状态对象
++   * @returns 是否发送了 THINKING_COMPLETE chunk
++   */
++  private emitThinkingCompleteIfNeeded(final: { reasoningContent: string; [key: string]: any }) {
++    if (final.reasoningContent) {
++      this.onChunk({
++        type: ChunkType.THINKING_COMPLETE,
++        text: final.reasoningContent
++      })
++      final.reasoningContent = ''
++    }
++  }
++
+   /**
+    * 转换 AI SDK chunk 为 Cherry Studio chunk 并调用回调
+    * @param chunk AI SDK 的 chunk 数据
+@@ -145,6 +160,9 @@ export class AiSdkToChunkAdapter {
+       }
+       // === 文本相关事件 ===
+       case 'text-start':
++        // 如果有未完成的思考内容，先生成 THINKING_COMPLETE
++        // 这处理了某些提供商不发送 reasoning-end 事件的情况
++        this.emitThinkingCompleteIfNeeded(final)
+         this.onChunk({
+           type: ChunkType.TEXT_START
+         })
+@@ -215,11 +233,7 @@ export class AiSdkToChunkAdapter {
+         })
+         break
+       case 'reasoning-end':
+-        this.onChunk({
+-          type: ChunkType.THINKING_COMPLETE,
+-          text: final.reasoningContent || ''
+-        })
+-        final.reasoningContent = ''
++        this.emitThinkingCompleteIfNeeded(final)
+         break
+ 
+       // === 工具调用相关事件（原始 AI SDK 事件，如果没有被中间件处理） ===
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index ac10106..d7f1432 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -46,7 +46,6 @@ import type {
+   GeminiSdkRawOutput,
+   GeminiSdkToolCall
+ } from '@renderer/types/sdk'
+-import { getTrailingApiVersion, withoutTrailingApiVersion } from '@renderer/utils'
+ import { isToolUseModeFunction } from '@renderer/utils/assistant'
+ import {
+   geminiFunctionCallToMcpTool,
+@@ -56,6 +55,7 @@ import {
+ } from '@renderer/utils/mcp-tools'
+ import { findFileBlocks, findImageBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+ import { defaultTimeout, MB } from '@shared/config/constant'
++import { getTrailingApiVersion, withoutTrailingApiVersion } from '@shared/utils'
+ import { t } from 'i18next'
+ 
+ import type { GenericChunk } from '../../middleware/schemas'
+diff --git a/src/aiCore/legacy/clients/ovms/OVMSClient.ts b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+index 02ac6de..4936b69 100644
+--- a/src/aiCore/legacy/clients/ovms/OVMSClient.ts
++++ b/src/aiCore/legacy/clients/ovms/OVMSClient.ts
+@@ -3,7 +3,8 @@ import { loggerService } from '@logger'
+ import { isSupportedModel } from '@renderer/config/models'
+ import type { Provider } from '@renderer/types'
+ import { objectKeys } from '@renderer/types'
+-import { formatApiHost, withoutTrailingApiVersion } from '@renderer/utils'
++import { formatApiHost } from '@renderer/utils'
++import { withoutTrailingApiVersion } from '@shared/utils'
+ 
+ import { OpenAIAPIClient } from '../openai/OpenAIApiClient'
+ 
+diff --git a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+index ea6c141..9c59099 100644
+--- a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
++++ b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+@@ -66,6 +66,11 @@ export class ZhipuAPIClient extends OpenAIAPIClient {
+ 
+   public async listModels(): Promise<OpenAI.Models.Model[]> {
+     const models = [
++      'glm-4.7',
++      'glm-4.6',
++      'glm-4.6v',
++      'glm-4.6v-flash',
++      'glm-4.6v-flashx',
+       'glm-4.5',
+       'glm-4.5-x',
+       'glm-4.5-air',
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index c3798c1..56c5f6a 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -8,13 +8,13 @@ import { loggerService } from '@logger'
+ import { isImageEnhancementModel, isVisionModel } from '@renderer/config/models'
+ import type { Message, Model } from '@renderer/types'
+ import type { FileMessageBlock, ImageMessageBlock, ThinkingMessageBlock } from '@renderer/types/newMessage'
+-import { parseDataUrlMediaType } from '@renderer/utils/image'
+ import {
+   findFileBlocks,
+   findImageBlocks,
+   findThinkingBlocks,
+   getMainTextContent
+ } from '@renderer/utils/messageUtils/find'
++import { parseDataUrl } from '@shared/utils'
+ import type {
+   AssistantModelMessage,
+   FilePart,
+@@ -69,18 +69,16 @@ async function convertImageBlockToImagePart(imageBlocks: ImageMessageBlock[]): P
+       }
+     } else if (imageBlock.url) {
+       const url = imageBlock.url
+-      const isDataUrl = url.startsWith('data:')
+-      if (isDataUrl) {
+-        const { mediaType } = parseDataUrlMediaType(url)
+-        const commaIndex = url.indexOf(',')
+-        if (commaIndex === -1) {
+-          logger.error('Malformed data URL detected (missing comma separator), image will be excluded:', {
+-            urlPrefix: url.slice(0, 50) + '...'
+-          })
+-          continue
+-        }
+-        const base64Data = url.slice(commaIndex + 1)
+-        parts.push({ type: 'image', image: base64Data, ...(mediaType ? { mediaType } : {}) })
++      const parseResult = parseDataUrl(url)
++      if (parseResult?.isBase64) {
++        const { mediaType, data } = parseResult
++        parts.push({ type: 'image', image: data, ...(mediaType ? { mediaType } : {}) })
++      } else if (url.startsWith('data:')) {
++        // Malformed data URL or non-base64 data URL
++        logger.error('Malformed or non-base64 data URL detected, image will be excluded:', {
++          urlPrefix: url.slice(0, 50) + '...'
++        })
++        continue
+       } else {
+         // For remote URLs we keep payload minimal to match existing expectations.
+         parts.push({ type: 'image', image: url })
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index ff10005..d18aa02 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -31,7 +31,8 @@ const STATIC_PROVIDER_MAPPING: Record<string, ProviderId> = {
+   'azure-openai': 'azure', // Azure OpenAI -> azure
+   'openai-response': 'openai', // OpenAI Responses -> openai
+   grok: 'xai', // Grok -> xai
+-  copilot: 'github-copilot-openai-compatible'
++  copilot: 'github-copilot-openai-compatible',
++  tokenflux: 'openrouter' // TokenFlux -> openrouter (fully compatible)
+ }
+ 
+ /**
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 0ad15ea..5491579 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -1,5 +1,5 @@
+ import { formatPrivateKey, hasProviderConfig, ProviderConfigFactory } from '@cherrystudio/ai-core/provider'
+-import { isOpenAIChatCompletionOnlyModel } from '@renderer/config/models'
++import { isOpenAIChatCompletionOnlyModel, isOpenAIReasoningModel } from '@renderer/config/models'
+ import {
+   getAwsBedrockAccessKeyId,
+   getAwsBedrockApiKey,
+@@ -29,6 +29,7 @@ import {
+   isNewApiProvider,
+   isOllamaProvider,
+   isPerplexityProvider,
++  isSupportDeveloperRoleProvider,
+   isSupportStreamOptionsProvider,
+   isVertexProvider
+ } from '@renderer/utils/provider'
+@@ -264,6 +265,14 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
++  // Apply developer-to-system role conversion for providers that don't support developer role
++  // bug: https://github.com/vercel/ai/issues/10982
++  // fixPR: https://github.com/vercel/ai/pull/11127
++  // TODO: but the PR don't backport to v5, the code will be removed when upgrading to v6
++  if (!isSupportDeveloperRoleProvider(actualProvider) || !isOpenAIReasoningModel(model)) {
++    extraOptions.fetch = createDeveloperToSystemFetch(extraOptions.fetch)
++  }
++
+   if (hasProviderConfig(aiSdkProviderId) && aiSdkProviderId !== 'openai-compatible') {
+     const options = ProviderConfigFactory.fromProvider(aiSdkProviderId, baseConfig, extraOptions)
+     return {
+@@ -302,6 +311,44 @@ export function isModernSdkSupported(provider: Provider): boolean {
+   return hasProviderConfig(aiSdkProviderId)
+ }
+ 
++/**
++ * Creates a custom fetch wrapper that converts 'developer' role to 'system' role in request body.
++ * This is needed for providers that don't support the 'developer' role (e.g., Azure DeepSeek R1).
++ *
++ * @param originalFetch - Optional original fetch function to wrap
++ * @returns A fetch function that transforms the request body
++ */
++function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetch {
++  const baseFetch = originalFetch ?? fetch
++  return async (input: RequestInfo | URL, init?: RequestInit) => {
++    let options = init
++    if (options?.body && typeof options.body === 'string') {
++      try {
++        const body = JSON.parse(options.body)
++        if (body.messages && Array.isArray(body.messages)) {
++          let hasChanges = false
++          body.messages = body.messages.map((msg: { role: string }) => {
++            if (msg.role === 'developer') {
++              hasChanges = true
++              return { ...msg, role: 'system' }
++            }
++            return msg
++          })
++          if (hasChanges) {
++            options = {
++              ...options,
++              body: JSON.stringify(body)
++            }
++          }
++        }
++      } catch {
++        // If parsing fails, just use original body
++      }
++    }
++    return baseFetch(input, options)
++  }
++}
++
+ /**
+  * 准备特殊provider的配置,主要用于异步处理的配置
+  */
+@@ -360,5 +407,6 @@ export async function prepareSpecialProviderConfig(
+       }
+     }
+   }
++
+   return config
+ }
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 36778b7..8dc7a10 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -580,8 +580,10 @@ function buildOllamaProviderOptions(
+   const reasoningEffort = assistant.settings?.reasoning_effort
+   if (enableReasoning) {
+     if (isOpenAIOpenWeightModel(model)) {
+-      // @ts-ignore upstream type error
+-      providerOptions.think = reasoningEffort as any
++      // For gpt-oss models, Ollama accepts: 'low' | 'medium' | 'high'
++      if (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high') {
++        providerOptions.think = reasoningEffort
++      }
+     } else {
+       providerOptions.think = !['none', undefined].includes(reasoningEffort)
+     }
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index ab8a0b7..c57dc31 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -118,6 +118,11 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { thinking: { type: 'disabled' } }
+     }
+ 
++    // Deepseek, default behavior is non-thinking
++    if (isDeepSeekHybridInferenceModel(model)) {
++      return {}
++    }
++
+     // GPT 5.1, GPT 5.2, or newer
+     if (isSupportNoneReasoningEffortModel(model)) {
+       return {
