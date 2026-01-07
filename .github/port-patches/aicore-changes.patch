@@ -1,0 +1,397 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 5de2ac3..5d418de 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -120,6 +120,21 @@ export class AiSdkToChunkAdapter {
+     }
+   }
+ 
++  /**
++   * 如果有累积的思考内容，发送 THINKING_COMPLETE chunk 并清空
++   * @param final 包含 reasoningContent 的状态对象
++   * @returns 是否发送了 THINKING_COMPLETE chunk
++   */
++  private emitThinkingCompleteIfNeeded(final: { reasoningContent: string; [key: string]: any }) {
++    if (final.reasoningContent) {
++      this.onChunk({
++        type: ChunkType.THINKING_COMPLETE,
++        text: final.reasoningContent
++      })
++      final.reasoningContent = ''
++    }
++  }
++
+   /**
+    * 转换 AI SDK chunk 为 Cherry Studio chunk 并调用回调
+    * @param chunk AI SDK 的 chunk 数据
+@@ -145,6 +160,9 @@ export class AiSdkToChunkAdapter {
+       }
+       // === 文本相关事件 ===
+       case 'text-start':
++        // 如果有未完成的思考内容，先生成 THINKING_COMPLETE
++        // 这处理了某些提供商不发送 reasoning-end 事件的情况
++        this.emitThinkingCompleteIfNeeded(final)
+         this.onChunk({
+           type: ChunkType.TEXT_START
+         })
+@@ -215,11 +233,7 @@ export class AiSdkToChunkAdapter {
+         })
+         break
+       case 'reasoning-end':
+-        this.onChunk({
+-          type: ChunkType.THINKING_COMPLETE,
+-          text: final.reasoningContent || ''
+-        })
+-        final.reasoningContent = ''
++        this.emitThinkingCompleteIfNeeded(final)
+         break
+ 
+       // === 工具调用相关事件（原始 AI SDK 事件，如果没有被中间件处理） ===
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+index b2a796b..ab4a5d8 100644
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+@@ -1,7 +1,7 @@
+ import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugins'
+ import { loggerService } from '@logger'
+-import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
+-import type { MCPTool } from '@renderer/types'
++import { isAnthropicModel, isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
++import type { McpMode, MCPTool } from '@renderer/types'
+ import { type Assistant, type Message, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+ import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+@@ -10,6 +10,7 @@ import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+ 
+ import { getAiSdkProviderId } from '../provider/factory'
+ import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
++import { anthropicCacheMiddleware } from './anthropicCacheMiddleware'
+ import { noThinkMiddleware } from './noThinkMiddleware'
+ import { openrouterGenerateImageMiddleware } from './openrouterGenerateImageMiddleware'
+ import { openrouterReasoningMiddleware } from './openrouterReasoningMiddleware'
+@@ -38,6 +39,7 @@ export interface AiSdkMiddlewareConfig {
+   enableWebSearch: boolean
+   enableGenerateImage: boolean
+   enableUrlContext: boolean
++  mcpMode?: McpMode
+   mcpTools?: MCPTool[]
+   uiMessages?: Message[]
+   // 内置搜索配置
+@@ -178,18 +180,22 @@ function addProviderSpecificMiddlewares(builder: AiSdkMiddlewareBuilder, config:
+   // 根据不同provider添加特定中间件
+   switch (config.provider.type) {
+     case 'anthropic':
+-      // Anthropic特定中间件
+-      break
+-    case 'openai':
+-    case 'azure-openai': {
+-      if (config.enableReasoning) {
+-        const tagName = getReasoningTagName(config.model?.id.toLowerCase())
++      if (isAnthropicModel(config.model) && config.provider.anthropicCacheControl?.tokenThreshold) {
+         builder.add({
+-          name: 'thinking-tag-extraction',
+-          middleware: extractReasoningMiddleware({ tagName })
++          name: 'anthropic-cache',
++          middleware: anthropicCacheMiddleware(config.provider)
+         })
+       }
+       break
++    case 'openai':
++    case 'azure-openai': {
++      // 就算这里不传参数也有可能调用推理
++      const tagName = getReasoningTagName(config.model?.id.toLowerCase())
++      builder.add({
++        name: 'thinking-tag-extraction',
++        middleware: extractReasoningMiddleware({ tagName })
++      })
++      break
+     }
+     case 'gemini':
+       // Gemini特定中间件
+diff --git a/src/aiCore/middleware/anthropicCacheMiddleware.ts b/src/aiCore/middleware/anthropicCacheMiddleware.ts
+new file mode 100644
+index 0000000..df50798
+--- /dev/null
++++ b/src/aiCore/middleware/anthropicCacheMiddleware.ts
+@@ -0,0 +1,79 @@
++/**
++ * Anthropic Prompt Caching Middleware
++ * @see https://ai-sdk.dev/providers/ai-sdk-providers/anthropic#cache-control
++ */
++import { estimateTextTokens } from '@renderer/services/TokenService'
++import type { Provider } from '@renderer/types'
++import type { LanguageModelMiddleware } from 'ai'
++
++const cacheProviderOptions = {
++  anthropic: { cacheControl: { type: 'ephemeral' } }
++}
++
++function estimateContentTokens(content: unknown): number {
++  if (typeof content === 'string') return estimateTextTokens(content)
++  if (Array.isArray(content)) {
++    return content.reduce((acc, part) => {
++      if (typeof part === 'object' && part !== null && 'text' in part) {
++        return acc + estimateTextTokens(part.text as string)
++      }
++      return acc
++    }, 0)
++  }
++  return 0
++}
++
++function addCacheToContentParts(content: unknown): unknown {
++  if (typeof content === 'string') {
++    return [{ type: 'text', text: content, providerOptions: cacheProviderOptions }]
++  }
++  if (Array.isArray(content) && content.length > 0) {
++    const result = [...content]
++    const last = result[result.length - 1]
++    if (typeof last === 'object' && last !== null) {
++      result[result.length - 1] = { ...last, providerOptions: cacheProviderOptions }
++    }
++    return result
++  }
++  return content
++}
++
++export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
++  return {
++    middlewareVersion: 'v2',
++    transformParams: async ({ params }) => {
++      const settings = provider.anthropicCacheControl
++      if (!settings?.tokenThreshold || !Array.isArray(params.prompt) || params.prompt.length === 0) {
++        return params
++      }
++
++      const { tokenThreshold, cacheSystemMessage, cacheLastNMessages } = settings
++      const messages = [...params.prompt]
++      let cachedCount = 0
++
++      // Cache system message (providerOptions on message object)
++      if (cacheSystemMessage) {
++        for (let i = 0; i < messages.length; i++) {
++          const msg = messages[i] as any
++          if (msg.role === 'system' && estimateContentTokens(msg.content) >= tokenThreshold) {
++            messages[i] = { ...msg, providerOptions: cacheProviderOptions }
++            break
++          }
++        }
++      }
++
++      // Cache last N non-system messages (providerOptions on content parts)
++      if (cacheLastNMessages > 0) {
++        for (let i = messages.length - 1; i >= 0 && cachedCount < cacheLastNMessages; i--) {
++          const msg = messages[i] as any
++          if (msg.role !== 'system' && estimateContentTokens(msg.content) >= tokenThreshold) {
++            messages[i] = { ...msg, content: addCacheToContentParts(msg.content) }
++            cachedCount++
++          }
++        }
++      }
++
++      return { ...params, prompt: messages }
++    }
++  }
++}
+diff --git a/src/aiCore/plugins/PluginBuilder.ts b/src/aiCore/plugins/PluginBuilder.ts
+index eb46eb7..d210455 100644
+--- a/src/aiCore/plugins/PluginBuilder.ts
++++ b/src/aiCore/plugins/PluginBuilder.ts
+@@ -47,6 +47,7 @@ export function buildPlugins(
+     plugins.push(
+       createPromptToolUsePlugin({
+         enabled: true,
++        mcpMode: middlewareConfig.mcpMode,
+         createSystemMessage: (systemPrompt, params, context) => {
+           const modelId = typeof context.model === 'string' ? context.model : context.model.modelId
+           if (modelId.includes('o1-mini') || modelId.includes('o1-preview')) {
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index c3798c1..56c5f6a 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -8,13 +8,13 @@ import { loggerService } from '@logger'
+ import { isImageEnhancementModel, isVisionModel } from '@renderer/config/models'
+ import type { Message, Model } from '@renderer/types'
+ import type { FileMessageBlock, ImageMessageBlock, ThinkingMessageBlock } from '@renderer/types/newMessage'
+-import { parseDataUrlMediaType } from '@renderer/utils/image'
+ import {
+   findFileBlocks,
+   findImageBlocks,
+   findThinkingBlocks,
+   getMainTextContent
+ } from '@renderer/utils/messageUtils/find'
++import { parseDataUrl } from '@shared/utils'
+ import type {
+   AssistantModelMessage,
+   FilePart,
+@@ -69,18 +69,16 @@ async function convertImageBlockToImagePart(imageBlocks: ImageMessageBlock[]): P
+       }
+     } else if (imageBlock.url) {
+       const url = imageBlock.url
+-      const isDataUrl = url.startsWith('data:')
+-      if (isDataUrl) {
+-        const { mediaType } = parseDataUrlMediaType(url)
+-        const commaIndex = url.indexOf(',')
+-        if (commaIndex === -1) {
+-          logger.error('Malformed data URL detected (missing comma separator), image will be excluded:', {
+-            urlPrefix: url.slice(0, 50) + '...'
+-          })
+-          continue
+-        }
+-        const base64Data = url.slice(commaIndex + 1)
+-        parts.push({ type: 'image', image: base64Data, ...(mediaType ? { mediaType } : {}) })
++      const parseResult = parseDataUrl(url)
++      if (parseResult?.isBase64) {
++        const { mediaType, data } = parseResult
++        parts.push({ type: 'image', image: data, ...(mediaType ? { mediaType } : {}) })
++      } else if (url.startsWith('data:')) {
++        // Malformed data URL or non-base64 data URL
++        logger.error('Malformed or non-base64 data URL detected, image will be excluded:', {
++          urlPrefix: url.slice(0, 50) + '...'
++        })
++        continue
+       } else {
+         // For remote URLs we keep payload minimal to match existing expectations.
+         parts.push({ type: 'image', image: url })
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 52234c5..8c8187e 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -26,11 +26,13 @@ import {
+   isSupportedThinkingTokenModel,
+   isWebSearchModel
+ } from '@renderer/config/models'
++import { getHubModeSystemPrompt } from '@renderer/config/prompts-code-mode'
++import { fetchAllActiveServerTools } from '@renderer/services/ApiService'
+ import { getDefaultModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+ import type { Model } from '@renderer/types'
+-import { type Assistant, type MCPTool, type Provider, SystemProviderIds } from '@renderer/types'
++import { type Assistant, getEffectiveMcpMode, type MCPTool, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
+@@ -243,8 +245,18 @@ export async function buildStreamTextParams(
+     params.tools = tools
+   }
+ 
+-  if (assistant.prompt) {
+-    params.system = await replacePromptVariables(assistant.prompt, model.name)
++  let systemPrompt = assistant.prompt ? await replacePromptVariables(assistant.prompt, model.name) : ''
++
++  if (getEffectiveMcpMode(assistant) === 'auto') {
++    const allActiveTools = await fetchAllActiveServerTools()
++    const autoModePrompt = getHubModeSystemPrompt(allActiveTools)
++    if (autoModePrompt) {
++      systemPrompt = systemPrompt ? `${systemPrompt}\n\n${autoModePrompt}` : autoModePrompt
++    }
++  }
++
++  if (systemPrompt) {
++    params.system = systemPrompt
+   }
+ 
+   logger.debug('params', params)
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 0ad15ea..5491579 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -1,5 +1,5 @@
+ import { formatPrivateKey, hasProviderConfig, ProviderConfigFactory } from '@cherrystudio/ai-core/provider'
+-import { isOpenAIChatCompletionOnlyModel } from '@renderer/config/models'
++import { isOpenAIChatCompletionOnlyModel, isOpenAIReasoningModel } from '@renderer/config/models'
+ import {
+   getAwsBedrockAccessKeyId,
+   getAwsBedrockApiKey,
+@@ -29,6 +29,7 @@ import {
+   isNewApiProvider,
+   isOllamaProvider,
+   isPerplexityProvider,
++  isSupportDeveloperRoleProvider,
+   isSupportStreamOptionsProvider,
+   isVertexProvider
+ } from '@renderer/utils/provider'
+@@ -264,6 +265,14 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
++  // Apply developer-to-system role conversion for providers that don't support developer role
++  // bug: https://github.com/vercel/ai/issues/10982
++  // fixPR: https://github.com/vercel/ai/pull/11127
++  // TODO: but the PR don't backport to v5, the code will be removed when upgrading to v6
++  if (!isSupportDeveloperRoleProvider(actualProvider) || !isOpenAIReasoningModel(model)) {
++    extraOptions.fetch = createDeveloperToSystemFetch(extraOptions.fetch)
++  }
++
+   if (hasProviderConfig(aiSdkProviderId) && aiSdkProviderId !== 'openai-compatible') {
+     const options = ProviderConfigFactory.fromProvider(aiSdkProviderId, baseConfig, extraOptions)
+     return {
+@@ -302,6 +311,44 @@ export function isModernSdkSupported(provider: Provider): boolean {
+   return hasProviderConfig(aiSdkProviderId)
+ }
+ 
++/**
++ * Creates a custom fetch wrapper that converts 'developer' role to 'system' role in request body.
++ * This is needed for providers that don't support the 'developer' role (e.g., Azure DeepSeek R1).
++ *
++ * @param originalFetch - Optional original fetch function to wrap
++ * @returns A fetch function that transforms the request body
++ */
++function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetch {
++  const baseFetch = originalFetch ?? fetch
++  return async (input: RequestInfo | URL, init?: RequestInit) => {
++    let options = init
++    if (options?.body && typeof options.body === 'string') {
++      try {
++        const body = JSON.parse(options.body)
++        if (body.messages && Array.isArray(body.messages)) {
++          let hasChanges = false
++          body.messages = body.messages.map((msg: { role: string }) => {
++            if (msg.role === 'developer') {
++              hasChanges = true
++              return { ...msg, role: 'system' }
++            }
++            return msg
++          })
++          if (hasChanges) {
++            options = {
++              ...options,
++              body: JSON.stringify(body)
++            }
++          }
++        }
++      } catch {
++        // If parsing fails, just use original body
++      }
++    }
++    return baseFetch(input, options)
++  }
++}
++
+ /**
+  * 准备特殊provider的配置,主要用于异步处理的配置
+  */
+@@ -360,5 +407,6 @@ export async function prepareSpecialProviderConfig(
+       }
+     }
+   }
++
+   return config
+ }
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index ab8a0b7..c57dc31 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -118,6 +118,11 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { thinking: { type: 'disabled' } }
+     }
+ 
++    // Deepseek, default behavior is non-thinking
++    if (isDeepSeekHybridInferenceModel(model)) {
++      return {}
++    }
++
+     // GPT 5.1, GPT 5.2, or newer
+     if (isSupportNoneReasoningEffortModel(model)) {
+       return {
