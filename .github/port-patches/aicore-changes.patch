@@ -1,0 +1,758 @@
+diff --git a/src/aiCore/middleware/anthropicCacheMiddleware.ts b/src/aiCore/middleware/anthropicCacheMiddleware.ts
+index df50798..80a391b 100644
+--- a/src/aiCore/middleware/anthropicCacheMiddleware.ts
++++ b/src/aiCore/middleware/anthropicCacheMiddleware.ts
+@@ -2,6 +2,7 @@
+  * Anthropic Prompt Caching Middleware
+  * @see https://ai-sdk.dev/providers/ai-sdk-providers/anthropic#cache-control
+  */
++import type { LanguageModelV2Message } from '@ai-sdk/provider'
+ import { estimateTextTokens } from '@renderer/services/TokenService'
+ import type { Provider } from '@renderer/types'
+ import type { LanguageModelMiddleware } from 'ai'
+@@ -10,11 +11,11 @@ const cacheProviderOptions = {
+   anthropic: { cacheControl: { type: 'ephemeral' } }
+ }
+ 
+-function estimateContentTokens(content: unknown): number {
++function estimateContentTokens(content: LanguageModelV2Message['content']): number {
+   if (typeof content === 'string') return estimateTextTokens(content)
+   if (Array.isArray(content)) {
+     return content.reduce((acc, part) => {
+-      if (typeof part === 'object' && part !== null && 'text' in part) {
++      if (part.type === 'text') {
+         return acc + estimateTextTokens(part.text as string)
+       }
+       return acc
+@@ -23,21 +24,6 @@ function estimateContentTokens(content: unknown): number {
+   return 0
+ }
+ 
+-function addCacheToContentParts(content: unknown): unknown {
+-  if (typeof content === 'string') {
+-    return [{ type: 'text', text: content, providerOptions: cacheProviderOptions }]
+-  }
+-  if (Array.isArray(content) && content.length > 0) {
+-    const result = [...content]
+-    const last = result[result.length - 1]
+-    if (typeof last === 'object' && last !== null) {
+-      result[result.length - 1] = { ...last, providerOptions: cacheProviderOptions }
+-    }
+-    return result
+-  }
+-  return content
+-}
+-
+ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
+   return {
+     middlewareVersion: 'v2',
+@@ -54,7 +40,7 @@ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddl
+       // Cache system message (providerOptions on message object)
+       if (cacheSystemMessage) {
+         for (let i = 0; i < messages.length; i++) {
+-          const msg = messages[i] as any
++          const msg = messages[i] as LanguageModelV2Message
+           if (msg.role === 'system' && estimateContentTokens(msg.content) >= tokenThreshold) {
+             messages[i] = { ...msg, providerOptions: cacheProviderOptions }
+             break
+@@ -64,12 +50,32 @@ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddl
+ 
+       // Cache last N non-system messages (providerOptions on content parts)
+       if (cacheLastNMessages > 0) {
++        const cumsumTokens = [] as Array<number>
++        let tokenSum = 0 as number
++        for (let i = 0; i < messages.length; i++) {
++          const msg = messages[i] as LanguageModelV2Message
++          tokenSum += estimateContentTokens(msg.content)
++          cumsumTokens.push(tokenSum)
++        }
++
+         for (let i = messages.length - 1; i >= 0 && cachedCount < cacheLastNMessages; i--) {
+-          const msg = messages[i] as any
+-          if (msg.role !== 'system' && estimateContentTokens(msg.content) >= tokenThreshold) {
+-            messages[i] = { ...msg, content: addCacheToContentParts(msg.content) }
+-            cachedCount++
++          const msg = messages[i] as LanguageModelV2Message
++          if (msg.role === 'system' || cumsumTokens[i] < tokenThreshold || msg.content.length === 0) {
++            continue
+           }
++
++          const newContent = [...msg.content]
++          const lastIndex = newContent.length - 1
++          newContent[lastIndex] = {
++            ...newContent[lastIndex],
++            providerOptions: cacheProviderOptions
++          }
++
++          messages[i] = {
++            ...msg,
++            content: newContent
++          } as LanguageModelV2Message
++          cachedCount++
+         }
+       }
+ 
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index 2a69f3b..4f76cbe 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -263,7 +263,7 @@ describe('messageConverter', () => {
+   })
+ 
+   describe('convertMessagesToSdkMessages', () => {
+-    it('collapses to [system?, user(image)] for image enhancement models', async () => {
++    it('preserves conversation history and merges images for image enhancement models', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const initialUser = createMessage('user')
+       initialUser.__mockContent = 'Start editing'
+@@ -277,7 +277,16 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessagesToSdkMessages([initialUser, assistant, finalUser], model)
+ 
++      // Preserves all conversation history, only merges images into the last user message
+       expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start editing' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Here is the current preview' }]
++        },
+         {
+           role: 'user',
+           content: [
+@@ -288,7 +297,7 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
+-    it('preserves system messages and collapses others for enhancement payloads', async () => {
++    it('preserves system messages and conversation history for enhancement payloads', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const fileUser = createMessage('user')
+       fileUser.__mockContent = 'Use this document as inspiration'
+@@ -309,8 +318,17 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessagesToSdkMessages([fileUser, assistant, finalUser], model)
+ 
++      // Preserves system message, conversation history, and merges images into the last user message
+       expect(result).toEqual([
+         { role: 'system', content: 'fileid://reference' },
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Use this document as inspiration' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Generated previews ready' }]
++        },
+         {
+           role: 'user',
+           content: [
+@@ -321,7 +339,7 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
+-    it('handles no previous assistant message with images', async () => {
++    it('returns messages as-is when no previous assistant message with images', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const user1 = createMessage('user')
+       user1.__mockContent = 'Start'
+@@ -331,7 +349,12 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessagesToSdkMessages([user1, user2], model)
+ 
++      // No images to merge, returns all messages as-is
+       expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start' }]
++        },
+         {
+           role: 'user',
+           content: [{ type: 'text', text: 'Continue without images' }]
+@@ -339,7 +362,7 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
+-    it('handles assistant message without images', async () => {
++    it('returns messages as-is when assistant message has no images', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const user1 = createMessage('user')
+       user1.__mockContent = 'Start'
+@@ -353,7 +376,16 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessagesToSdkMessages([user1, assistant, user2], model)
+ 
++      // No images to merge, returns all messages as-is
+       expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Text only response' }]
++        },
+         {
+           role: 'user',
+           content: [{ type: 'text', text: 'Follow up' }]
+@@ -361,7 +393,7 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
+-    it('handles multiple assistant messages by using the most recent one', async () => {
++    it('merges images from the most recent assistant message', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const user1 = createMessage('user')
+       user1.__mockContent = 'Start'
+@@ -382,7 +414,24 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessagesToSdkMessages([user1, assistant1, user2, assistant2, user3], model)
+ 
++      // Preserves all history, merges only the most recent assistant's images
+       expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'First response' }]
++        },
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Continue' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Second response' }]
++        },
+         {
+           role: 'user',
+           content: [
+@@ -393,7 +442,7 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
+-    it('handles conversation ending with assistant message', async () => {
++    it('returns messages as-is when conversation ends with assistant message', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const user = createMessage('user')
+       user.__mockContent = 'Start'
+@@ -406,15 +455,20 @@ describe('messageConverter', () => {
+ 
+       // The user message is the last user message, but since the assistant comes after,
+       // there's no "previous" assistant message (search starts from messages.length-2 backwards)
++      // So no images to merge, returns all messages as-is
+       expect(result).toEqual([
+         {
+           role: 'user',
+           content: [{ type: 'text', text: 'Start' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Response with image' }]
+         }
+       ])
+     })
+ 
+-    it('handles empty content in last user message', async () => {
++    it('merges images even when last user message has empty content', async () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const user1 = createMessage('user')
+       user1.__mockContent = 'Start'
+@@ -428,12 +482,79 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessagesToSdkMessages([user1, assistant, user2], model)
+ 
++      // Preserves history, merges images into last user message (even if empty)
+       expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Start' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Here is the preview' }]
++        },
+         {
+           role: 'user',
+           content: [{ type: 'image', image: 'https://example.com/preview.png' }]
+         }
+       ])
+     })
++
++    it('allows using LLM conversation context for image generation', async () => {
++      // This test verifies the key use case: switching from LLM to image enhancement model
++      // and using the previous conversation as context for image generation
++      const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
++
++      // Simulate a conversation that started with a regular LLM
++      const user1 = createMessage('user')
++      user1.__mockContent = 'Help me design a futuristic robot with blue lights'
++
++      const assistant1 = createMessage('assistant')
++      assistant1.__mockContent =
++        'Great idea! The robot could have a sleek metallic body with glowing blue LED strips...'
++      assistant1.__mockImageBlocks = [] // LLM response, no images
++
++      const user2 = createMessage('user')
++      user2.__mockContent = 'Yes, and add some chrome accents'
++
++      const assistant2 = createMessage('assistant')
++      assistant2.__mockContent = 'Perfect! Chrome accents would complement the blue lights beautifully...'
++      assistant2.__mockImageBlocks = [] // Still LLM response, no images
++
++      // User switches to image enhancement model and asks for image generation
++      const user3 = createMessage('user')
++      user3.__mockContent = 'Now generate an image based on our discussion'
++
++      const result = await convertMessagesToSdkMessages([user1, assistant1, user2, assistant2, user3], model)
++
++      // All conversation history should be preserved for context
++      // No images to merge since previous assistant had no images
++      expect(result).toEqual([
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Help me design a futuristic robot with blue lights' }]
++        },
++        {
++          role: 'assistant',
++          content: [
++            {
++              type: 'text',
++              text: 'Great idea! The robot could have a sleek metallic body with glowing blue LED strips...'
++            }
++          ]
++        },
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Yes, and add some chrome accents' }]
++        },
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Perfect! Chrome accents would complement the blue lights beautifully...' }]
++        },
++        {
++          role: 'user',
++          content: [{ type: 'text', text: 'Now generate an image based on our discussion' }]
++        }
++      ])
++    })
+   })
+ })
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index 56c5f6a..eba16c6 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -229,23 +229,15 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+     sdkMessages.push(...(Array.isArray(sdkMessage) ? sdkMessage : [sdkMessage]))
+   }
+   // Special handling for image enhancement models
+-  // Target behavior: Collapse the conversation into [system?, user(image)].
+-  // Explanation of why we don't simply use slice:
+-  // 1) We need to preserve all system messages: During the convertMessageToSdkParam process, native file uploads may insert `system(fileid://...)`.
+-  // Directly slicing the original messages or already converted sdkMessages could easily result in missing these system instructions.
+-  // Therefore, we first perform a full conversion and then aggregate the system messages afterward.
+-  // 2) The conversion process may split messages: A single user message might be broken into two SDK messages—[system, user].
+-  // Slicing either side could lead to obtaining semantically incorrect fragments (e.g., only the split-out system message).
+-  // 3) The “previous assistant message” is not necessarily the second-to-last one: There might be system messages or other message blocks inserted in between,
+-  // making a simple slice(-2) assumption too rigid. Here, we trace back from the end of the original messages to locate the most recent assistant message, which better aligns with business semantics.
+-  // 4) This is a “collapse” rather than a simple “slice”: Ultimately, we need to synthesize a new user message
+-  // (with text from the last user message and images from the previous assistant message). Using slice can only extract subarrays,
+-  // which still require reassembly; constructing directly according to the target structure is clearer and more reliable.
++  // These models support multi-turn conversations but need images from previous assistant messages
++  // to be merged into the current user message for editing/enhancement operations.
++  //
++  // Key behaviors:
++  // 1. Preserve all conversation history for context
++  // 2. Find images from the previous assistant message and merge them into the last user message
++  // 3. This allows users to switch from LLM conversations and use that context for image generation
+   if (isImageEnhancementModel(model)) {
+-    // Collect all system messages (including ones generated from file uploads)
+-    const systemMessages = sdkMessages.filter((m): m is SystemModelMessage => m.role === 'system')
+-
+-    // Find the last user message (SDK converted)
++    // Find the last user SDK message index
+     const lastUserSdkIndex = (() => {
+       for (let i = sdkMessages.length - 1; i >= 0; i--) {
+         if (sdkMessages[i].role === 'user') return i
+@@ -253,7 +245,10 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+       return -1
+     })()
+ 
+-    const lastUserSdk = lastUserSdkIndex >= 0 ? (sdkMessages[lastUserSdkIndex] as UserModelMessage) : null
++    // If no user message found, return messages as-is
++    if (lastUserSdkIndex < 0) {
++      return sdkMessages
++    }
+ 
+     // Find the nearest preceding assistant message in original messages
+     let prevAssistant: Message | null = null
+@@ -264,31 +259,33 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+       }
+     }
+ 
+-    // Build the final user content parts
+-    let finalUserParts: Array<TextPart | FilePart | ImagePart> = []
+-    if (lastUserSdk) {
+-      if (typeof lastUserSdk.content === 'string') {
+-        finalUserParts.push({ type: 'text', text: lastUserSdk.content })
+-      } else if (Array.isArray(lastUserSdk.content)) {
+-        finalUserParts = [...lastUserSdk.content]
+-      }
+-    }
++    // Check if there are images from the previous assistant message
++    const imageBlocks = prevAssistant ? findImageBlocks(prevAssistant) : []
++    const imageParts = await convertImageBlockToImagePart(imageBlocks)
+ 
+-    // Append images from the previous assistant message if any
+-    if (prevAssistant) {
+-      const imageBlocks = findImageBlocks(prevAssistant)
+-      const imageParts = await convertImageBlockToImagePart(imageBlocks)
+-      if (imageParts.length > 0) {
+-        finalUserParts.push(...imageParts)
+-      }
++    // If no images to merge, return messages as-is
++    if (imageParts.length === 0) {
++      return sdkMessages
+     }
+ 
+-    // If we couldn't find a last user message, fall back to returning collected system messages only
+-    if (!lastUserSdk) {
+-      return systemMessages
++    // Build the new last user message with merged images
++    const lastUserSdk = sdkMessages[lastUserSdkIndex] as UserModelMessage
++    let finalUserParts: Array<TextPart | FilePart | ImagePart> = []
++
++    if (typeof lastUserSdk.content === 'string') {
++      finalUserParts.push({ type: 'text', text: lastUserSdk.content })
++    } else if (Array.isArray(lastUserSdk.content)) {
++      finalUserParts = [...lastUserSdk.content]
+     }
+ 
+-    return [...systemMessages, { role: 'user', content: finalUserParts }]
++    // Append images from the previous assistant message
++    finalUserParts.push(...imageParts)
++
++    // Replace the last user message with the merged version
++    const result = [...sdkMessages]
++    result[lastUserSdkIndex] = { role: 'user', content: finalUserParts }
++
++    return result
+   }
+ 
+   return sdkMessages
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 5491579..3ab329e 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -11,6 +11,7 @@ import { createVertexProvider, isVertexAIConfigured } from '@renderer/hooks/useV
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+ import { getProviderById } from '@renderer/services/ProviderService'
+ import store from '@renderer/store'
++import type { EndpointType } from '@renderer/types'
+ import { isSystemProvider, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { OpenAICompletionsStreamOptions } from '@renderer/types/aiCoreTypes'
+ import {
+@@ -140,6 +141,48 @@ export function adaptProvider({ provider, model }: { provider: Provider; model?:
+   return adaptedProvider
+ }
+ 
++interface BaseExtraOptions {
++  fetch?: typeof fetch
++  endpoint: string
++  mode?: 'responses' | 'chat'
++  headers: Record<string, string>
++}
++
++interface AzureOpenAIExtraOptions extends BaseExtraOptions {
++  apiVersion: string
++  useDeploymentBasedUrls: true | undefined
++}
++
++interface BedrockApiKeyExtraOptions extends BaseExtraOptions {
++  region: string
++  apiKey: string
++}
++
++interface BedrockAccessKeyExtraOptions extends BaseExtraOptions {
++  region: string
++  accessKeyId: string
++  secretAccessKey: string
++}
++
++type BedrockExtraOptions = BedrockApiKeyExtraOptions | BedrockAccessKeyExtraOptions
++
++interface VertexExtraOptions extends BaseExtraOptions {
++  project: string
++  location: string
++  googleCredentials: {
++    privateKey: string
++    clientEmail: string
++  }
++}
++
++interface CherryInExtraOptions extends BaseExtraOptions {
++  endpointType?: EndpointType
++  anthropicBaseURL?: string
++  geminiBaseURL?: string
++}
++
++type ExtraOptions = BedrockExtraOptions | AzureOpenAIExtraOptions | VertexExtraOptions | CherryInExtraOptions
++
+ /**
+  * 将 Provider 配置转换为新 AI SDK 格式
+  * 简化版：利用新的别名映射系统
+@@ -158,6 +201,8 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     includeUsage = store.getState().settings.openAI?.streamOptions?.includeUsage
+   }
+ 
++  // Specially, some providers which need to early return
++  // Copilot
+   const isCopilotProvider = actualProvider.id === SystemProviderIds.copilot
+   if (isCopilotProvider) {
+     const storedHeaders = store.getState().copilot.defaultHeaders ?? {}
+@@ -177,6 +222,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
++  // Ollama
+   if (isOllamaProvider(actualProvider)) {
+     return {
+       providerId: 'ollama',
+@@ -190,106 +236,142 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
+-  // 处理OpenAI模式
+-  const extraOptions: any = {}
+-  extraOptions.endpoint = endpoint
+-  if (actualProvider.type === 'openai-response' && !isOpenAIChatCompletionOnlyModel(model)) {
+-    extraOptions.mode = 'responses'
+-  } else if (aiSdkProviderId === 'openai' || (aiSdkProviderId === 'cherryin' && actualProvider.type === 'openai')) {
+-    extraOptions.mode = 'chat'
++  // Generally, construct extraOptions according to provider & model
++  // Consider as OpenAI like provider
++
++  // Construct baseExtraOptions first
++  // About mode of azure:
++  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
++  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses?tabs=python-key#responses-api
++  let mode: BaseExtraOptions['mode']
++  if (
++    (actualProvider.type === 'openai-response' && !isOpenAIChatCompletionOnlyModel(model)) ||
++    aiSdkProviderId === 'azure-responses'
++  ) {
++    mode = 'responses'
++  } else if (
++    aiSdkProviderId === 'openai' ||
++    (aiSdkProviderId === 'cherryin' && actualProvider.type === 'openai') ||
++    aiSdkProviderId === 'azure'
++  ) {
++    mode = 'chat'
+   }
+ 
+-  extraOptions.headers = {
++  const headers: BaseExtraOptions['headers'] = {
+     ...defaultAppHeaders(),
+     ...actualProvider.extra_headers
+   }
+-
+   if (aiSdkProviderId === 'openai') {
+-    extraOptions.headers['X-Api-Key'] = baseConfig.apiKey
++    if (actualProvider.extra_headers?.['X-Api-Key'] === undefined) {
++      headers['X-Api-Key'] = baseConfig.apiKey
++    }
+   }
+-  // azure
+-  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
+-  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses?tabs=python-key#responses-api
+-  if (aiSdkProviderId === 'azure-responses') {
+-    extraOptions.mode = 'responses'
+-  } else if (aiSdkProviderId === 'azure') {
+-    extraOptions.mode = 'chat'
++
++  let _fetch: typeof fetch | undefined
++
++  // Apply developer-to-system role conversion for providers that don't support developer role
++  // bug: https://github.com/vercel/ai/issues/10982
++  // fixPR: https://github.com/vercel/ai/pull/11127
++  // TODO: but the PR don't backport to v5, the code will be removed when upgrading to v6
++  if (!isSupportDeveloperRoleProvider(actualProvider) || !isOpenAIReasoningModel(model)) {
++    _fetch = createDeveloperToSystemFetch(fetch)
+   }
++
++  const baseExtraOptions = {
++    fetch: _fetch,
++    endpoint,
++    mode,
++    headers
++  } as const satisfies BaseExtraOptions
++
++  // Create specifical fields in extraOptions for different provider
++  let extraOptions: ExtraOptions | undefined
+   if (isAzureOpenAIProvider(actualProvider)) {
+     const apiVersion = actualProvider.apiVersion?.trim()
++    let useDeploymentBasedUrls: true | undefined
+     if (apiVersion) {
+-      extraOptions.apiVersion = apiVersion
+       if (!['preview', 'v1'].includes(apiVersion)) {
+-        extraOptions.useDeploymentBasedUrls = true
++        useDeploymentBasedUrls = true
+       }
+     }
+-  }
+-
+-  // bedrock
+-  if (aiSdkProviderId === 'bedrock') {
++    extraOptions = {
++      ...baseExtraOptions,
++      apiVersion,
++      useDeploymentBasedUrls
++    } satisfies AzureOpenAIExtraOptions
++  } else if (aiSdkProviderId === 'bedrock') {
++    // bedrock
+     const authType = getAwsBedrockAuthType()
+-    extraOptions.region = getAwsBedrockRegion()
++    const region = getAwsBedrockRegion()
+ 
+     if (authType === 'apiKey') {
+-      extraOptions.apiKey = getAwsBedrockApiKey()
++      extraOptions = {
++        ...baseExtraOptions,
++        region,
++        apiKey: getAwsBedrockApiKey()
++      } satisfies BedrockApiKeyExtraOptions
+     } else {
+-      extraOptions.accessKeyId = getAwsBedrockAccessKeyId()
+-      extraOptions.secretAccessKey = getAwsBedrockSecretAccessKey()
++      extraOptions = {
++        ...baseExtraOptions,
++        region,
++        accessKeyId: getAwsBedrockAccessKeyId(),
++        secretAccessKey: getAwsBedrockSecretAccessKey()
++      } satisfies BedrockAccessKeyExtraOptions
+     }
+-  }
+-  // google-vertex
+-  if (aiSdkProviderId === 'google-vertex' || aiSdkProviderId === 'google-vertex-anthropic') {
++  } else if (aiSdkProviderId === 'google-vertex' || aiSdkProviderId === 'google-vertex-anthropic') {
++    // google-vertex
+     if (!isVertexAIConfigured()) {
+       throw new Error('VertexAI is not configured. Please configure project, location and service account credentials.')
+     }
+     const { project, location, googleCredentials } = createVertexProvider(actualProvider)
+-    extraOptions.project = project
+-    extraOptions.location = location
+-    extraOptions.googleCredentials = {
+-      ...googleCredentials,
+-      privateKey: formatPrivateKey(googleCredentials.privateKey)
+-    }
++    extraOptions = {
++      ...baseExtraOptions,
++      project,
++      location,
++      googleCredentials: {
++        ...googleCredentials,
++        privateKey: formatPrivateKey(googleCredentials.privateKey)
++      }
++    } satisfies VertexExtraOptions
+     baseConfig.baseURL += aiSdkProviderId === 'google-vertex' ? '/publishers/google' : '/publishers/anthropic/models'
+-  }
+-
+-  // cherryin
+-  if (aiSdkProviderId === 'cherryin') {
+-    if (model.endpoint_type) {
+-      extraOptions.endpointType = model.endpoint_type
+-    }
++  } else if (aiSdkProviderId === 'cherryin') {
+     // CherryIN API Host
+     const cherryinProvider = getProviderById(SystemProviderIds.cherryin)
++    const endpointType: EndpointType | undefined = model.endpoint_type
++    let anthropicBaseURL: string | undefined
++    let geminiBaseURL: string | undefined
+     if (cherryinProvider) {
+-      extraOptions.anthropicBaseURL = cherryinProvider.anthropicApiHost + '/v1'
+-      extraOptions.geminiBaseURL = cherryinProvider.apiHost + '/v1beta/models'
++      anthropicBaseURL = cherryinProvider.anthropicApiHost + '/v1'
++      geminiBaseURL = cherryinProvider.apiHost + '/v1beta/models'
+     }
+-  }
+-
+-  // Apply developer-to-system role conversion for providers that don't support developer role
+-  // bug: https://github.com/vercel/ai/issues/10982
+-  // fixPR: https://github.com/vercel/ai/pull/11127
+-  // TODO: but the PR don't backport to v5, the code will be removed when upgrading to v6
+-  if (!isSupportDeveloperRoleProvider(actualProvider) || !isOpenAIReasoningModel(model)) {
+-    extraOptions.fetch = createDeveloperToSystemFetch(extraOptions.fetch)
++    extraOptions = {
++      ...baseExtraOptions,
++      endpointType,
++      anthropicBaseURL,
++      geminiBaseURL
++    } satisfies CherryInExtraOptions
++  } else {
++    extraOptions = baseExtraOptions
+   }
+ 
+   if (hasProviderConfig(aiSdkProviderId) && aiSdkProviderId !== 'openai-compatible') {
++    // if the provider has a specific aisdk provider
+     const options = ProviderConfigFactory.fromProvider(aiSdkProviderId, baseConfig, extraOptions)
+     return {
+       providerId: aiSdkProviderId,
+       options
+     }
+-  }
+-
+-  // 否则fallback到openai-compatible
+-  const options = ProviderConfigFactory.createOpenAICompatible(baseConfig.baseURL, baseConfig.apiKey)
+-  return {
+-    providerId: 'openai-compatible',
+-    options: {
+-      ...options,
+-      name: actualProvider.id,
+-      ...extraOptions,
+-      includeUsage
++  } else {
++    // otherwise, fallback to openai-compatible
++    const options = ProviderConfigFactory.createOpenAICompatible(baseConfig.baseURL, baseConfig.apiKey)
++    return {
++      providerId: 'openai-compatible',
++      options: {
++        ...options,
++        name: actualProvider.id,
++        ...extraOptions,
++        includeUsage
++      }
+     }
+   }
+ }
+@@ -325,9 +407,9 @@ function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetc
+     if (options?.body && typeof options.body === 'string') {
+       try {
+         const body = JSON.parse(options.body)
+-        if (body.messages && Array.isArray(body.messages)) {
++        if (body.input && Array.isArray(body.input)) {
+           let hasChanges = false
+-          body.messages = body.messages.map((msg: { role: string }) => {
++          body.input = body.input.map((msg: { role: string }) => {
+             if (msg.role === 'developer') {
+               hasChanges = true
+               return { ...msg, role: 'system' }
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 1a16ea0..b6bd63e 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -653,6 +653,10 @@ function buildGenericProviderOptions(
+     }
+   }
+ 
++  if (isOpenAIModel(model)) {
++    providerOptions.strictJsonSchema = false
++  }
++
+   return {
+     [providerId]: providerOptions
+   }
