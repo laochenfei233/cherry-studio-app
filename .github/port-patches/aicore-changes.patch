@@ -1,0 +1,911 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 5d418de..78f5d6b 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -238,15 +238,16 @@ export class AiSdkToChunkAdapter {
+ 
+       // === 工具调用相关事件（原始 AI SDK 事件，如果没有被中间件处理） ===
+ 
+-      // case 'tool-input-start':
+-      // case 'tool-input-delta':
+-      // case 'tool-input-end':
+-      //   this.toolCallHandler.handleToolCallCreated(chunk)
+-      //   break
++      case 'tool-input-start':
++        this.toolCallHandler.handleToolInputStart(chunk)
++        break
++      case 'tool-input-delta':
++        this.toolCallHandler.handleToolInputDelta(chunk)
++        break
++      case 'tool-input-end':
++        this.toolCallHandler.handleToolInputEnd(chunk)
++        break
+ 
+-      // case 'tool-input-delta':
+-      //   this.toolCallHandler.handleToolCallCreated(chunk)
+-      //   break
+       case 'tool-call':
+         this.toolCallHandler.handleToolCall(chunk)
+         break
+diff --git a/src/aiCore/chunk/handleToolCallChunk.ts b/src/aiCore/chunk/handleToolCallChunk.ts
+index b5acbb6..61ec029 100644
+--- a/src/aiCore/chunk/handleToolCallChunk.ts
++++ b/src/aiCore/chunk/handleToolCallChunk.ts
+@@ -5,18 +5,12 @@
+  */
+ 
+ import { loggerService } from '@logger'
++import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js'
+ import { processKnowledgeReferences } from '@renderer/services/KnowledgeService'
+-import type {
+-  BaseTool,
+-  MCPCallToolResponse,
+-  MCPTool,
+-  MCPToolResponse,
+-  MCPToolResultContent,
+-  NormalToolResponse
+-} from '@renderer/types'
++import type { BaseTool, MCPTool, MCPToolResponse, NormalToolResponse } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+-import type { ToolSet, TypedToolCall, TypedToolError, TypedToolResult } from 'ai'
++import type { ProviderMetadata, ToolSet, TypedToolCall, TypedToolError, TypedToolResult } from 'ai'
+ 
+ const logger = loggerService.withContext('ToolCallChunkHandler')
+ 
+@@ -26,6 +20,8 @@ export type ToolcallsMap = {
+   args: any
+   // mcpTool 现在可以是 MCPTool 或我们为 Provider 工具创建的通用类型
+   tool: BaseTool
++  // Streaming arguments buffer
++  streamingArgs?: string
+ }
+ /**
+  * 工具调用处理器类
+@@ -71,110 +67,169 @@ export class ToolCallChunkHandler {
+     return ToolCallChunkHandler.addActiveToolCallImpl(toolCallId, map)
+   }
+ 
+-  //   /**
+-  //    * 设置 onChunk 回调
+-  //    */
+-  //   public setOnChunk(callback: (chunk: Chunk) => void): void {
+-  //     this.onChunk = callback
+-  //   }
+-
+-  // handleToolCallCreated(
+-  //   chunk:
+-  //     | {
+-  //         type: 'tool-input-start'
+-  //         id: string
+-  //         toolName: string
+-  //         providerMetadata?: ProviderMetadata
+-  //         providerExecuted?: boolean
+-  //       }
+-  //     | {
+-  //         type: 'tool-input-end'
+-  //         id: string
+-  //         providerMetadata?: ProviderMetadata
+-  //       }
+-  //     | {
+-  //         type: 'tool-input-delta'
+-  //         id: string
+-  //         delta: string
+-  //         providerMetadata?: ProviderMetadata
+-  //       }
+-  // ): void {
+-  //   switch (chunk.type) {
+-  //     case 'tool-input-start': {
+-  //       // 能拿到说明是mcpTool
+-  //       // if (this.activeToolCalls.get(chunk.id)) return
+-
+-  //       const tool: BaseTool | MCPTool = {
+-  //         id: chunk.id,
+-  //         name: chunk.toolName,
+-  //         description: chunk.toolName,
+-  //         type: chunk.toolName.startsWith('builtin_') ? 'builtin' : 'provider'
+-  //       }
+-  //       this.activeToolCalls.set(chunk.id, {
+-  //         toolCallId: chunk.id,
+-  //         toolName: chunk.toolName,
+-  //         args: '',
+-  //         tool
+-  //       })
+-  //       const toolResponse: MCPToolResponse | NormalToolResponse = {
+-  //         id: chunk.id,
+-  //         tool: tool,
+-  //         arguments: {},
+-  //         status: 'pending',
+-  //         toolCallId: chunk.id
+-  //       }
+-  //       this.onChunk({
+-  //         type: ChunkType.MCP_TOOL_PENDING,
+-  //         responses: [toolResponse]
+-  //       })
+-  //       break
+-  //     }
+-  //     case 'tool-input-delta': {
+-  //       const toolCall = this.activeToolCalls.get(chunk.id)
+-  //       if (!toolCall) {
+-  //         logger.warn(`🔧 [ToolCallChunkHandler] Tool call not found: ${chunk.id}`)
+-  //         return
+-  //       }
+-  //       toolCall.args += chunk.delta
+-  //       break
+-  //     }
+-  //     case 'tool-input-end': {
+-  //       const toolCall = this.activeToolCalls.get(chunk.id)
+-  //       this.activeToolCalls.delete(chunk.id)
+-  //       if (!toolCall) {
+-  //         logger.warn(`🔧 [ToolCallChunkHandler] Tool call not found: ${chunk.id}`)
+-  //         return
+-  //       }
+-  //       // const toolResponse: ToolCallResponse = {
+-  //       //   id: toolCall.toolCallId,
+-  //       //   tool: toolCall.tool,
+-  //       //   arguments: toolCall.args,
+-  //       //   status: 'pending',
+-  //       //   toolCallId: toolCall.toolCallId
+-  //       // }
+-  //       // logger.debug('toolResponse', toolResponse)
+-  //       // this.onChunk({
+-  //       //   type: ChunkType.MCP_TOOL_PENDING,
+-  //       //   responses: [toolResponse]
+-  //       // })
+-  //       break
+-  //     }
+-  //   }
+-  //   // if (!toolCall) {
+-  //   //   Logger.warn(`🔧 [ToolCallChunkHandler] Tool call not found: ${chunk.id}`)
+-  //   //   return
+-  //   // }
+-  //   // this.onChunk({
+-  //   //   type: ChunkType.MCP_TOOL_CREATED,
+-  //   //   tool_calls: [
+-  //   //     {
+-  //   //       id: chunk.id,
+-  //   //       name: chunk.toolName,
+-  //   //       status: 'pending'
+-  //   //     }
+-  //   //   ]
+-  //   // })
+-  // }
++  /**
++   * 根据工具名称确定工具类型
++   */
++  private determineToolType(toolName: string, toolCallId: string): BaseTool {
++    let mcpTool: MCPTool | undefined
++    if (toolName.startsWith('builtin_')) {
++      return {
++        id: toolCallId,
++        name: toolName,
++        description: toolName,
++        type: 'builtin'
++      } as BaseTool
++    } else if ((mcpTool = this.mcpTools.find((t) => t.id === toolName) as MCPTool)) {
++      return mcpTool
++    } else {
++      return {
++        id: toolCallId,
++        name: toolName,
++        description: toolName,
++        type: 'provider'
++      }
++    }
++  }
++
++  /**
++   * 处理工具输入开始事件 - 流式参数开始
++   */
++  public handleToolInputStart(chunk: {
++    type: 'tool-input-start'
++    id: string
++    toolName: string
++    providerMetadata?: ProviderMetadata
++    providerExecuted?: boolean
++  }): void {
++    const { id: toolCallId, toolName, providerExecuted } = chunk
++
++    if (!toolCallId || !toolName) {
++      logger.warn(`🔧 [ToolCallChunkHandler] Invalid tool-input-start chunk: missing id or toolName`)
++      return
++    }
++
++    // 如果已存在，跳过
++    if (this.activeToolCalls.has(toolCallId)) {
++      return
++    }
++
++    let tool: BaseTool
++    if (providerExecuted) {
++      tool = {
++        id: toolCallId,
++        name: toolName,
++        description: toolName,
++        type: 'provider'
++      } as BaseTool
++    } else {
++      tool = this.determineToolType(toolName, toolCallId)
++    }
++
++    // 初始化流式工具调用
++    this.addActiveToolCall(toolCallId, {
++      toolCallId,
++      toolName,
++      args: undefined,
++      tool,
++      streamingArgs: ''
++    })
++
++    logger.info(`🔧 [ToolCallChunkHandler] Tool input streaming started: ${toolName} (${toolCallId})`)
++
++    // 发送初始 streaming chunk
++    const toolResponse: MCPToolResponse | NormalToolResponse = {
++      id: toolCallId,
++      tool: tool,
++      arguments: undefined,
++      status: 'streaming',
++      toolCallId: toolCallId,
++      partialArguments: ''
++    }
++
++    this.onChunk({
++      type: ChunkType.MCP_TOOL_STREAMING,
++      responses: [toolResponse]
++    })
++  }
++
++  /**
++   * 处理工具输入增量事件 - 流式参数片段
++   */
++  public handleToolInputDelta(chunk: {
++    type: 'tool-input-delta'
++    id: string
++    delta: string
++    providerMetadata?: ProviderMetadata
++  }): void {
++    const { id: toolCallId, delta } = chunk
++
++    const toolCall = this.activeToolCalls.get(toolCallId)
++    if (!toolCall) {
++      logger.warn(`🔧 [ToolCallChunkHandler] Tool call not found for delta: ${toolCallId}`)
++      return
++    }
++
++    // 累积流式参数
++    toolCall.streamingArgs = (toolCall.streamingArgs || '') + delta
++
++    // 发送 streaming chunk 更新
++    const toolResponse: MCPToolResponse | NormalToolResponse = {
++      id: toolCallId,
++      tool: toolCall.tool,
++      arguments: undefined,
++      status: 'streaming',
++      toolCallId: toolCallId,
++      partialArguments: toolCall.streamingArgs
++    }
++
++    this.onChunk({
++      type: ChunkType.MCP_TOOL_STREAMING,
++      responses: [toolResponse]
++    })
++  }
++
++  /**
++   * 处理工具输入结束事件 - 流式参数完成
++   */
++  public handleToolInputEnd(chunk: { type: 'tool-input-end'; id: string; providerMetadata?: ProviderMetadata }): void {
++    const { id: toolCallId } = chunk
++
++    const toolCall = this.activeToolCalls.get(toolCallId)
++    if (!toolCall) {
++      logger.warn(`🔧 [ToolCallChunkHandler] Tool call not found for end: ${toolCallId}`)
++      return
++    }
++
++    // 尝试解析完整的 JSON 参数
++    let parsedArgs: any = undefined
++    if (toolCall.streamingArgs) {
++      try {
++        parsedArgs = JSON.parse(toolCall.streamingArgs)
++        toolCall.args = parsedArgs
++      } catch (e) {
++        logger.warn(`🔧 [ToolCallChunkHandler] Failed to parse streaming args for ${toolCallId}:`, e as Error)
++        // 保留原始字符串
++        toolCall.args = toolCall.streamingArgs
++      }
++    }
++
++    logger.info(`🔧 [ToolCallChunkHandler] Tool input streaming completed: ${toolCall.toolName} (${toolCallId})`)
++
++    // 发送 streaming 完成 chunk
++    const toolResponse: MCPToolResponse | NormalToolResponse = {
++      id: toolCallId,
++      tool: toolCall.tool,
++      arguments: parsedArgs,
++      status: 'pending',
++      toolCallId: toolCallId,
++      partialArguments: toolCall.streamingArgs
++    }
++
++    this.onChunk({
++      type: ChunkType.MCP_TOOL_STREAMING,
++      responses: [toolResponse]
++    })
++  }
+ 
+   /**
+    * 处理工具调用事件
+@@ -191,6 +246,15 @@ export class ToolCallChunkHandler {
+       return
+     }
+ 
++    // Check if this tool call was already processed via streaming events
++    const existingToolCall = this.activeToolCalls.get(toolCallId)
++    if (existingToolCall?.streamingArgs !== undefined) {
++      // Tool call was already processed via streaming events (tool-input-start/delta/end)
++      // Update args if needed, but don't emit duplicate pending chunk
++      existingToolCall.args = args
++      return
++    }
++
+     let tool: BaseTool
+     let mcpTool: MCPTool | undefined
+     // 根据 providerExecuted 标志区分处理逻辑
+@@ -216,11 +280,6 @@ export class ToolCallChunkHandler {
+       // 如果是客户端执行的 MCP 工具，沿用现有逻辑
+       // toolName is mcpTool.id (registered with id as key in convertMcpToolsToAiSdkTools)
+       logger.info(`[ToolCallChunkHandler] Handling client-side MCP tool: ${toolName}`)
+-      // mcpTool = this.mcpTools.find((t) => t.name === toolName) as MCPTool
+-      // if (!mcpTool) {
+-      //   logger.warn(`[ToolCallChunkHandler] MCP tool not found: ${toolName}`)
+-      //   return
+-      // }
+       tool = mcpTool
+     } else {
+       tool = {
+@@ -357,40 +416,20 @@ export class ToolCallChunkHandler {
+ 
+ export const addActiveToolCall = ToolCallChunkHandler.addActiveToolCall.bind(ToolCallChunkHandler)
+ 
++/**
++ * 从工具输出中提取图片（使用 MCP SDK 类型安全验证）
++ */
+ function extractImagesFromToolOutput(output: unknown): string[] {
+   if (!output) {
+     return []
+   }
+ 
+-  const contents: unknown[] = []
+-
+-  if (isMcpCallToolResponse(output)) {
+-    contents.push(...output.content)
+-  } else if (Array.isArray(output)) {
+-    contents.push(...output)
+-  } else if (hasContentArray(output)) {
+-    contents.push(...output.content)
+-  }
+-
+-  return contents
+-    .filter(isMcpImageContent)
+-    .map((content) => `data:${content.mimeType ?? 'image/png'};base64,${content.data}`)
+-}
+-
+-function isMcpCallToolResponse(value: unknown): value is MCPCallToolResponse {
+-  return typeof value === 'object' && value !== null && Array.isArray((value as MCPCallToolResponse).content)
+-}
+-
+-function hasContentArray(value: unknown): value is { content: unknown[] } {
+-  return typeof value === 'object' && value !== null && Array.isArray((value as { content?: unknown }).content)
+-}
+-
+-function isMcpImageContent(content: unknown): content is MCPToolResultContent & { data: string } {
+-  if (typeof content !== 'object' || content === null) {
+-    return false
++  const result = CallToolResultSchema.safeParse(output)
++  if (result.success) {
++    return result.data.content
++      .filter((c) => c.type === 'image')
++      .map((content) => `data:${content.mimeType ?? 'image/png'};base64,${content.data}`)
+   }
+ 
+-  const resultContent = content as MCPToolResultContent
+-
+-  return resultContent.type === 'image' && typeof resultContent.data === 'string'
++  return []
+ }
+diff --git a/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts b/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
+index 991c436..3c9e845 100644
+--- a/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
++++ b/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
+@@ -84,7 +84,7 @@ vi.mock('@renderer/config/models', () => ({
+     defaultModel: []
+   },
+   isOpenAIModel: vi.fn(() => false),
+-  glm45FlashModel: {},
++  qwen3Next80BModel: {},
+   qwen38bModel: {}
+ }))
+ 
+diff --git a/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts b/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
+index bcff572..9cc0a92 100644
+--- a/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
++++ b/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
+@@ -36,7 +36,7 @@ vi.mock('@renderer/config/models', () => ({
+   isFunctionCallingModel: vi.fn().mockReturnValue(false),
+   DEFAULT_MAX_TOKENS: 4096,
+   qwen38bModel: {},
+-  glm45FlashModel: {}
++  qwen3Next80BModel: {}
+ }))
+ 
+ vi.mock('@renderer/services/AssistantService', () => ({
+diff --git a/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts b/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts
+index b72e0a8..0d5d302 100644
+--- a/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts
++++ b/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts
+@@ -38,7 +38,7 @@ export class CherryAiAPIClient extends OpenAIAPIClient {
+   }
+ 
+   public async listModels(): Promise<OpenAI.Models.Model[]> {
+-    const models = ['glm-4.5-flash', 'Qwen/Qwen3-8B']
++    const models = ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Next-80B-A3B-Instruct']
+ 
+     const created = Date.now()
+     return models.map((id) => ({
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index eba16c6..3f27fe7 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -45,7 +45,7 @@ export async function convertMessageToSdkParam(
+   if (message.role === 'user' || message.role === 'system') {
+     return convertMessageToUserModelMessage(content, fileBlocks, imageBlocks, isVisionModel, model)
+   } else {
+-    return convertMessageToAssistantModelMessage(content, fileBlocks, reasoningBlocks, model)
++    return convertMessageToAssistantModelMessage(content, fileBlocks, imageBlocks, reasoningBlocks, model)
+   }
+ }
+ 
+@@ -155,10 +155,13 @@ async function convertMessageToUserModelMessage(
+ 
+ /**
+  * 转换为助手模型消息
++ * 注意：当助手消息只包含图片（如图片生成模型的响应）而没有文本时，
++ * 需要添加占位文本，因为某些 API（如 Gemini）不接受空的 assistant 消息
+  */
+ async function convertMessageToAssistantModelMessage(
+   content: string,
+   fileBlocks: FileMessageBlock[],
++  imageBlocks: ImageMessageBlock[],
+   thinkingBlocks: ThinkingMessageBlock[],
+   model?: Model
+ ): Promise<AssistantModelMessage> {
+@@ -188,6 +191,12 @@ async function convertMessageToAssistantModelMessage(
+     }
+   }
+ 
++  // 当 parts 为空但有图片时，添加占位文本
++  // 这对于图片生成模型的继续对话很重要，因为助手消息可能只包含生成的图片
++  if (parts.length === 0 && imageBlocks.length > 0) {
++    parts.push({ type: 'text', text: '[Image]' })
++  }
++
+   return {
+     role: 'assistant',
+     content: parts
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index bdee5fc..a9b69f0 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -11,6 +11,7 @@ import { createVertexProvider, isVertexAIConfigured } from '@renderer/hooks/useV
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+ import { getProviderById } from '@renderer/services/ProviderService'
+ import store from '@renderer/store'
++import type { EndpointType } from '@renderer/types'
+ import { isSystemProvider, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { OpenAICompletionsStreamOptions } from '@renderer/types/aiCoreTypes'
+ import {
+@@ -140,6 +141,48 @@ export function adaptProvider({ provider, model }: { provider: Provider; model?:
+   return adaptedProvider
+ }
+ 
++interface BaseExtraOptions {
++  fetch?: typeof fetch
++  endpoint: string
++  mode?: 'responses' | 'chat'
++  headers: Record<string, string>
++}
++
++interface AzureOpenAIExtraOptions extends BaseExtraOptions {
++  apiVersion: string
++  useDeploymentBasedUrls: true | undefined
++}
++
++interface BedrockApiKeyExtraOptions extends BaseExtraOptions {
++  region: string
++  apiKey: string
++}
++
++interface BedrockAccessKeyExtraOptions extends BaseExtraOptions {
++  region: string
++  accessKeyId: string
++  secretAccessKey: string
++}
++
++type BedrockExtraOptions = BedrockApiKeyExtraOptions | BedrockAccessKeyExtraOptions
++
++interface VertexExtraOptions extends BaseExtraOptions {
++  project: string
++  location: string
++  googleCredentials: {
++    privateKey: string
++    clientEmail: string
++  }
++}
++
++interface CherryInExtraOptions extends BaseExtraOptions {
++  endpointType?: EndpointType
++  anthropicBaseURL?: string
++  geminiBaseURL?: string
++}
++
++type ExtraOptions = BedrockExtraOptions | AzureOpenAIExtraOptions | VertexExtraOptions | CherryInExtraOptions
++
+ /**
+  * 将 Provider 配置转换为新 AI SDK 格式
+  * 简化版：利用新的别名映射系统
+@@ -158,6 +201,8 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     includeUsage = store.getState().settings.openAI?.streamOptions?.includeUsage
+   }
+ 
++  // Specially, some providers which need to early return
++  // Copilot
+   const isCopilotProvider = actualProvider.id === SystemProviderIds.copilot
+   if (isCopilotProvider) {
+     const storedHeaders = store.getState().copilot.defaultHeaders ?? {}
+@@ -177,6 +222,7 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
++  // Ollama
+   if (isOllamaProvider(actualProvider)) {
+     return {
+       providerId: 'ollama',
+@@ -190,106 +236,142 @@ export function providerToAiSdkConfig(actualProvider: Provider, model: Model): A
+     }
+   }
+ 
+-  // 处理OpenAI模式
+-  const extraOptions: any = {}
+-  extraOptions.endpoint = endpoint
+-  if (actualProvider.type === 'openai-response' && !isOpenAIChatCompletionOnlyModel(model)) {
+-    extraOptions.mode = 'responses'
+-  } else if (aiSdkProviderId === 'openai' || (aiSdkProviderId === 'cherryin' && actualProvider.type === 'openai')) {
+-    extraOptions.mode = 'chat'
++  // Generally, construct extraOptions according to provider & model
++  // Consider as OpenAI like provider
++
++  // Construct baseExtraOptions first
++  // About mode of azure:
++  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
++  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses?tabs=python-key#responses-api
++  let mode: BaseExtraOptions['mode']
++  if (
++    (actualProvider.type === 'openai-response' && !isOpenAIChatCompletionOnlyModel(model)) ||
++    aiSdkProviderId === 'azure-responses'
++  ) {
++    mode = 'responses'
++  } else if (
++    aiSdkProviderId === 'openai' ||
++    (aiSdkProviderId === 'cherryin' && actualProvider.type === 'openai') ||
++    aiSdkProviderId === 'azure'
++  ) {
++    mode = 'chat'
+   }
+ 
+-  extraOptions.headers = {
++  const headers: BaseExtraOptions['headers'] = {
+     ...defaultAppHeaders(),
+     ...actualProvider.extra_headers
+   }
+-
+   if (aiSdkProviderId === 'openai') {
+-    extraOptions.headers['X-Api-Key'] = baseConfig.apiKey
++    if (actualProvider.extra_headers?.['X-Api-Key'] === undefined) {
++      headers['X-Api-Key'] = baseConfig.apiKey
++    }
+   }
+-  // azure
+-  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/latest
+-  // https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses?tabs=python-key#responses-api
+-  if (aiSdkProviderId === 'azure-responses') {
+-    extraOptions.mode = 'responses'
+-  } else if (aiSdkProviderId === 'azure') {
+-    extraOptions.mode = 'chat'
++
++  let _fetch: typeof fetch | undefined
++
++  // Apply developer-to-system role conversion for providers that don't support developer role
++  // bug: https://github.com/vercel/ai/issues/10982
++  // fixPR: https://github.com/vercel/ai/pull/11127
++  // TODO: but the PR don't backport to v5, the code will be removed when upgrading to v6
++  if (!isSupportDeveloperRoleProvider(actualProvider) || !isOpenAIReasoningModel(model)) {
++    _fetch = createDeveloperToSystemFetch(fetch)
+   }
++
++  const baseExtraOptions = {
++    fetch: _fetch,
++    endpoint,
++    mode,
++    headers
++  } as const satisfies BaseExtraOptions
++
++  // Create specifical fields in extraOptions for different provider
++  let extraOptions: ExtraOptions | undefined
+   if (isAzureOpenAIProvider(actualProvider)) {
+     const apiVersion = actualProvider.apiVersion?.trim()
++    let useDeploymentBasedUrls: true | undefined
+     if (apiVersion) {
+-      extraOptions.apiVersion = apiVersion
+       if (!['preview', 'v1'].includes(apiVersion)) {
+-        extraOptions.useDeploymentBasedUrls = true
++        useDeploymentBasedUrls = true
+       }
+     }
+-  }
+-
+-  // bedrock
+-  if (aiSdkProviderId === 'bedrock') {
++    extraOptions = {
++      ...baseExtraOptions,
++      apiVersion,
++      useDeploymentBasedUrls
++    } satisfies AzureOpenAIExtraOptions
++  } else if (aiSdkProviderId === 'bedrock') {
++    // bedrock
+     const authType = getAwsBedrockAuthType()
+-    extraOptions.region = getAwsBedrockRegion()
++    const region = getAwsBedrockRegion()
+ 
+     if (authType === 'apiKey') {
+-      extraOptions.apiKey = getAwsBedrockApiKey()
++      extraOptions = {
++        ...baseExtraOptions,
++        region,
++        apiKey: getAwsBedrockApiKey()
++      } satisfies BedrockApiKeyExtraOptions
+     } else {
+-      extraOptions.accessKeyId = getAwsBedrockAccessKeyId()
+-      extraOptions.secretAccessKey = getAwsBedrockSecretAccessKey()
++      extraOptions = {
++        ...baseExtraOptions,
++        region,
++        accessKeyId: getAwsBedrockAccessKeyId(),
++        secretAccessKey: getAwsBedrockSecretAccessKey()
++      } satisfies BedrockAccessKeyExtraOptions
+     }
+-  }
+-  // google-vertex
+-  if (aiSdkProviderId === 'google-vertex' || aiSdkProviderId === 'google-vertex-anthropic') {
++  } else if (aiSdkProviderId === 'google-vertex' || aiSdkProviderId === 'google-vertex-anthropic') {
++    // google-vertex
+     if (!isVertexAIConfigured()) {
+       throw new Error('VertexAI is not configured. Please configure project, location and service account credentials.')
+     }
+     const { project, location, googleCredentials } = createVertexProvider(actualProvider)
+-    extraOptions.project = project
+-    extraOptions.location = location
+-    extraOptions.googleCredentials = {
+-      ...googleCredentials,
+-      privateKey: formatPrivateKey(googleCredentials.privateKey)
+-    }
++    extraOptions = {
++      ...baseExtraOptions,
++      project,
++      location,
++      googleCredentials: {
++        ...googleCredentials,
++        privateKey: formatPrivateKey(googleCredentials.privateKey)
++      }
++    } satisfies VertexExtraOptions
+     baseConfig.baseURL += aiSdkProviderId === 'google-vertex' ? '/publishers/google' : '/publishers/anthropic/models'
+-  }
+-
+-  // cherryin
+-  if (aiSdkProviderId === 'cherryin') {
+-    if (model.endpoint_type) {
+-      extraOptions.endpointType = model.endpoint_type
+-    }
++  } else if (aiSdkProviderId === 'cherryin') {
+     // CherryIN API Host
+     const cherryinProvider = getProviderById(SystemProviderIds.cherryin)
++    const endpointType: EndpointType | undefined = model.endpoint_type
++    let anthropicBaseURL: string | undefined
++    let geminiBaseURL: string | undefined
+     if (cherryinProvider) {
+-      extraOptions.anthropicBaseURL = cherryinProvider.anthropicApiHost + '/v1'
+-      extraOptions.geminiBaseURL = cherryinProvider.apiHost + '/v1beta/models'
++      anthropicBaseURL = cherryinProvider.anthropicApiHost + '/v1'
++      geminiBaseURL = cherryinProvider.apiHost + '/v1beta/models'
+     }
+-  }
+-
+-  // Apply developer-to-system role conversion for providers that don't support developer role
+-  // bug: https://github.com/vercel/ai/issues/10982
+-  // fixPR: https://github.com/vercel/ai/pull/11127
+-  // TODO: but the PR don't backport to v5, the code will be removed when upgrading to v6
+-  if (!isSupportDeveloperRoleProvider(actualProvider) || !isOpenAIReasoningModel(model)) {
+-    extraOptions.fetch = createDeveloperToSystemFetch(extraOptions.fetch)
++    extraOptions = {
++      ...baseExtraOptions,
++      endpointType,
++      anthropicBaseURL,
++      geminiBaseURL
++    } satisfies CherryInExtraOptions
++  } else {
++    extraOptions = baseExtraOptions
+   }
+ 
+   if (hasProviderConfig(aiSdkProviderId) && aiSdkProviderId !== 'openai-compatible') {
++    // if the provider has a specific aisdk provider
+     const options = ProviderConfigFactory.fromProvider(aiSdkProviderId, baseConfig, extraOptions)
+     return {
+       providerId: aiSdkProviderId,
+       options
+     }
+-  }
+-
+-  // 否则fallback到openai-compatible
+-  const options = ProviderConfigFactory.createOpenAICompatible(baseConfig.baseURL, baseConfig.apiKey)
+-  return {
+-    providerId: 'openai-compatible',
+-    options: {
+-      ...options,
+-      name: actualProvider.id,
+-      ...extraOptions,
+-      includeUsage
++  } else {
++    // otherwise, fallback to openai-compatible
++    const options = ProviderConfigFactory.createOpenAICompatible(baseConfig.baseURL, baseConfig.apiKey)
++    return {
++      providerId: 'openai-compatible',
++      options: {
++        ...options,
++        name: actualProvider.id,
++        ...extraOptions,
++        includeUsage
++      }
+     }
+   }
+ }
+@@ -315,6 +397,10 @@ export function isModernSdkSupported(provider: Provider): boolean {
+  * Creates a custom fetch wrapper that converts 'developer' role to 'system' role in request body.
+  * This is needed for providers that don't support the 'developer' role (e.g., Azure DeepSeek R1).
+  *
++ * Handles both:
++ * - Responses API format: body.input array
++ * - Chat Completions API format: body.messages array
++ *
+  * @param originalFetch - Optional original fetch function to wrap
+  * @returns A fetch function that transforms the request body
+  */
+@@ -325,8 +411,10 @@ function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetc
+     if (options?.body && typeof options.body === 'string') {
+       try {
+         const body = JSON.parse(options.body)
++        let hasChanges = false
++
++        // Handle Responses API format (body.input)
+         if (body.input && Array.isArray(body.input)) {
+-          let hasChanges = false
+           body.input = body.input.map((msg: { role: string }) => {
+             if (msg.role === 'developer') {
+               hasChanges = true
+@@ -334,11 +422,23 @@ function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetc
+             }
+             return msg
+           })
+-          if (hasChanges) {
+-            options = {
+-              ...options,
+-              body: JSON.stringify(body)
++        }
++
++        // Handle Chat Completions API format (body.messages)
++        if (body.messages && Array.isArray(body.messages)) {
++          body.messages = body.messages.map((msg: { role: string }) => {
++            if (msg.role === 'developer') {
++              hasChanges = true
++              return { ...msg, role: 'system' }
+             }
++            return msg
++          })
++        }
++
++        if (hasChanges) {
++          options = {
++            ...options,
++            body: JSON.stringify(body)
+           }
+         }
+       } catch {
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index c57dc31..8ccd824 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -28,6 +28,7 @@ import {
+   isSupportedThinkingTokenDoubaoModel,
+   isSupportedThinkingTokenGeminiModel,
+   isSupportedThinkingTokenHunyuanModel,
++  isSupportedThinkingTokenKimiModel,
+   isSupportedThinkingTokenMiMoModel,
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+@@ -82,10 +83,10 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+ 
+     // providers that use enable_thinking
+     if (
+-      isSupportEnableThinkingProvider(provider) &&
+-      (isSupportedThinkingTokenQwenModel(model) ||
+-        isSupportedThinkingTokenHunyuanModel(model) ||
+-        (provider.id === SystemProviderIds.dashscope && isDeepSeekHybridInferenceModel(model)))
++      (isSupportEnableThinkingProvider(provider) &&
++        (isSupportedThinkingTokenQwenModel(model) || isSupportedThinkingTokenHunyuanModel(model))) ||
++      (provider.id === SystemProviderIds.dashscope &&
++        (isDeepSeekHybridInferenceModel(model) || isSupportedThinkingTokenZhipuModel(model)))
+     ) {
+       return { enable_thinking: false }
+     }
+@@ -109,7 +110,11 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     }
+ 
+     // use thinking, doubao, zhipu, etc.
+-    if (isSupportedThinkingTokenDoubaoModel(model) || isSupportedThinkingTokenZhipuModel(model)) {
++    if (
++      isSupportedThinkingTokenDoubaoModel(model) ||
++      isSupportedThinkingTokenZhipuModel(model) ||
++      isSupportedThinkingTokenKimiModel(model)
++    ) {
+       if (provider.id === SystemProviderIds.cerebras) {
+         return {
+           disable_reasoning: true
+@@ -309,18 +314,24 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     }
+   }
+ 
++  // https://help.aliyun.com/zh/model-studio/deep-thinking
++  if (provider.id === SystemProviderIds.dashscope) {
++    // For dashscope: Qwen, DeepSeek, and GLM models use enable_thinking to control thinking
++    // No effort, only on/off
++    if (isQwenReasoningModel(model) || isSupportedThinkingTokenZhipuModel(model)) {
++      return {
++        enable_thinking: true,
++        thinking_budget: budgetTokens
++      }
++    }
++  }
++
+   // Qwen models, use enable_thinking
+   if (isQwenReasoningModel(model)) {
+     const thinkConfig = {
+       enable_thinking: isQwenAlwaysThinkModel(model) || !isSupportEnableThinkingProvider(provider) ? undefined : true,
+       thinking_budget: budgetTokens
+     }
+-    if (provider.id === SystemProviderIds.dashscope) {
+-      return {
+-        ...thinkConfig,
+-        incremental_output: true
+-      }
+-    }
+     return thinkConfig
+   }
+ 
+@@ -413,7 +424,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     return { thinking: { type: 'enabled' } }
+   }
+ 
+-  if (isSupportedThinkingTokenMiMoModel(model)) {
++  if (isSupportedThinkingTokenMiMoModel(model) || isSupportedThinkingTokenKimiModel(model)) {
+     return {
+       thinking: { type: 'enabled' }
+     }
