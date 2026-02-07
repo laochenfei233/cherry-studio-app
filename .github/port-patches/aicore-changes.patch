@@ -1,0 +1,549 @@
+diff --git a/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts b/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
+index 991c436..3c9e845 100644
+--- a/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
++++ b/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
+@@ -84,7 +84,7 @@ vi.mock('@renderer/config/models', () => ({
+     defaultModel: []
+   },
+   isOpenAIModel: vi.fn(() => false),
+-  glm45FlashModel: {},
++  qwen3Next80BModel: {},
+   qwen38bModel: {}
+ }))
+ 
+diff --git a/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts b/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
+index bcff572..9cc0a92 100644
+--- a/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
++++ b/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
+@@ -36,7 +36,7 @@ vi.mock('@renderer/config/models', () => ({
+   isFunctionCallingModel: vi.fn().mockReturnValue(false),
+   DEFAULT_MAX_TOKENS: 4096,
+   qwen38bModel: {},
+-  glm45FlashModel: {}
++  qwen3Next80BModel: {}
+ }))
+ 
+ vi.mock('@renderer/services/AssistantService', () => ({
+diff --git a/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts b/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts
+index b72e0a8..0d5d302 100644
+--- a/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts
++++ b/src/aiCore/legacy/clients/cherryai/CherryAiAPIClient.ts
+@@ -38,7 +38,7 @@ export class CherryAiAPIClient extends OpenAIAPIClient {
+   }
+ 
+   public async listModels(): Promise<OpenAI.Models.Model[]> {
+-    const models = ['glm-4.5-flash', 'Qwen/Qwen3-8B']
++    const models = ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Next-80B-A3B-Instruct']
+ 
+     const created = Date.now()
+     return models.map((id) => ({
+diff --git a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+index 0df303e..298179a 100644
+--- a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
++++ b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+@@ -50,7 +50,9 @@ export const ImageGenerationMiddleware: CompletionsMiddleware =
+               if (!block.file) return null
+               const binaryData: Uint8Array = await FileManager.readBinaryImage(block.file)
+               const mimeType = `${block.file.type}/${block.file.ext.slice(1)}`
+-              return await toFile(new Blob([binaryData]), block.file.origin_name || 'image.png', { type: mimeType })
++              return await toFile(new Blob([binaryData.slice()]), block.file.origin_name || 'image.png', {
++                type: mimeType
++              })
+             })
+           )
+           imageFiles = imageFiles.concat(userImages.filter(Boolean) as Blob[])
+diff --git a/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts b/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
+index da318ea..3fc72be 100644
+--- a/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
++++ b/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
+@@ -1,10 +1,23 @@
++import { loggerService } from '@logger'
+ import type { LanguageModelMiddleware } from 'ai'
+ 
++const logger = loggerService.withContext('skipGeminiThoughtSignatureMiddleware')
++
+ /**
+  * skip Gemini Thought Signature Middleware
+  * 由于多模型客户端请求的复杂性（可以中途切换其他模型），这里选择通过中间件方式添加跳过所有 Gemini3 思考签名
+  * Due to the complexity of multi-model client requests (which can switch to other models mid-process),
+  * it was decided to add a skip for all Gemini3 thinking signatures via middleware.
++ *
++ * Handles multiple cases:
++ * 1. Parts from a previous Gemini response that already have providerOptions.google.thoughtSignature
++ *    -> Replace with magic string to skip validation
++ * 2. Reasoning parts from conversation replay (ThinkingMessageBlock -> { type: 'reasoning' })
++ *    that have NO providerOptions at all (lost during message serialization/deserialization)
++ *    -> Add providerOptions with magic string
++ * 3. Tool-call parts that need thought_signature for OpenAI-compatible API
++ *    -> Add providerOptions.openaiCompatible.extra_content.google.thought_signature
++ *
+  * @param aiSdkId AI SDK Provider ID
+  * @returns LanguageModelMiddleware
+  */
+@@ -15,14 +28,43 @@ export function skipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageM
+ 
+     transformParams: async ({ params }) => {
+       const transformedParams = { ...params }
++      logger.debug('transformedParams', transformedParams)
+       // Process messages in prompt
+       if (transformedParams.prompt && Array.isArray(transformedParams.prompt)) {
+         transformedParams.prompt = transformedParams.prompt.map((message) => {
+           if (typeof message.content !== 'string') {
+             for (const part of message.content) {
+-              const googleOptions = part?.providerOptions?.[aiSdkId]
+-              if (googleOptions?.thoughtSignature) {
+-                googleOptions.thoughtSignature = MAGIC_STRING
++              const hasExistingSignature = part?.providerOptions?.[aiSdkId]?.thoughtSignature
++              const isReasoningPart = part.type === 'reasoning'
++              const isToolCallPart = part.type === 'tool-call'
++
++              // Case 1 & 2: Native Gemini path - add thoughtSignature to google providerOptions
++              if (hasExistingSignature || isReasoningPart) {
++                if (!part.providerOptions) {
++                  part.providerOptions = {}
++                }
++                if (!part.providerOptions[aiSdkId]) {
++                  part.providerOptions[aiSdkId] = {}
++                }
++                part.providerOptions[aiSdkId].thoughtSignature = MAGIC_STRING
++              }
++
++              // Case 3: OpenAI-compatible path - add extra_content for tool-call parts
++              // All tool-calls need the signature for Gemini OpenAI-compatible API
++              if (isToolCallPart) {
++                if (!part.providerOptions) {
++                  part.providerOptions = {}
++                }
++                if (!part.providerOptions.openaiCompatible) {
++                  part.providerOptions.openaiCompatible = {}
++                }
++                // Google OpenAI-compatible API expects extra_content.google.thought_signature
++                // See: https://ai.google.dev/gemini-api/docs/thought-signatures#openai
++                part.providerOptions.openaiCompatible.extra_content = {
++                  google: {
++                    thought_signature: MAGIC_STRING
++                  }
++                }
+               }
+             }
+           }
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index 4f76cbe..c217606 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -252,14 +252,59 @@ describe('messageConverter', () => {
+ 
+       const result = await convertMessageToSdkParam(message, false, model)
+ 
++      // Reasoning blocks must come before text blocks (required by AWS Bedrock for Claude extended thinking)
+       expect(result).toEqual({
+         role: 'assistant',
+         content: [
+-          { type: 'text', text: 'Here is my answer' },
+-          { type: 'reasoning', text: 'Let me think...' }
++          { type: 'reasoning', text: 'Let me think...' },
++          { type: 'text', text: 'Here is my answer' }
+         ]
+       })
+     })
++
++    it('excludes empty content from assistant messages', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = ''
++      message.__mockThinkingBlocks = [createThinkingBlock(message.id, { content: 'Thinking only' })]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      // Empty content should not create a text block
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [{ type: 'reasoning', text: 'Thinking only' }]
++      })
++    })
++
++    it('excludes whitespace-only content from assistant messages', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = '   \n\t  '
++      message.__mockThinkingBlocks = [createThinkingBlock(message.id, { content: 'Thinking only' })]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      // Whitespace-only content should not create a text block
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [{ type: 'reasoning', text: 'Thinking only' }]
++      })
++    })
++
++    it('trims content in assistant messages', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = '  Trimmed answer  \n'
++      message.__mockThinkingBlocks = []
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [{ type: 'text', text: 'Trimmed answer' }]
++      })
++    })
+   })
+ 
+   describe('convertMessagesToSdkMessages', () => {
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index eba16c6..98c62f9 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -45,7 +45,7 @@ export async function convertMessageToSdkParam(
+   if (message.role === 'user' || message.role === 'system') {
+     return convertMessageToUserModelMessage(content, fileBlocks, imageBlocks, isVisionModel, model)
+   } else {
+-    return convertMessageToAssistantModelMessage(content, fileBlocks, reasoningBlocks, model)
++    return convertMessageToAssistantModelMessage(content, fileBlocks, imageBlocks, reasoningBlocks, model)
+   }
+ }
+ 
+@@ -155,22 +155,29 @@ async function convertMessageToUserModelMessage(
+ 
+ /**
+  * 转换为助手模型消息
++ * 注意：当助手消息只包含图片（如图片生成模型的响应）而没有文本时，
++ * 需要添加占位文本，因为某些 API（如 Gemini）不接受空的 assistant 消息
+  */
+ async function convertMessageToAssistantModelMessage(
+   content: string,
+   fileBlocks: FileMessageBlock[],
++  imageBlocks: ImageMessageBlock[],
+   thinkingBlocks: ThinkingMessageBlock[],
+   model?: Model
+ ): Promise<AssistantModelMessage> {
+   const parts: Array<TextPart | ReasoningPart | FilePart> = []
+-  if (content) {
+-    parts.push({ type: 'text', text: content })
+-  }
+ 
++  // Add reasoning blocks first (required by AWS Bedrock for Claude extended thinking)
+   for (const thinkingBlock of thinkingBlocks) {
+     parts.push({ type: 'reasoning', text: thinkingBlock.content })
+   }
+ 
++  // Add text content after reasoning blocks, only if non-empty after trimming
++  const trimmedContent = content?.trim()
++  if (trimmedContent) {
++    parts.push({ type: 'text', text: trimmedContent })
++  }
++
+   for (const fileBlock of fileBlocks) {
+     // 优先尝试原生文件支持（PDF等）
+     if (model) {
+@@ -188,6 +195,12 @@ async function convertMessageToAssistantModelMessage(
+     }
+   }
+ 
++  // 当 parts 为空但有图片时，添加占位文本
++  // 这对于图片生成模型的继续对话很重要，因为助手消息可能只包含生成的图片
++  if (parts.length === 0 && imageBlocks.length > 0) {
++    parts.push({ type: 'text', text: '[Image]' })
++  }
++
+   return {
+     role: 'assistant',
+     content: parts
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 8c8187e..9d15bd2 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -27,7 +27,6 @@ import {
+   isWebSearchModel
+ } from '@renderer/config/models'
+ import { getHubModeSystemPrompt } from '@renderer/config/prompts-code-mode'
+-import { fetchAllActiveServerTools } from '@renderer/services/ApiService'
+ import { getDefaultModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+@@ -248,8 +247,7 @@ export async function buildStreamTextParams(
+   let systemPrompt = assistant.prompt ? await replacePromptVariables(assistant.prompt, model.name) : ''
+ 
+   if (getEffectiveMcpMode(assistant) === 'auto') {
+-    const allActiveTools = await fetchAllActiveServerTools()
+-    const autoModePrompt = getHubModeSystemPrompt(allActiveTools)
++    const autoModePrompt = getHubModeSystemPrompt()
+     if (autoModePrompt) {
+       systemPrompt = systemPrompt ? `${systemPrompt}\n\n${autoModePrompt}` : autoModePrompt
+     }
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 3ab329e..a9b69f0 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -397,6 +397,10 @@ export function isModernSdkSupported(provider: Provider): boolean {
+  * Creates a custom fetch wrapper that converts 'developer' role to 'system' role in request body.
+  * This is needed for providers that don't support the 'developer' role (e.g., Azure DeepSeek R1).
+  *
++ * Handles both:
++ * - Responses API format: body.input array
++ * - Chat Completions API format: body.messages array
++ *
+  * @param originalFetch - Optional original fetch function to wrap
+  * @returns A fetch function that transforms the request body
+  */
+@@ -407,8 +411,10 @@ function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetc
+     if (options?.body && typeof options.body === 'string') {
+       try {
+         const body = JSON.parse(options.body)
++        let hasChanges = false
++
++        // Handle Responses API format (body.input)
+         if (body.input && Array.isArray(body.input)) {
+-          let hasChanges = false
+           body.input = body.input.map((msg: { role: string }) => {
+             if (msg.role === 'developer') {
+               hasChanges = true
+@@ -416,11 +422,23 @@ function createDeveloperToSystemFetch(originalFetch?: typeof fetch): typeof fetc
+             }
+             return msg
+           })
+-          if (hasChanges) {
+-            options = {
+-              ...options,
+-              body: JSON.stringify(body)
++        }
++
++        // Handle Chat Completions API format (body.messages)
++        if (body.messages && Array.isArray(body.messages)) {
++          body.messages = body.messages.map((msg: { role: string }) => {
++            if (msg.role === 'developer') {
++              hasChanges = true
++              return { ...msg, role: 'system' }
+             }
++            return msg
++          })
++        }
++
++        if (hasChanges) {
++          options = {
++            ...options,
++            body: JSON.stringify(body)
+           }
+         }
+       } catch {
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index c57dc31..7a2935f 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -18,6 +18,7 @@ import {
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+   isOpenAIReasoningModel,
++  isOpus46Model,
+   isQwenAlwaysThinkModel,
+   isQwenReasoningModel,
+   isReasoningModel,
+@@ -28,6 +29,7 @@ import {
+   isSupportedThinkingTokenDoubaoModel,
+   isSupportedThinkingTokenGeminiModel,
+   isSupportedThinkingTokenHunyuanModel,
++  isSupportedThinkingTokenKimiModel,
+   isSupportedThinkingTokenMiMoModel,
+   isSupportedThinkingTokenModel,
+   isSupportedThinkingTokenQwenModel,
+@@ -82,14 +84,21 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+ 
+     // providers that use enable_thinking
+     if (
+-      isSupportEnableThinkingProvider(provider) &&
+-      (isSupportedThinkingTokenQwenModel(model) ||
+-        isSupportedThinkingTokenHunyuanModel(model) ||
+-        (provider.id === SystemProviderIds.dashscope && isDeepSeekHybridInferenceModel(model)))
++      (isSupportEnableThinkingProvider(provider) &&
++        (isSupportedThinkingTokenQwenModel(model) || isSupportedThinkingTokenHunyuanModel(model))) ||
++      (provider.id === SystemProviderIds.dashscope &&
++        (isDeepSeekHybridInferenceModel(model) ||
++          isSupportedThinkingTokenZhipuModel(model) ||
++          isSupportedThinkingTokenKimiModel(model)))
+     ) {
+       return { enable_thinking: false }
+     }
+ 
++    // together
++    if (provider.id === SystemProviderIds.together) {
++      return { reasoning: { enabled: false } }
++    }
++
+     // gemini
+     if (isSupportedThinkingTokenGeminiModel(model)) {
+       if (GEMINI_FLASH_MODEL_REGEX.test(model.id)) {
+@@ -109,7 +118,11 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     }
+ 
+     // use thinking, doubao, zhipu, etc.
+-    if (isSupportedThinkingTokenDoubaoModel(model) || isSupportedThinkingTokenZhipuModel(model)) {
++    if (
++      isSupportedThinkingTokenDoubaoModel(model) ||
++      isSupportedThinkingTokenZhipuModel(model) ||
++      isSupportedThinkingTokenKimiModel(model)
++    ) {
+       if (provider.id === SystemProviderIds.cerebras) {
+         return {
+           disable_reasoning: true
+@@ -278,6 +291,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+             }
+           }
+         case SystemProviderIds.openrouter:
++        case SystemProviderIds.together:
+           return {
+             reasoning: {
+               enabled: true
+@@ -309,18 +323,52 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     }
+   }
+ 
++  // https://help.aliyun.com/zh/model-studio/deep-thinking
++  if (provider.id === SystemProviderIds.dashscope) {
++    // For dashscope: Qwen, DeepSeek, and GLM models use enable_thinking to control thinking
++    // No effort, only on/off
++    if (
++      isQwenReasoningModel(model) ||
++      isSupportedThinkingTokenZhipuModel(model) ||
++      isSupportedThinkingTokenKimiModel(model)
++    ) {
++      return {
++        enable_thinking: true,
++        thinking_budget: budgetTokens
++      }
++    }
++  }
++
++  // https://docs.together.ai/reference/chat-completions-1#body-reasoning-effort
++  if (provider.id === SystemProviderIds.together) {
++    let adjustedReasoningEffort: 'low' | 'medium' | 'high' = 'medium'
++    switch (reasoningEffort) {
++      case 'minimal':
++        adjustedReasoningEffort = 'low'
++        break
++      case 'xhigh':
++        adjustedReasoningEffort = 'high'
++        break
++      case 'auto':
++        adjustedReasoningEffort = 'medium'
++        break
++      default:
++        adjustedReasoningEffort = reasoningEffort
++        break
++    }
++    return {
++      // Only low, medium, high
++      reasoningEffort: adjustedReasoningEffort,
++      reasoning: { enabled: true }
++    }
++  }
++
+   // Qwen models, use enable_thinking
+   if (isQwenReasoningModel(model)) {
+     const thinkConfig = {
+       enable_thinking: isQwenAlwaysThinkModel(model) || !isSupportEnableThinkingProvider(provider) ? undefined : true,
+       thinking_budget: budgetTokens
+     }
+-    if (provider.id === SystemProviderIds.dashscope) {
+-      return {
+-        ...thinkConfig,
+-        incremental_output: true
+-      }
+-    }
+     return thinkConfig
+   }
+ 
+@@ -413,7 +461,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     return { thinking: { type: 'enabled' } }
+   }
+ 
+-  if (isSupportedThinkingTokenMiMoModel(model)) {
++  if (isSupportedThinkingTokenMiMoModel(model) || isSupportedThinkingTokenKimiModel(model)) {
+     return {
+       thinking: { type: 'enabled' }
+     }
+@@ -501,13 +549,19 @@ export function getAnthropicThinkingBudget(
+ }
+ 
+ /**
+- * 获取 Anthropic 推理参数
+- * 从 AnthropicAPIClient 中提取的逻辑
++ * Get Anthropic reasoning parameters.
++ * Extracted from AnthropicAPIClient logic.
++ *
++ * Returns different parameter shapes depending on the model:
++ * - **Opus 4.6**: `{ thinking: { type: 'adaptive' }, effort: 'low' | 'medium' | 'high' | 'max' }`
++ *   Uses the new adaptive thinking API with effort-based control.
++ * - **Other Claude models** (4.0, 4.1, 4.5, etc.): `{ thinking: { type: 'enabled', budgetTokens: number } }`
++ *   Uses the classic thinking API with explicit token budget.
+  */
+ export function getAnthropicReasoningParams(
+   assistant: Assistant,
+   model: Model
+-): Pick<AnthropicProviderOptions, 'thinking'> {
++): Pick<AnthropicProviderOptions, 'thinking' | 'effort'> {
+   if (!isReasoningModel(model)) {
+     return {}
+   }
+@@ -526,8 +580,31 @@ export function getAnthropicReasoningParams(
+     }
+   }
+ 
+-  // Claude 推理参数
++  // Claude reasoning parameters
+   if (isSupportedThinkingTokenClaudeModel(model)) {
++    // Opus 4.6 uses adaptive thinking + effort parameters
++    // Map reasoningEffort to Opus 4.6 supported effort values
++    if (isOpus46Model(model)) {
++      // Opus 4.6 supports: low, medium, high, max
++      // Mapping rules: default/none -> no effort (uses default high)
++      //                minimal/low -> low
++      //                medium -> medium
++      //                high -> high
++      //                xhigh -> max
++      const effortMap = {
++        default: undefined,
++        auto: undefined,
++        minimal: 'low',
++        low: 'low',
++        medium: 'medium',
++        high: 'high',
++        xhigh: 'max'
++      } as const satisfies Record<Exclude<ReasoningEffortOption, 'none'>, AnthropicProviderOptions['effort']>
++      const effort = effortMap[reasoningEffort]
++      return effort ? { thinking: { type: 'adaptive' }, effort } : { thinking: { type: 'adaptive' } }
++    }
++
++    // Other Claude models continue using enabled + budgetTokens
+     const { maxTokens } = getAssistantSettings(assistant)
+     const budgetTokens = getAnthropicThinkingBudget(maxTokens, reasoningEffort, model.id)
+ 
+@@ -689,6 +766,26 @@ export function getBedrockReasoningParams(
+     return {}
+   }
+ 
++  // Opus 4.6 uses adaptive thinking + maxReasoningEffort
++  if (isOpus46Model(model)) {
++    const effortMap = {
++      auto: undefined,
++      minimal: 'low',
++      low: 'low',
++      medium: 'medium',
++      high: 'high',
++      xhigh: 'max'
++    } as const satisfies Record<
++      Exclude<ReasoningEffortOption, 'none' | 'default'>,
++      NonNullable<BedrockProviderOptions['reasoningConfig']>['maxReasoningEffort']
++    >
++    const maxReasoningEffort = effortMap[reasoningEffort]
++    return maxReasoningEffort
++      ? { reasoningConfig: { type: 'adaptive', maxReasoningEffort } }
++      : { reasoningConfig: { type: 'adaptive' } }
++  }
++
++  // Other Claude models use enabled + budgetTokens
+   const { maxTokens } = getAssistantSettings(assistant)
+   const budgetTokens = getAnthropicThinkingBudget(maxTokens, reasoningEffort, model.id)
+   return {
