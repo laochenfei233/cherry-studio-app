@@ -1,0 +1,739 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 78f5d6b..fcea6ac 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -4,8 +4,8 @@
+  */
+ 
+ import { loggerService } from '@logger'
+-import type { AISDKWebSearchResult, MCPTool, WebSearchResults } from '@renderer/types'
+-import { WebSearchSource } from '@renderer/types'
++import type { AISDKWebSearchResult, MCPTool, WebSearchResults, WebSearchSource } from '@renderer/types'
++import { WEB_SEARCH_SOURCE } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { ProviderSpecificError } from '@renderer/types/provider-specific-error'
+@@ -287,24 +287,24 @@ export class AiSdkToChunkAdapter {
+             type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+             llm_web_search: {
+               results: providerMetadata.google?.groundingMetadata as WebSearchResults,
+-              source: WebSearchSource.GEMINI
++              source: WEB_SEARCH_SOURCE.GEMINI
+             }
+           })
+         } else if (final.webSearchResults.length) {
+           const providerName = Object.keys(providerMetadata || {})[0]
+           const sourceMap: Record<string, WebSearchSource> = {
+-            [WebSearchSource.OPENAI]: WebSearchSource.OPENAI_RESPONSE,
+-            [WebSearchSource.ANTHROPIC]: WebSearchSource.ANTHROPIC,
+-            [WebSearchSource.OPENROUTER]: WebSearchSource.OPENROUTER,
+-            [WebSearchSource.GEMINI]: WebSearchSource.GEMINI,
++            [WEB_SEARCH_SOURCE.OPENAI]: WEB_SEARCH_SOURCE.OPENAI_RESPONSE,
++            [WEB_SEARCH_SOURCE.ANTHROPIC]: WEB_SEARCH_SOURCE.ANTHROPIC,
++            [WEB_SEARCH_SOURCE.OPENROUTER]: WEB_SEARCH_SOURCE.OPENROUTER,
++            [WEB_SEARCH_SOURCE.GEMINI]: WEB_SEARCH_SOURCE.GEMINI,
+             // [WebSearchSource.PERPLEXITY]: WebSearchSource.PERPLEXITY,
+-            [WebSearchSource.QWEN]: WebSearchSource.QWEN,
+-            [WebSearchSource.HUNYUAN]: WebSearchSource.HUNYUAN,
+-            [WebSearchSource.ZHIPU]: WebSearchSource.ZHIPU,
+-            [WebSearchSource.GROK]: WebSearchSource.GROK,
+-            [WebSearchSource.WEBSEARCH]: WebSearchSource.WEBSEARCH
++            [WEB_SEARCH_SOURCE.QWEN]: WEB_SEARCH_SOURCE.QWEN,
++            [WEB_SEARCH_SOURCE.HUNYUAN]: WEB_SEARCH_SOURCE.HUNYUAN,
++            [WEB_SEARCH_SOURCE.ZHIPU]: WEB_SEARCH_SOURCE.ZHIPU,
++            [WEB_SEARCH_SOURCE.GROK]: WEB_SEARCH_SOURCE.GROK,
++            [WEB_SEARCH_SOURCE.WEBSEARCH]: WEB_SEARCH_SOURCE.WEBSEARCH
+           }
+-          const source = sourceMap[providerName] || WebSearchSource.AISDK
++          const source = sourceMap[providerName] || WEB_SEARCH_SOURCE.AISDK
+ 
+           this.onChunk({
+             type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index 5c84a72..9a1e886 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -353,9 +353,11 @@ export default class ModernAiProvider {
+       await streamResult?.consumeStream()
+ 
+       const finalText = await streamResult.text
++      const usage = await streamResult.totalUsage
+ 
+       return {
+-        getText: () => finalText
++        getText: () => finalText,
++        usage
+       }
+     }
+   }
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index 5d435b9..78124b9 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -26,7 +26,7 @@ import type {
+   WebSearchResponse
+ } from '@renderer/types'
+ import {
+-  FileTypes,
++  FILE_TYPE,
+   GroqServiceTiers,
+   isGroqServiceTier,
+   isOpenAIServiceTier,
+@@ -321,7 +321,7 @@ export abstract class BaseApiClient<
+     const fileBlocks = findFileBlocks(message)
+     if (fileBlocks.length > 0) {
+       const textFileBlocks = fileBlocks.filter(
+-        (fb) => fb.file && [FileTypes.TEXT, FileTypes.DOCUMENT].includes(fb.file.type)
++        (fb) => fb.file && [FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => fb.file.type === type)
+       )
+ 
+       if (textFileBlocks.length > 0) {
+diff --git a/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts b/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
+index 9b63b77..e4af654 100644
+--- a/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
++++ b/src/aiCore/legacy/clients/anthropic/AnthropicAPIClient.ts
+@@ -39,7 +39,7 @@ import type {
+   Provider,
+   ToolCallResponse
+ } from '@renderer/types'
+-import { EFFORT_RATIO, FileTypes, WebSearchSource } from '@renderer/types'
++import { EFFORT_RATIO, FILE_TYPE, WEB_SEARCH_SOURCE } from '@renderer/types'
+ import type {
+   ErrorChunk,
+   LLMWebSearchCompleteChunk,
+@@ -246,7 +246,7 @@ export class AnthropicAPIClient extends BaseApiClient<
+     const fileBlocks = findFileBlocks(message)
+     for (const fileBlock of fileBlocks) {
+       const { file } = fileBlock
+-      if ([FileTypes.TEXT, FileTypes.DOCUMENT].includes(file.type)) {
++      if ([FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => file.type === type)) {
+         if (file.ext === '.pdf' && file.size < 32 * 1024 * 1024) {
+           const base64Data = await FileManager.readBase64File(file)
+           parts.push({
+@@ -588,7 +588,7 @@ export class AnthropicAPIClient extends BaseApiClient<
+                       type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+                       llm_web_search: {
+                         results: content.content,
+-                        source: WebSearchSource.ANTHROPIC
++                        source: WEB_SEARCH_SOURCE.ANTHROPIC
+                       }
+                     } as LLMWebSearchCompleteChunk)
+                     break
+@@ -641,7 +641,7 @@ export class AnthropicAPIClient extends BaseApiClient<
+                       type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+                       llm_web_search: {
+                         results: contentBlock.content as Array<WebSearchResultBlock>,
+-                        source: WebSearchSource.ANTHROPIC
++                        source: WEB_SEARCH_SOURCE.ANTHROPIC
+                       }
+                     } as LLMWebSearchCompleteChunk)
+                   }
+diff --git a/src/aiCore/legacy/clients/aws/AwsBedrockAPIClient.ts b/src/aiCore/legacy/clients/aws/AwsBedrockAPIClient.ts
+index c4b0140..e28554b 100644
+--- a/src/aiCore/legacy/clients/aws/AwsBedrockAPIClient.ts
++++ b/src/aiCore/legacy/clients/aws/AwsBedrockAPIClient.ts
+@@ -29,7 +29,7 @@ import type {
+   Provider,
+   ToolCallResponse
+ } from '@renderer/types'
+-import { EFFORT_RATIO, FileTypes } from '@renderer/types'
++import { EFFORT_RATIO, FILE_TYPE } from '@renderer/types'
+ import type { MCPToolCreatedChunk, TextDeltaChunk, ThinkingDeltaChunk, ThinkingStartChunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import type { Message } from '@renderer/types/newMessage'
+@@ -727,7 +727,7 @@ export class AwsBedrockAPIClient extends BaseApiClient<
+         continue
+       }
+ 
+-      if ([FileTypes.TEXT, FileTypes.DOCUMENT].includes(file.type)) {
++      if ([FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => file.type === type)) {
+         try {
+           const fileContent = (await window.api.file.read(file.id + file.ext, true)).trim()
+           if (fileContent) {
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index d7f1432..52e721b 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -34,7 +34,7 @@ import type {
+   Provider,
+   ToolCallResponse
+ } from '@renderer/types'
+-import { EFFORT_RATIO, FileTypes, WebSearchSource } from '@renderer/types'
++import { EFFORT_RATIO, FILE_TYPE, WEB_SEARCH_SOURCE } from '@renderer/types'
+ import type { LLMWebSearchCompleteChunk, TextStartChunk, ThinkingStartChunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import type { Message } from '@renderer/types/newMessage'
+@@ -313,7 +313,7 @@ export class GeminiAPIClient extends BaseApiClient<
+     const fileBlocks = findFileBlocks(message)
+     for (const fileBlock of fileBlocks) {
+       const file = fileBlock.file
+-      if (file.type === FileTypes.IMAGE) {
++      if (file.type === FILE_TYPE.IMAGE) {
+         const base64Data = await window.api.file.base64Image(file.id + file.ext)
+         parts.push({
+           inlineData: {
+@@ -327,7 +327,7 @@ export class GeminiAPIClient extends BaseApiClient<
+         parts.push(await this.handlePdfFile(file))
+         continue
+       }
+-      if ([FileTypes.TEXT, FileTypes.DOCUMENT].includes(file.type)) {
++      if ([FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => file.type === type)) {
+         const fileContent = await (await window.api.file.read(file.id + file.ext, true)).trim()
+         parts.push({
+           text: file.origin_name + '\n' + fileContent
+@@ -656,7 +656,7 @@ export class GeminiAPIClient extends BaseApiClient<
+                   type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+                   llm_web_search: {
+                     results: candidate.groundingMetadata,
+-                    source: WebSearchSource.GEMINI
++                    source: WEB_SEARCH_SOURCE.GEMINI
+                   }
+                 } satisfies LLMWebSearchCompleteChunk)
+               }
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+index 73a5bed..90d4427 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIApiClient.ts
+@@ -51,11 +51,11 @@ import type {
+ } from '@renderer/types'
+ import {
+   EFFORT_RATIO,
+-  FileTypes,
++  FILE_TYPE,
+   isSystemProvider,
+   isTranslateAssistant,
+   SystemProviderIds,
+-  WebSearchSource
++  WEB_SEARCH_SOURCE
+ } from '@renderer/types'
+ import type { TextStartChunk, ThinkingStartChunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+@@ -446,7 +446,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         continue
+       }
+ 
+-      if ([FileTypes.TEXT, FileTypes.DOCUMENT].includes(file.type)) {
++      if ([FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => type === file.type)) {
+         const fileContent = await (await window.api.file.read(file.id + file.ext, true)).trim()
+         parts.push({
+           type: 'text',
+@@ -754,7 +754,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         hasBeenCollectedWebSearch = true
+         return {
+           results: annotations,
+-          source: WebSearchSource.OPENAI
++          source: WEB_SEARCH_SOURCE.OPENAI
+         }
+       }
+ 
+@@ -765,7 +765,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         return {
+           // @ts-ignore - citations may not be in standard type definitions
+           results: chunk.citations,
+-          source: WebSearchSource.GROK
++          source: WEB_SEARCH_SOURCE.GROK
+         }
+       }
+ 
+@@ -776,7 +776,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         return {
+           // @ts-ignore - citations may not be in standard type definitions
+           results: chunk.search_results,
+-          source: WebSearchSource.PERPLEXITY
++          source: WEB_SEARCH_SOURCE.PERPLEXITY
+         }
+       }
+ 
+@@ -787,7 +787,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         return {
+           // @ts-ignore - citations may not be in standard type definitions
+           results: chunk.citations,
+-          source: WebSearchSource.OPENROUTER
++          source: WEB_SEARCH_SOURCE.OPENROUTER
+         }
+       }
+ 
+@@ -798,7 +798,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         return {
+           // @ts-ignore - web_search may not be in standard type definitions
+           results: chunk.web_search,
+-          source: WebSearchSource.ZHIPU
++          source: WEB_SEARCH_SOURCE.ZHIPU
+         }
+       }
+ 
+@@ -809,7 +809,7 @@ export class OpenAIAPIClient extends OpenAIBaseClient<
+         return {
+           // @ts-ignore - search_info may not be in standard type definitions
+           results: chunk.search_info.search_results,
+-          source: WebSearchSource.HUNYUAN
++          source: WEB_SEARCH_SOURCE.HUNYUAN
+         }
+       }
+ 
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+index b4f63e2..681a662 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+@@ -23,7 +23,7 @@ import type {
+   Provider,
+   ToolCallResponse
+ } from '@renderer/types'
+-import { FileTypes, WebSearchSource } from '@renderer/types'
++import { FILE_TYPE, WEB_SEARCH_SOURCE } from '@renderer/types'
+ import { ChunkType } from '@renderer/types/chunk'
+ import type { Message } from '@renderer/types/newMessage'
+ import type {
+@@ -239,7 +239,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+         }
+       }
+ 
+-      if ([FileTypes.TEXT, FileTypes.DOCUMENT].includes(file.type)) {
++      if ([FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => file.type === type)) {
+         const fileContent = (await window.api.file.read(file.id + file.ext, true)).trim()
+         parts.push({
+           type: 'input_text',
+@@ -576,7 +576,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+                     controller.enqueue({
+                       type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+                       llm_web_search: {
+-                        source: WebSearchSource.OPENAI_RESPONSE,
++                        source: WEB_SEARCH_SOURCE.OPENAI_RESPONSE,
+                         results: output.content[0].annotations
+                       }
+                     })
+@@ -712,7 +712,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+                 controller.enqueue({
+                   type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+                   llm_web_search: {
+-                    source: WebSearchSource.OPENAI_RESPONSE,
++                    source: WEB_SEARCH_SOURCE.OPENAI_RESPONSE,
+                     results: chunk.part.annotations
+                   }
+                 })
+diff --git a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+index 9c59099..aceb1a3 100644
+--- a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
++++ b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+@@ -66,6 +66,7 @@ export class ZhipuAPIClient extends OpenAIAPIClient {
+ 
+   public async listModels(): Promise<OpenAI.Models.Model[]> {
+     const models = [
++      'glm-5',
+       'glm-4.7',
+       'glm-4.6',
+       'glm-4.6v',
+diff --git a/src/aiCore/legacy/middleware/schemas.ts b/src/aiCore/legacy/middleware/schemas.ts
+index 9119d81..a730a79 100644
+--- a/src/aiCore/legacy/middleware/schemas.ts
++++ b/src/aiCore/legacy/middleware/schemas.ts
+@@ -2,6 +2,7 @@ import type { Assistant, MCPTool } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+ import type { Message } from '@renderer/types/newMessage'
+ import type { SdkRawChunk, SdkRawOutput } from '@renderer/types/sdk'
++import type { LanguageModelUsage } from 'ai'
+ 
+ import type { ProcessingState } from './types'
+ 
+@@ -69,6 +70,7 @@ export interface CompletionsResult {
+   rawOutput?: SdkRawOutput
+   stream?: ReadableStream<SdkRawChunk> | ReadableStream<Chunk> | AsyncIterable<Chunk>
+   controller?: AbortController
++  usage?: LanguageModelUsage
+ 
+   getText: () => string
+ }
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index c217606..45c0d34 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -1,6 +1,6 @@
+ import type { Message, Model } from '@renderer/types'
+ import type { FileMetadata } from '@renderer/types/file'
+-import { FileTypes } from '@renderer/types/file'
++import { FILE_TYPE } from '@renderer/types/file'
+ import {
+   AssistantMessageStatus,
+   type FileMessageBlock,
+@@ -87,7 +87,7 @@ const createFileBlock = (
+       path: file?.path ?? '/tmp/document.txt',
+       size: file?.size ?? 1024,
+       ext: file?.ext ?? '.txt',
+-      type: file?.type ?? FileTypes.TEXT,
++      type: file?.type ?? FILE_TYPE.TEXT,
+       created_at: file?.created_at ?? timestamp,
+       count: file?.count ?? 1,
+       ...file
+@@ -346,7 +346,7 @@ describe('messageConverter', () => {
+       const model = createModel({ id: 'qwen-image-edit', name: 'Qwen Image Edit', provider: 'qwen', group: 'qwen' })
+       const fileUser = createMessage('user')
+       fileUser.__mockContent = 'Use this document as inspiration'
+-      fileUser.__mockFileBlocks = [createFileBlock(fileUser.id, { file: { ext: '.pdf', type: FileTypes.DOCUMENT } })]
++      fileUser.__mockFileBlocks = [createFileBlock(fileUser.id, { file: { ext: '.pdf', type: FILE_TYPE.DOCUMENT } })]
+       convertFileBlockToFilePartMock.mockResolvedValueOnce({
+         type: 'file',
+         filename: 'reference.pdf',
+diff --git a/src/aiCore/prepareParams/fileProcessor.ts b/src/aiCore/prepareParams/fileProcessor.ts
+index 5ee8812..3030b06 100644
+--- a/src/aiCore/prepareParams/fileProcessor.ts
++++ b/src/aiCore/prepareParams/fileProcessor.ts
+@@ -7,7 +7,7 @@ import type OpenAI from '@cherrystudio/openai'
+ import { loggerService } from '@logger'
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+ import type { FileMetadata, Message, Model } from '@renderer/types'
+-import { FileTypes } from '@renderer/types'
++import { FILE_TYPE } from '@renderer/types'
+ import type { FileMessageBlock } from '@renderer/types/newMessage'
+ import { findFileBlocks } from '@renderer/utils/messageUtils/find'
+ import type { FilePart, TextPart } from 'ai'
+@@ -24,7 +24,7 @@ export async function extractFileContent(message: Message): Promise<string> {
+   const fileBlocks = findFileBlocks(message)
+   if (fileBlocks.length > 0) {
+     const textFileBlocks = fileBlocks.filter(
+-      (fb) => fb.file && [FileTypes.TEXT, FileTypes.DOCUMENT].includes(fb.file.type)
++      (fb) => fb.file && [FILE_TYPE.TEXT, FILE_TYPE.DOCUMENT].some((type) => fb.file.type === type)
+     )
+ 
+     if (textFileBlocks.length > 0) {
+@@ -52,7 +52,7 @@ export async function convertFileBlockToTextPart(fileBlock: FileMessageBlock): P
+   const file = fileBlock.file
+ 
+   // 处理文本文件
+-  if (file.type === FileTypes.TEXT) {
++  if (file.type === FILE_TYPE.TEXT) {
+     try {
+       const fileContent = await window.api.file.read(file.id + file.ext)
+       return {
+@@ -65,7 +65,7 @@ export async function convertFileBlockToTextPart(fileBlock: FileMessageBlock): P
+   }
+ 
+   // 处理文档文件（PDF、Word、Excel等）- 提取为文本内容
+-  if (file.type === FileTypes.DOCUMENT) {
++  if (file.type === FILE_TYPE.DOCUMENT) {
+     try {
+       const fileContent = await window.api.file.read(file.id + file.ext, true) // true表示强制文本提取
+       return {
+@@ -202,7 +202,7 @@ export async function convertFileBlockToFilePart(fileBlock: FileMessageBlock, mo
+ 
+   try {
+     // 处理PDF文档
+-    if (file.type === FileTypes.DOCUMENT && file.ext === '.pdf' && supportsPdfInput(model)) {
++    if (file.type === FILE_TYPE.DOCUMENT && file.ext === '.pdf' && supportsPdfInput(model)) {
+       // 检查文件大小限制
+       if (file.size > fileSizeLimit) {
+         // 如果支持大文件上传（如Gemini File API），尝试上传
+@@ -231,7 +231,7 @@ export async function convertFileBlockToFilePart(fileBlock: FileMessageBlock, mo
+     }
+ 
+     // 处理图片文件
+-    if (file.type === FileTypes.IMAGE && supportsImageInput(model)) {
++    if (file.type === FILE_TYPE.IMAGE && supportsImageInput(model)) {
+       // 检查文件大小
+       if (file.size > fileSizeLimit) {
+         logger.warn(`Image file ${file.origin_name} exceeds size limit (${file.size} > ${fileSizeLimit})`)
+@@ -258,7 +258,7 @@ export async function convertFileBlockToFilePart(fileBlock: FileMessageBlock, mo
+     }
+ 
+     // 处理其他文档类型（Word、Excel等）
+-    if (file.type === FileTypes.DOCUMENT && file.ext !== '.pdf') {
++    if (file.type === FILE_TYPE.DOCUMENT && file.ext !== '.pdf') {
+       // 目前大多数提供商不支持Word等格式的原生处理
+       // 返回null会触发上层调用convertFileBlockToTextPart进行文本提取
+       // 这与Legacy架构中的处理方式一致
+diff --git a/src/aiCore/prepareParams/modelCapabilities.ts b/src/aiCore/prepareParams/modelCapabilities.ts
+index 4a3c3f4..d4ca6a6 100644
+--- a/src/aiCore/prepareParams/modelCapabilities.ts
++++ b/src/aiCore/prepareParams/modelCapabilities.ts
+@@ -5,8 +5,8 @@
+ 
+ import { isVisionModel } from '@renderer/config/models'
+ import { getProviderByModel } from '@renderer/services/AssistantService'
+-import type { Model } from '@renderer/types'
+-import { FileTypes } from '@renderer/types'
++import type { FileType, Model } from '@renderer/types'
++import { FILE_TYPE } from '@renderer/types'
+ 
+ import { getAiSdkProviderId } from '../provider/factory'
+ 
+@@ -88,12 +88,12 @@ export function supportsLargeFileUpload(model: Model): boolean {
+ /**
+  * 获取提供商特定的文件大小限制
+  */
+-export function getFileSizeLimit(model: Model, fileType: FileTypes): number {
++export function getFileSizeLimit(model: Model, fileType: FileType): number {
+   const provider = getProviderByModel(model)
+   const aiSdkId = getAiSdkProviderId(provider)
+ 
+   // Anthropic PDF限制32MB
+-  if (aiSdkId === 'anthropic' && fileType === FileTypes.DOCUMENT) {
++  if (aiSdkId === 'anthropic' && fileType === FILE_TYPE.DOCUMENT) {
+     return 32 * 1024 * 1024 // 32MB
+   }
+ 
+diff --git a/src/aiCore/utils/__tests__/mcp.test.ts b/src/aiCore/utils/__tests__/mcp.test.ts
+index dc26a03..c11165f 100644
+--- a/src/aiCore/utils/__tests__/mcp.test.ts
++++ b/src/aiCore/utils/__tests__/mcp.test.ts
+@@ -7,7 +7,7 @@ import type { MCPTool } from '@renderer/types'
+ import type { Tool } from 'ai'
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { convertMcpToolsToAiSdkTools, setupToolsConfig } from '../mcp'
++import { convertMcpToolsToAiSdkTools, hasMultimodalContent, mcpResultToTextSummary, setupToolsConfig } from '../mcp'
+ 
+ // Mock dependencies
+ vi.mock('@logger', () => ({
+@@ -288,6 +288,136 @@ describe('mcp utils', () => {
+     })
+   })
+ 
++  describe('hasMultimodalContent', () => {
++    it('should return false for pure text content', () => {
++      expect(hasMultimodalContent({ content: [{ type: 'text', text: 'hello' }] })).toBe(false)
++    })
++
++    it('should return true for image content', () => {
++      expect(hasMultimodalContent({ content: [{ type: 'image', data: 'base64...', mimeType: 'image/png' }] })).toBe(
++        true
++      )
++    })
++
++    it('should return true for audio content', () => {
++      expect(hasMultimodalContent({ content: [{ type: 'audio', data: 'base64...', mimeType: 'audio/mp3' }] })).toBe(
++        true
++      )
++    })
++
++    it('should return true for resource with blob', () => {
++      expect(
++        hasMultimodalContent({
++          content: [{ type: 'resource', resource: { blob: 'base64...', mimeType: 'image/png', uri: 'file://a.png' } }]
++        })
++      ).toBe(true)
++    })
++
++    it('should return false for resource without blob', () => {
++      expect(
++        hasMultimodalContent({
++          content: [{ type: 'resource', resource: { text: 'plain text', uri: 'file://a.txt' } }]
++        })
++      ).toBe(false)
++    })
++
++    it('should return true for mixed content with at least one multimodal item', () => {
++      expect(
++        hasMultimodalContent({
++          content: [
++            { type: 'text', text: 'hello' },
++            { type: 'image', data: 'base64...', mimeType: 'image/png' }
++          ]
++        })
++      ).toBe(true)
++    })
++
++    it('should return false for empty content array', () => {
++      expect(hasMultimodalContent({ content: [] })).toBe(false)
++    })
++
++    it('should return false for null/undefined result', () => {
++      expect(hasMultimodalContent(null as any)).toBe(false)
++      expect(hasMultimodalContent(undefined as any)).toBe(false)
++    })
++
++    it('should return false when content is not an array', () => {
++      expect(hasMultimodalContent({ content: 'not-array' } as any)).toBe(false)
++    })
++  })
++
++  describe('mcpResultToTextSummary', () => {
++    it('should extract text from text content', () => {
++      expect(mcpResultToTextSummary({ content: [{ type: 'text', text: 'hello world' }] })).toBe('hello world')
++    })
++
++    it('should replace image with placeholder', () => {
++      expect(mcpResultToTextSummary({ content: [{ type: 'image', data: 'base64...', mimeType: 'image/jpeg' }] })).toBe(
++        '[Image: image/jpeg, delivered to user]'
++      )
++    })
++
++    it('should use default mimeType for image without mimeType', () => {
++      expect(mcpResultToTextSummary({ content: [{ type: 'image', data: 'base64...' }] })).toBe(
++        '[Image: image/png, delivered to user]'
++      )
++    })
++
++    it('should replace audio with placeholder', () => {
++      expect(mcpResultToTextSummary({ content: [{ type: 'audio', data: 'base64...', mimeType: 'audio/wav' }] })).toBe(
++        '[Audio: audio/wav, delivered to user]'
++      )
++    })
++
++    it('should use default mimeType for audio without mimeType', () => {
++      expect(mcpResultToTextSummary({ content: [{ type: 'audio', data: 'base64...' }] })).toBe(
++        '[Audio: audio/mp3, delivered to user]'
++      )
++    })
++
++    it('should replace resource with blob with placeholder', () => {
++      expect(
++        mcpResultToTextSummary({
++          content: [
++            { type: 'resource', resource: { blob: 'base64...', mimeType: 'application/pdf', uri: 'file://doc.pdf' } }
++          ]
++        })
++      ).toBe('[Resource: application/pdf, uri=file://doc.pdf, delivered to user]')
++    })
++
++    it('should use resource text when no blob', () => {
++      expect(
++        mcpResultToTextSummary({
++          content: [{ type: 'resource', resource: { text: 'resource content', uri: 'file://a.txt' } }]
++        })
++      ).toBe('resource content')
++    })
++
++    it('should JSON.stringify unknown content types', () => {
++      const item = { type: 'unknown' as any, foo: 'bar' }
++      expect(mcpResultToTextSummary({ content: [item] })).toBe(JSON.stringify(item))
++    })
++
++    it('should join multiple content parts with newline', () => {
++      const result = mcpResultToTextSummary({
++        content: [
++          { type: 'text', text: 'Description' },
++          { type: 'image', data: 'base64...', mimeType: 'image/png' }
++        ]
++      })
++      expect(result).toBe('Description\n[Image: image/png, delivered to user]')
++    })
++
++    it('should JSON.stringify result when content is missing', () => {
++      expect(mcpResultToTextSummary(null as any)).toBe('null')
++      expect(mcpResultToTextSummary({} as any)).toBe('{}')
++    })
++
++    it('should handle empty text gracefully', () => {
++      expect(mcpResultToTextSummary({ content: [{ type: 'text' }] })).toBe('')
++    })
++  })
++
+   describe('tool execution', () => {
+     it('should execute tool with user confirmation', async () => {
+       const { callMCPTool } = await import('@renderer/utils/mcp-tools')
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index 7d3be9a..fd38030 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -1,5 +1,5 @@
+ import { loggerService } from '@logger'
+-import type { MCPTool, MCPToolResponse } from '@renderer/types'
++import type { MCPCallToolResponse, MCPTool, MCPToolResponse } from '@renderer/types'
+ import { callMCPTool, getMcpServerByTool, isToolAutoApproved } from '@renderer/utils/mcp-tools'
+ import { requestToolConfirmation } from '@renderer/utils/userConfirmation'
+ import { type Tool, type ToolSet } from 'ai'
+@@ -21,6 +21,58 @@ export function setupToolsConfig(mcpTools?: MCPTool[]): Record<string, Tool<any,
+   return tools
+ }
+ 
++/**
++ * 检查 MCP 工具调用结果是否包含可能携带大体积 base64 数据的多模态内容。
++ * 包括 image、audio 以及含 blob 的 resource 类型。
++ */
++export function hasMultimodalContent(result: MCPCallToolResponse): boolean {
++  return (
++    Array.isArray(result?.content) &&
++    result.content.some(
++      (item) => item.type === 'image' || item.type === 'audio' || (item.type === 'resource' && !!item.resource?.blob)
++    )
++  )
++}
++
++/**
++ * 将 MCP 工具调用结果转换为纯文本摘要，把图片/音频/resource blob 替换为文本占位描述，
++ * 避免 base64 数据超出消息大小限制（如 kimi 的 4MB 限制）。
++ */
++export function mcpResultToTextSummary(result: MCPCallToolResponse): string {
++  if (!result || !result.content || !Array.isArray(result.content)) {
++    return JSON.stringify(result)
++  }
++
++  const parts: string[] = []
++  for (const item of result.content) {
++    switch (item.type) {
++      case 'text':
++        parts.push(item.text || '')
++        break
++      case 'image':
++        parts.push(`[Image: ${item.mimeType || 'image/png'}, delivered to user]`)
++        break
++      case 'audio':
++        parts.push(`[Audio: ${item.mimeType || 'audio/mp3'}, delivered to user]`)
++        break
++      case 'resource':
++        if (item.resource?.blob) {
++          parts.push(
++            `[Resource: ${item.resource.mimeType || 'application/octet-stream'}, uri=${item.resource.uri || 'unknown'}, delivered to user]`
++          )
++        } else {
++          parts.push(item.resource?.text || JSON.stringify(item))
++        }
++        break
++      default:
++        parts.push(JSON.stringify(item))
++        break
++    }
++  }
++
++  return parts.join('\n')
++}
++
+ /**
+  * 将 MCPTool 转换为 AI SDK 工具格式
+  */
+@@ -76,14 +128,19 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[]): ToolSet {
+ 
+         // 返回结果，AI SDK 会处理序列化
+         if (result.isError) {
+-          // throw new Error(result.content?.[0]?.text || 'Tool execution failed')
+           return Promise.reject(result)
+         }
+         // 返回工具执行结果
+         return result
+-        // } catch (error) {
+-        //   logger.error(`MCP Tool execution failed: ${mcpTool.name}`, { error })
+-        // }
++      },
++      // 将多模态结果 (image/audio/resource blob) 转为文本摘要，避免 base64 超出消息大小限制。
++      // 图片/音频已通过 IMAGE_COMPLETE chunk 展示给用户。
++      // TODO: 待 AI SDK 支持 provider 感知后，可按 provider 返回 media 格式。
++      toModelOutput(rawOutput: unknown) {
++        // rawOutput 来自上方 execute 的 return result，类型始终为 MCPCallToolResponse
++        // mcpResultToTextSummary 内部已有 null/content 校验，不会因意外输入崩溃
++        const result = rawOutput as MCPCallToolResponse
++        return { type: 'text' as const, value: mcpResultToTextSummary(result) }
+       }
+     })
+   }
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 7a2935f..0c60efc 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -304,9 +304,15 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+             }
+           }
+         default:
+-          logger.warn(
+-            `Skipping thinking options for provider ${provider.name} as DeepSeek v3.1 thinking control method is unknown`
+-          )
++          break
++      }
++    }
++    logger.warn(
++      `Use default thinking options for provider ${provider.name} as DeepSeek v3.1+ thinking control method is unknown`
++    )
++    return {
++      thinking: {
++        type: 'enabled'
+       }
+     }
+   }
