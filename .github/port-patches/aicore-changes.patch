@@ -1,0 +1,1612 @@
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index 9a1e886..e8a30e0 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -7,6 +7,7 @@
+  * 2. 暂时保持接口兼容性
+  */
+ 
++import type { AiSdkModel } from '@cherrystudio/ai-core'
+ import { createExecutor } from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+@@ -14,16 +15,14 @@ import { normalizeGatewayModels, normalizeSdkModels } from '@renderer/services/m
+ import { addSpan, endSpan } from '@renderer/services/SpanManagerService'
+ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+ import { type Assistant, type GenerateImageParams, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+-import type { AiSdkModel, StreamTextParams } from '@renderer/types/aiCoreTypes'
++import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { SUPPORTED_IMAGE_ENDPOINT_LIST } from '@renderer/utils'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+-import { gateway, type ImageModel, type LanguageModel, type Provider as AiSdkProvider, wrapLanguageModel } from 'ai'
++import { gateway, type LanguageModel, type Provider as AiSdkProvider } from 'ai'
+ 
+ import AiSdkToChunkAdapter from './chunk/AiSdkToChunkAdapter'
+ import LegacyAiProvider from './legacy/index'
+ import type { CompletionsParams, CompletionsResult } from './legacy/middleware/schemas'
+-import type { AiSdkMiddlewareConfig } from './middleware/AiSdkMiddlewareBuilder'
+-import { buildAiSdkMiddlewares } from './middleware/AiSdkMiddlewareBuilder'
+ import { buildPlugins } from './plugins/PluginBuilder'
+ import { createAiSdkProvider } from './provider/factory'
+ import {
+@@ -34,6 +33,7 @@ import {
+   providerToAiSdkConfig
+ } from './provider/providerConfig'
+ import type { AiSdkConfig } from './types'
++import type { AiSdkMiddlewareConfig } from './types/middlewareConfig'
+ 
+ const logger = loggerService.withContext('ModernAiProvider')
+ 
+@@ -144,16 +144,6 @@ export default class ModernAiProvider {
+       this.localProvider = await createAiSdkProvider(this.config)
+     }
+ 
+-    // 提前构建中间件
+-    const middlewares = buildAiSdkMiddlewares({
+-      ...providerConfig,
+-      provider: this.actualProvider,
+-      assistant: providerConfig.assistant
+-    })
+-    logger.debug('Built middlewares in completions', {
+-      middlewareCount: middlewares.length,
+-      isImageGeneration: providerConfig.isImageGenerationEndpoint
+-    })
+     if (!this.localProvider) {
+       throw new Error('Local provider not created')
+     }
+@@ -164,14 +154,20 @@ export default class ModernAiProvider {
+       model = this.localProvider.imageModel(modelId)
+     } else {
+       model = this.localProvider.languageModel(modelId)
+-      // 如果有中间件，应用到语言模型上
+-      if (middlewares.length > 0 && typeof model === 'object') {
+-        model = wrapLanguageModel({ model, middleware: middlewares })
+-      }
+     }
+ 
+     if (this.actualProvider.id === 'anthropic' && this.actualProvider.authType === 'oauth') {
+-      const claudeCodeSystemMessage = buildClaudeCodeSystemModelMessage(params.system)
++      // 类型守卫：确保 system 是 string、Array 或 undefined
++      const system = params.system
++      let systemParam: string | Array<any> | undefined
++      if (typeof system === 'string' || Array.isArray(system) || system === undefined) {
++        systemParam = system
++      } else {
++        // SystemModelMessage 类型，转换为 string
++        systemParam = undefined
++      }
++
++      const claudeCodeSystemMessage = buildClaudeCodeSystemModelMessage(systemParam)
+       params.system = undefined // 清除原有system，避免重复
+       params.messages = [...claudeCodeSystemMessage, ...(params.messages || [])]
+     }
+@@ -545,7 +541,7 @@ export default class ModernAiProvider {
+ 
+     const executor = createExecutor(this.config!.providerId, this.config!.options, [])
+     const result = await executor.generateImage({
+-      model: this.localProvider?.imageModel(model) as ImageModel,
++      model: model, // 直接使用 model ID 字符串，由 executor 内部解析
+       ...aiSdkParams
+     })
+ 
+diff --git a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+index 9c59099..aceb1a3 100644
+--- a/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
++++ b/src/aiCore/legacy/clients/zhipu/ZhipuAPIClient.ts
+@@ -66,6 +66,7 @@ export class ZhipuAPIClient extends OpenAIAPIClient {
+ 
+   public async listModels(): Promise<OpenAI.Models.Model[]> {
+     const models = [
++      'glm-5',
+       'glm-4.7',
+       'glm-4.6',
+       'glm-4.6v',
+diff --git a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts b/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
+deleted file mode 100644
+index ab4a5d8..0000000
+--- a/src/aiCore/middleware/AiSdkMiddlewareBuilder.ts
++++ /dev/null
+@@ -1,292 +0,0 @@
+-import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugins'
+-import { loggerService } from '@logger'
+-import { isAnthropicModel, isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
+-import type { McpMode, MCPTool } from '@renderer/types'
+-import { type Assistant, type Message, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+-import type { Chunk } from '@renderer/types/chunk'
+-import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+-import type { LanguageModelMiddleware } from 'ai'
+-import { extractReasoningMiddleware, simulateStreamingMiddleware } from 'ai'
+-
+-import { getAiSdkProviderId } from '../provider/factory'
+-import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
+-import { anthropicCacheMiddleware } from './anthropicCacheMiddleware'
+-import { noThinkMiddleware } from './noThinkMiddleware'
+-import { openrouterGenerateImageMiddleware } from './openrouterGenerateImageMiddleware'
+-import { openrouterReasoningMiddleware } from './openrouterReasoningMiddleware'
+-import { qwenThinkingMiddleware } from './qwenThinkingMiddleware'
+-import { skipGeminiThoughtSignatureMiddleware } from './skipGeminiThoughtSignatureMiddleware'
+-
+-const logger = loggerService.withContext('AiSdkMiddlewareBuilder')
+-
+-/**
+- * AI SDK 中间件配置项
+- */
+-export interface AiSdkMiddlewareConfig {
+-  streamOutput: boolean
+-  onChunk?: (chunk: Chunk) => void
+-  model?: Model
+-  provider?: Provider
+-  assistant?: Assistant
+-  enableReasoning: boolean
+-  // 是否开启提示词工具调用
+-  isPromptToolUse: boolean
+-  // 是否支持工具调用
+-  isSupportedToolUse: boolean
+-  // image generation endpoint
+-  isImageGenerationEndpoint: boolean
+-  // 是否开启内置搜索
+-  enableWebSearch: boolean
+-  enableGenerateImage: boolean
+-  enableUrlContext: boolean
+-  mcpMode?: McpMode
+-  mcpTools?: MCPTool[]
+-  uiMessages?: Message[]
+-  // 内置搜索配置
+-  webSearchPluginConfig?: WebSearchPluginConfig
+-  // 知识库识别开关，默认开启
+-  knowledgeRecognition?: 'off' | 'on'
+-}
+-
+-/**
+- * 具名的 AI SDK 中间件
+- */
+-export interface NamedAiSdkMiddleware {
+-  name: string
+-  middleware: LanguageModelMiddleware
+-}
+-
+-/**
+- * AI SDK 中间件建造者
+- * 用于根据不同条件动态构建中间件数组
+- */
+-export class AiSdkMiddlewareBuilder {
+-  private middlewares: NamedAiSdkMiddleware[] = []
+-
+-  /**
+-   * 添加具名中间件
+-   */
+-  public add(namedMiddleware: NamedAiSdkMiddleware): this {
+-    this.middlewares.push(namedMiddleware)
+-    return this
+-  }
+-
+-  /**
+-   * 在指定位置插入中间件
+-   */
+-  public insertAfter(targetName: string, middleware: NamedAiSdkMiddleware): this {
+-    const index = this.middlewares.findIndex((m) => m.name === targetName)
+-    if (index !== -1) {
+-      this.middlewares.splice(index + 1, 0, middleware)
+-    } else {
+-      logger.warn(`AiSdkMiddlewareBuilder: Middleware named '${targetName}' not found, cannot insert`)
+-    }
+-    return this
+-  }
+-
+-  /**
+-   * 检查是否包含指定名称的中间件
+-   */
+-  public has(name: string): boolean {
+-    return this.middlewares.some((m) => m.name === name)
+-  }
+-
+-  /**
+-   * 移除指定名称的中间件
+-   */
+-  public remove(name: string): this {
+-    this.middlewares = this.middlewares.filter((m) => m.name !== name)
+-    return this
+-  }
+-
+-  /**
+-   * 构建最终的中间件数组
+-   */
+-  public build(): LanguageModelMiddleware[] {
+-    return this.middlewares.map((m) => m.middleware)
+-  }
+-
+-  /**
+-   * 获取具名中间件数组（用于调试）
+-   */
+-  public buildNamed(): NamedAiSdkMiddleware[] {
+-    return [...this.middlewares]
+-  }
+-
+-  /**
+-   * 清空所有中间件
+-   */
+-  public clear(): this {
+-    this.middlewares = []
+-    return this
+-  }
+-
+-  /**
+-   * 获取中间件总数
+-   */
+-  public get length(): number {
+-    return this.middlewares.length
+-  }
+-}
+-
+-/**
+- * 根据配置构建AI SDK中间件的工厂函数
+- * 这里要注意构建顺序，因为有些中间件需要依赖其他中间件的结果
+- */
+-export function buildAiSdkMiddlewares(config: AiSdkMiddlewareConfig): LanguageModelMiddleware[] {
+-  const builder = new AiSdkMiddlewareBuilder()
+-
+-  // 1. 根据provider添加特定中间件
+-  if (config.provider) {
+-    addProviderSpecificMiddlewares(builder, config)
+-  }
+-
+-  // 2. 根据模型类型添加特定中间件
+-  if (config.model) {
+-    addModelSpecificMiddlewares(builder, config)
+-  }
+-
+-  // 3. 非流式输出时添加模拟流中间件
+-  if (config.streamOutput === false) {
+-    builder.add({
+-      name: 'simulate-streaming',
+-      middleware: simulateStreamingMiddleware()
+-    })
+-  }
+-
+-  return builder.build()
+-}
+-
+-const tagName = {
+-  reasoning: 'reasoning',
+-  think: 'think',
+-  thought: 'thought',
+-  seedThink: 'seed:think'
+-}
+-
+-function getReasoningTagName(modelId: string | undefined): string {
+-  if (modelId?.includes('gpt-oss')) return tagName.reasoning
+-  if (modelId?.includes('gemini')) return tagName.thought
+-  if (modelId?.includes('seed-oss-36b')) return tagName.seedThink
+-  return tagName.think
+-}
+-
+-/**
+- * 添加provider特定的中间件
+- */
+-function addProviderSpecificMiddlewares(builder: AiSdkMiddlewareBuilder, config: AiSdkMiddlewareConfig): void {
+-  if (!config.provider) return
+-
+-  // 根据不同provider添加特定中间件
+-  switch (config.provider.type) {
+-    case 'anthropic':
+-      if (isAnthropicModel(config.model) && config.provider.anthropicCacheControl?.tokenThreshold) {
+-        builder.add({
+-          name: 'anthropic-cache',
+-          middleware: anthropicCacheMiddleware(config.provider)
+-        })
+-      }
+-      break
+-    case 'openai':
+-    case 'azure-openai': {
+-      // 就算这里不传参数也有可能调用推理
+-      const tagName = getReasoningTagName(config.model?.id.toLowerCase())
+-      builder.add({
+-        name: 'thinking-tag-extraction',
+-        middleware: extractReasoningMiddleware({ tagName })
+-      })
+-      break
+-    }
+-    case 'gemini':
+-      // Gemini特定中间件
+-      break
+-    case 'aws-bedrock': {
+-      break
+-    }
+-    default:
+-      // 其他provider的通用处理
+-      break
+-  }
+-
+-  // OVMS+MCP's specific middleware
+-  if (config.provider.id === 'ovms' && config.mcpTools && config.mcpTools.length > 0) {
+-    builder.add({
+-      name: 'no-think',
+-      middleware: noThinkMiddleware()
+-    })
+-  }
+-
+-  if (config.provider.id === SystemProviderIds.openrouter && config.enableReasoning) {
+-    builder.add({
+-      name: 'openrouter-reasoning-redaction',
+-      middleware: openrouterReasoningMiddleware()
+-    })
+-    logger.debug('Added OpenRouter reasoning redaction middleware')
+-  }
+-}
+-
+-/**
+- * 添加模型特定的中间件
+- */
+-function addModelSpecificMiddlewares(builder: AiSdkMiddlewareBuilder, config: AiSdkMiddlewareConfig): void {
+-  if (!config.model || !config.provider) return
+-
+-  // Qwen models on providers that don't support enable_thinking parameter (like Ollama, LM Studio, NVIDIA)
+-  // Use /think or /no_think suffix to control thinking mode
+-  if (
+-    config.provider &&
+-    !isOllamaProvider(config.provider) &&
+-    isSupportedThinkingTokenQwenModel(config.model) &&
+-    !isSupportEnableThinkingProvider(config.provider)
+-  ) {
+-    const enableThinking = config.assistant?.settings?.reasoning_effort !== undefined
+-    builder.add({
+-      name: 'qwen-thinking-control',
+-      middleware: qwenThinkingMiddleware(enableThinking)
+-    })
+-    logger.debug(`Added Qwen thinking middleware with thinking ${enableThinking ? 'enabled' : 'disabled'}`)
+-  }
+-
+-  // 可以根据模型ID或特性添加特定中间件
+-  // 例如：图像生成模型、多模态模型等
+-  if (isOpenRouterGeminiGenerateImageModel(config.model, config.provider)) {
+-    builder.add({
+-      name: 'openrouter-gemini-image-generation',
+-      middleware: openrouterGenerateImageMiddleware()
+-    })
+-  }
+-
+-  if (isGemini3Model(config.model)) {
+-    const aiSdkId = getAiSdkProviderId(config.provider)
+-    builder.add({
+-      name: 'skip-gemini3-thought-signature',
+-      middleware: skipGeminiThoughtSignatureMiddleware(aiSdkId)
+-    })
+-    logger.debug('Added skip Gemini3 thought signature middleware')
+-  }
+-}
+-
+-/**
+- * 创建一个预配置的中间件建造者
+- */
+-export function createAiSdkMiddlewareBuilder(): AiSdkMiddlewareBuilder {
+-  return new AiSdkMiddlewareBuilder()
+-}
+-
+-/**
+- * 创建一个带有默认中间件的建造者
+- */
+-export function createDefaultAiSdkMiddlewareBuilder(config: AiSdkMiddlewareConfig): AiSdkMiddlewareBuilder {
+-  const builder = new AiSdkMiddlewareBuilder()
+-  const defaultMiddlewares = buildAiSdkMiddlewares(config)
+-
+-  // 将普通中间件数组转换为具名中间件并添加
+-  defaultMiddlewares.forEach((middleware, index) => {
+-    builder.add({
+-      name: `default-middleware-${index}`,
+-      middleware
+-    })
+-  })
+-
+-  return builder
+-}
+diff --git a/src/aiCore/middleware/README.md b/src/aiCore/middleware/README.md
+deleted file mode 100644
+index 7731d26..0000000
+--- a/src/aiCore/middleware/README.md
++++ /dev/null
+@@ -1,140 +0,0 @@
+-# AI SDK 中间件建造者
+-
+-## 概述
+-
+-`AiSdkMiddlewareBuilder` 是一个用于动态构建 AI SDK 中间件数组的建造者模式实现。它可以根据不同的条件（如流式输出、思考模型、provider类型等）自动构建合适的中间件组合。
+-
+-## 使用方式
+-
+-### 基本用法
+-
+-```typescript
+-import { buildAiSdkMiddlewares, type AiSdkMiddlewareConfig } from './AiSdkMiddlewareBuilder'
+-
+-// 配置中间件参数
+-const config: AiSdkMiddlewareConfig = {
+-  streamOutput: false, // 非流式输出
+-  onChunk: chunkHandler, // chunk回调函数
+-  model: currentModel, // 当前模型
+-  provider: currentProvider, // 当前provider
+-  enableReasoning: true, // 启用推理
+-  enableTool: false, // 禁用工具
+-  enableWebSearch: false // 禁用网页搜索
+-}
+-
+-// 构建中间件数组
+-const middlewares = buildAiSdkMiddlewares(config)
+-
+-// 创建带有中间件的客户端
+-const client = createClient(providerId, options, middlewares)
+-```
+-
+-### 手动构建
+-
+-```typescript
+-import { AiSdkMiddlewareBuilder, createAiSdkMiddlewareBuilder } from './AiSdkMiddlewareBuilder'
+-
+-const builder = createAiSdkMiddlewareBuilder()
+-
+-// 添加特定中间件
+-builder.add({
+-  name: 'custom-middleware',
+-  aiSdkMiddlewares: [customMiddleware()]
+-})
+-
+-// 检查是否包含某个中间件
+-if (builder.has('thinking-time')) {
+-  console.log('已包含思考时间中间件')
+-}
+-
+-// 移除不需要的中间件
+-builder.remove('simulate-streaming')
+-
+-// 构建最终数组
+-const middlewares = builder.build()
+-```
+-
+-## 支持的条件
+-
+-### 1. 流式输出控制
+-
+-- **streamOutput = false**: 自动添加 `simulateStreamingMiddleware`
+-- **streamOutput = true**: 使用原生流式处理
+-
+-### 2. 思考模型处理
+-
+-- **条件**: `onChunk` 存在 && `isReasoningModel(model)` 为 true
+-- **效果**: 自动添加 `thinkingTimeMiddleware`
+-
+-### 3. Provider 特定中间件
+-
+-根据不同的 provider 类型添加特定中间件：
+-
+-- **anthropic**: Anthropic 特定处理
+-- **openai**: OpenAI 特定处理
+-- **gemini**: Gemini 特定处理
+-
+-### 4. 模型特定中间件
+-
+-根据模型特性添加中间件：
+-
+-- **图像生成模型**: 添加图像处理相关中间件
+-- **多模态模型**: 添加多模态处理中间件
+-
+-## 扩展指南
+-
+-### 添加新的条件判断
+-
+-在 `buildAiSdkMiddlewares` 函数中添加新的条件：
+-
+-```typescript
+-// 例如：添加缓存中间件
+-if (config.enableCache) {
+-  builder.add({
+-    name: 'cache',
+-    aiSdkMiddlewares: [cacheMiddleware(config.cacheOptions)]
+-  })
+-}
+-```
+-
+-### 添加 Provider 特定处理
+-
+-在 `addProviderSpecificMiddlewares` 函数中添加：
+-
+-```typescript
+-case 'custom-provider':
+-  builder.add({
+-    name: 'custom-provider-middleware',
+-    aiSdkMiddlewares: [customProviderMiddleware()]
+-  })
+-  break
+-```
+-
+-### 添加模型特定处理
+-
+-在 `addModelSpecificMiddlewares` 函数中添加：
+-
+-```typescript
+-if (config.model.id.includes('custom-model')) {
+-  builder.add({
+-    name: 'custom-model-middleware',
+-    aiSdkMiddlewares: [customModelMiddleware()]
+-  })
+-}
+-```
+-
+-## 中间件执行顺序
+-
+-中间件按照添加顺序执行：
+-
+-1. **simulate-streaming** (如果 streamOutput = false)
+-2. **thinking-time** (如果是思考模型且有 onChunk)
+-3. **provider-specific** (根据 provider 类型)
+-4. **model-specific** (根据模型类型)
+-
+-## 注意事项
+-
+-1. 中间件的执行顺序很重要，确保按正确顺序添加
+-2. 避免添加冲突的中间件
+-3. 某些中间件可能有依赖关系，需要确保依赖的中间件先添加
+-4. 建议在开发环境下启用日志，以便调试中间件构建过程
+diff --git a/src/aiCore/middleware/toolChoiceMiddleware.ts b/src/aiCore/middleware/toolChoiceMiddleware.ts
+deleted file mode 100644
+index 7bb00af..0000000
+--- a/src/aiCore/middleware/toolChoiceMiddleware.ts
++++ /dev/null
+@@ -1,45 +0,0 @@
+-import { loggerService } from '@logger'
+-import type { LanguageModelMiddleware } from 'ai'
+-
+-const logger = loggerService.withContext('toolChoiceMiddleware')
+-
+-/**
+- * Tool Choice Middleware
+- * Controls tool selection strategy across multiple rounds of tool calls:
+- * - First round: Forces the model to call a specific tool (e.g., knowledge base search)
+- * - Subsequent rounds: Allows the model to automatically choose any available tool
+- *
+- * This ensures knowledge base is consulted first while still enabling MCP tools
+- * and other capabilities in follow-up interactions.
+- *
+- * @param forceFirstToolName - The tool name to force on the first round
+- * @returns LanguageModelMiddleware
+- */
+-export function toolChoiceMiddleware(forceFirstToolName: string): LanguageModelMiddleware {
+-  let toolCallRound = 0
+-
+-  return {
+-    middlewareVersion: 'v2',
+-
+-    transformParams: async ({ params }) => {
+-      toolCallRound++
+-
+-      const transformedParams = { ...params }
+-
+-      if (toolCallRound === 1) {
+-        // First round: force the specified tool
+-        logger.debug(`Round ${toolCallRound}: Forcing tool choice to '${forceFirstToolName}'`)
+-        transformedParams.toolChoice = {
+-          type: 'tool',
+-          toolName: forceFirstToolName
+-        }
+-      } else {
+-        // Subsequent rounds: allow automatic tool selection
+-        logger.debug(`Round ${toolCallRound}: Using automatic tool choice`)
+-        transformedParams.toolChoice = { type: 'auto' }
+-      }
+-
+-      return transformedParams
+-    }
+-  }
+-}
+diff --git a/src/aiCore/plugins/PluginBuilder.ts b/src/aiCore/plugins/PluginBuilder.ts
+index d210455..74227d1 100644
+--- a/src/aiCore/plugins/PluginBuilder.ts
++++ b/src/aiCore/plugins/PluginBuilder.ts
+@@ -1,11 +1,25 @@
+ import type { AiPlugin } from '@cherrystudio/ai-core'
+ import { createPromptToolUsePlugin, webSearchPlugin } from '@cherrystudio/ai-core/built-in/plugins'
+ import { loggerService } from '@logger'
++import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+ import type { Assistant } from '@renderer/types'
++import { SystemProviderIds } from '@renderer/types'
++import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ 
+-import type { AiSdkMiddlewareConfig } from '../middleware/AiSdkMiddlewareBuilder'
++import { getAiSdkProviderId } from '../provider/factory'
++import type { AiSdkMiddlewareConfig } from '../types/middlewareConfig'
++import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
++import { getReasoningTagName } from '../utils/reasoning'
++import { createAnthropicCachePlugin } from './anthropicCachePlugin'
++import { createNoThinkPlugin } from './noThinkPlugin'
++import { createOpenrouterGenerateImagePlugin } from './openrouterGenerateImagePlugin'
++import { createOpenrouterReasoningPlugin } from './openrouterReasoningPlugin'
++import { createQwenThinkingPlugin } from './qwenThinkingPlugin'
++import { createReasoningExtractionPlugin } from './reasoningExtractionPlugin'
+ import { searchOrchestrationPlugin } from './searchOrchestrationPlugin'
++import { createSimulateStreamingPlugin } from './simulateStreamingPlugin'
++import { createSkipGeminiThoughtSignaturePlugin } from './skipGeminiThoughtSignaturePlugin'
+ import { createTelemetryPlugin } from './telemetryPlugin'
+ 
+ const logger = loggerService.withContext('PluginBuilder')
+@@ -15,7 +29,7 @@ const logger = loggerService.withContext('PluginBuilder')
+ export function buildPlugins(
+   middlewareConfig: AiSdkMiddlewareConfig & { assistant: Assistant; topicId?: string }
+ ): AiPlugin[] {
+-  const plugins: AiPlugin[] = []
++  const plugins: AiPlugin<any, any>[] = []
+ 
+   if (middlewareConfig.topicId && getEnableDeveloperMode()) {
+     // 0. 添加 telemetry 插件
+@@ -28,6 +42,63 @@ export function buildPlugins(
+     )
+   }
+ 
++  // === AI SDK Middleware Plugins ===
++
++  // 0.1 Simulate streaming for non-streaming requests
++  if (!middlewareConfig.streamOutput) {
++    plugins.push(createSimulateStreamingPlugin())
++  }
++
++  // 0.2 Reasoning extraction for OpenAI/Azure providers
++  if (middlewareConfig.provider) {
++    const providerType = middlewareConfig.provider.type
++    if (providerType === 'openai' || providerType === 'azure-openai') {
++      const tagName = getReasoningTagName(middlewareConfig.model?.id.toLowerCase())
++      plugins.push(createReasoningExtractionPlugin({ tagName }))
++    }
++
++    if (providerType === 'anthropic' && middlewareConfig.provider.anthropicCacheControl?.tokenThreshold) {
++      plugins.push(createAnthropicCachePlugin())
++    }
++  }
++
++  // 0.3 OpenRouter reasoning redaction
++  if (middlewareConfig.provider?.id === SystemProviderIds.openrouter) {
++    plugins.push(createOpenrouterReasoningPlugin())
++  }
++
++  // 0.4 OVMS no-think for MCP tools
++  if (middlewareConfig.provider?.id === 'ovms' && middlewareConfig.mcpTools && middlewareConfig.mcpTools.length > 0) {
++    plugins.push(createNoThinkPlugin())
++  }
++
++  // 0.5 Qwen thinking control for providers without enable_thinking support
++  if (
++    middlewareConfig.provider &&
++    middlewareConfig.model &&
++    !isOllamaProvider(middlewareConfig.provider) &&
++    isSupportedThinkingTokenQwenModel(middlewareConfig.model) &&
++    !isSupportEnableThinkingProvider(middlewareConfig.provider)
++  ) {
++    const enableThinking = middlewareConfig.assistant?.settings?.reasoning_effort !== undefined
++    plugins.push(createQwenThinkingPlugin(enableThinking))
++  }
++
++  // 0.6 OpenRouter Gemini image generation
++  if (
++    middlewareConfig.model &&
++    middlewareConfig.provider &&
++    isOpenRouterGeminiGenerateImageModel(middlewareConfig.model, middlewareConfig.provider)
++  ) {
++    plugins.push(createOpenrouterGenerateImagePlugin())
++  }
++
++  // 0.7 Skip Gemini3 thought signature
++  if (middlewareConfig.model && middlewareConfig.provider && isGemini3Model(middlewareConfig.model)) {
++    const aiSdkId = getAiSdkProviderId(middlewareConfig.provider)
++    plugins.push(createSkipGeminiThoughtSignaturePlugin(aiSdkId))
++  }
++
+   // 1. 模型内置搜索
+   if (middlewareConfig.enableWebSearch && middlewareConfig.webSearchPluginConfig) {
+     plugins.push(webSearchPlugin(middlewareConfig.webSearchPluginConfig))
+@@ -47,24 +118,7 @@ export function buildPlugins(
+     plugins.push(
+       createPromptToolUsePlugin({
+         enabled: true,
+-        mcpMode: middlewareConfig.mcpMode,
+-        createSystemMessage: (systemPrompt, params, context) => {
+-          const modelId = typeof context.model === 'string' ? context.model : context.model.modelId
+-          if (modelId.includes('o1-mini') || modelId.includes('o1-preview')) {
+-            if (context.isRecursiveCall) {
+-              return null
+-            }
+-            params.messages = [
+-              {
+-                role: 'assistant',
+-                content: systemPrompt
+-              },
+-              ...params.messages
+-            ]
+-            return null
+-          }
+-          return systemPrompt
+-        }
++        mcpMode: middlewareConfig.mcpMode
+       })
+     )
+   }
+diff --git a/src/aiCore/middleware/anthropicCacheMiddleware.ts b/src/aiCore/plugins/anthropicCachePlugin.ts
+similarity index 75%
+rename from src/aiCore/middleware/anthropicCacheMiddleware.ts
+rename to src/aiCore/plugins/anthropicCachePlugin.ts
+index 80a391b..eeac5c3 100644
+--- a/src/aiCore/middleware/anthropicCacheMiddleware.ts
++++ b/src/aiCore/plugins/anthropicCachePlugin.ts
+@@ -2,7 +2,8 @@
+  * Anthropic Prompt Caching Middleware
+  * @see https://ai-sdk.dev/providers/ai-sdk-providers/anthropic#cache-control
+  */
+-import type { LanguageModelV2Message } from '@ai-sdk/provider'
++import type { LanguageModelV3Message } from '@ai-sdk/provider'
++import { definePlugin } from '@cherrystudio/ai-core/core/plugins'
+ import { estimateTextTokens } from '@renderer/services/TokenService'
+ import type { Provider } from '@renderer/types'
+ import type { LanguageModelMiddleware } from 'ai'
+@@ -11,7 +12,7 @@ const cacheProviderOptions = {
+   anthropic: { cacheControl: { type: 'ephemeral' } }
+ }
+ 
+-function estimateContentTokens(content: LanguageModelV2Message['content']): number {
++function estimateContentTokens(content: LanguageModelV3Message['content']): number {
+   if (typeof content === 'string') return estimateTextTokens(content)
+   if (Array.isArray(content)) {
+     return content.reduce((acc, part) => {
+@@ -24,9 +25,9 @@ function estimateContentTokens(content: LanguageModelV2Message['content']): numb
+   return 0
+ }
+ 
+-export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
++function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
+   return {
+-    middlewareVersion: 'v2',
++    specificationVersion: 'v3',
+     transformParams: async ({ params }) => {
+       const settings = provider.anthropicCacheControl
+       if (!settings?.tokenThreshold || !Array.isArray(params.prompt) || params.prompt.length === 0) {
+@@ -40,7 +41,7 @@ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddl
+       // Cache system message (providerOptions on message object)
+       if (cacheSystemMessage) {
+         for (let i = 0; i < messages.length; i++) {
+-          const msg = messages[i] as LanguageModelV2Message
++          const msg = messages[i] as LanguageModelV3Message
+           if (msg.role === 'system' && estimateContentTokens(msg.content) >= tokenThreshold) {
+             messages[i] = { ...msg, providerOptions: cacheProviderOptions }
+             break
+@@ -53,13 +54,13 @@ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddl
+         const cumsumTokens = [] as Array<number>
+         let tokenSum = 0 as number
+         for (let i = 0; i < messages.length; i++) {
+-          const msg = messages[i] as LanguageModelV2Message
++          const msg = messages[i] as LanguageModelV3Message
+           tokenSum += estimateContentTokens(msg.content)
+           cumsumTokens.push(tokenSum)
+         }
+ 
+         for (let i = messages.length - 1; i >= 0 && cachedCount < cacheLastNMessages; i--) {
+-          const msg = messages[i] as LanguageModelV2Message
++          const msg = messages[i] as LanguageModelV3Message
+           if (msg.role === 'system' || cumsumTokens[i] < tokenThreshold || msg.content.length === 0) {
+             continue
+           }
+@@ -74,7 +75,7 @@ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddl
+           messages[i] = {
+             ...msg,
+             content: newContent
+-          } as LanguageModelV2Message
++          } as LanguageModelV3Message
+           cachedCount++
+         }
+       }
+@@ -83,3 +84,13 @@ export function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddl
+     }
+   }
+ }
++
++export const createAnthropicCachePlugin = () =>
++  definePlugin({
++    name: 'anthropicCache',
++    enforce: 'pre',
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(anthropicCacheMiddleware(context.provider))
++    }
++  })
+diff --git a/src/aiCore/middleware/noThinkMiddleware.ts b/src/aiCore/plugins/noThinkPlugin.ts
+similarity index 78%
+rename from src/aiCore/middleware/noThinkMiddleware.ts
+rename to src/aiCore/plugins/noThinkPlugin.ts
+index 3e56249..919d3ab 100644
+--- a/src/aiCore/middleware/noThinkMiddleware.ts
++++ b/src/aiCore/plugins/noThinkPlugin.ts
+@@ -1,7 +1,8 @@
++import { definePlugin } from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ import type { LanguageModelMiddleware } from 'ai'
+ 
+-const logger = loggerService.withContext('noThinkMiddleware')
++const logger = loggerService.withContext('noThinkPlugin')
+ 
+ /**
+  * No Think Middleware
+@@ -9,9 +10,9 @@ const logger = loggerService.withContext('noThinkMiddleware')
+  * This prevents the model from generating unnecessary thinking process and returns results directly
+  * @returns LanguageModelMiddleware
+  */
+-export function noThinkMiddleware(): LanguageModelMiddleware {
++function createNoThinkMiddleware(): LanguageModelMiddleware {
+   return {
+-    middlewareVersion: 'v2',
++    specificationVersion: 'v3',
+ 
+     transformParams: async ({ params }) => {
+       const transformedParams = { ...params }
+@@ -50,3 +51,14 @@ export function noThinkMiddleware(): LanguageModelMiddleware {
+     }
+   }
+ }
++
++export const createNoThinkPlugin = () =>
++  definePlugin({
++    name: 'noThink',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(createNoThinkMiddleware())
++    }
++  })
+diff --git a/src/aiCore/middleware/openrouterGenerateImageMiddleware.ts b/src/aiCore/plugins/openrouterGenerateImagePlugin.ts
+similarity index 67%
+rename from src/aiCore/middleware/openrouterGenerateImageMiddleware.ts
+rename to src/aiCore/plugins/openrouterGenerateImagePlugin.ts
+index 792192b..e446b5f 100644
+--- a/src/aiCore/middleware/openrouterGenerateImageMiddleware.ts
++++ b/src/aiCore/plugins/openrouterGenerateImagePlugin.ts
+@@ -1,3 +1,4 @@
++import { definePlugin } from '@cherrystudio/ai-core'
+ import type { LanguageModelMiddleware } from 'ai'
+ 
+ /**
+@@ -6,7 +7,7 @@ import type { LanguageModelMiddleware } from 'ai'
+  * https://openrouter.ai/docs/features/multimodal/image-generation
+  *
+  * Remarks:
+- * - The middleware declares middlewareVersion as 'v2'.
++ * - The middleware declares specificationVersion as 'v3'.
+  * - transformParams asynchronously clones the incoming params and sets
+  *   providerOptions.openrouter.modalities = ['image', 'text'], preserving other providerOptions and
+  *   openrouter fields when present.
+@@ -15,9 +16,9 @@ import type { LanguageModelMiddleware } from 'ai'
+  *
+  * @returns LanguageModelMiddleware - a middleware that augments providerOptions for OpenRouter to include image and text modalities.
+  */
+-export function openrouterGenerateImageMiddleware(): LanguageModelMiddleware {
++function createOpenrouterGenerateImageMiddleware(): LanguageModelMiddleware {
+   return {
+-    middlewareVersion: 'v2',
++    specificationVersion: 'v3',
+ 
+     transformParams: async ({ params }) => {
+       const transformedParams = { ...params }
+@@ -25,9 +26,19 @@ export function openrouterGenerateImageMiddleware(): LanguageModelMiddleware {
+         ...transformedParams.providerOptions,
+         openrouter: { ...transformedParams.providerOptions?.openrouter, modalities: ['image', 'text'] }
+       }
+-      transformedParams
+ 
+       return transformedParams
+     }
+   }
+ }
++
++export const createOpenrouterGenerateImagePlugin = () =>
++  definePlugin({
++    name: 'openrouterGenerateImage',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(createOpenrouterGenerateImageMiddleware())
++    }
++  })
+diff --git a/src/aiCore/middleware/openrouterReasoningMiddleware.ts b/src/aiCore/plugins/openrouterReasoningPlugin.ts
+similarity index 67%
+rename from src/aiCore/middleware/openrouterReasoningMiddleware.ts
+rename to src/aiCore/plugins/openrouterReasoningPlugin.ts
+index 9ef3df6..7363ccc 100644
+--- a/src/aiCore/middleware/openrouterReasoningMiddleware.ts
++++ b/src/aiCore/plugins/openrouterReasoningPlugin.ts
+@@ -1,4 +1,5 @@
+-import type { LanguageModelV2StreamPart } from '@ai-sdk/provider'
++import type { LanguageModelV3StreamPart } from '@ai-sdk/provider'
++import { definePlugin } from '@cherrystudio/ai-core'
+ import type { LanguageModelMiddleware } from 'ai'
+ 
+ /**
+@@ -6,10 +7,10 @@ import type { LanguageModelMiddleware } from 'ai'
+  *
+  * @returns LanguageModelMiddleware - a middleware filter redacted block
+  */
+-export function openrouterReasoningMiddleware(): LanguageModelMiddleware {
++function createOpenrouterReasoningMiddleware(): LanguageModelMiddleware {
+   const REDACTED_BLOCK = '[REDACTED]'
+   return {
+-    middlewareVersion: 'v2',
++    specificationVersion: 'v3',
+     wrapGenerate: async ({ doGenerate }) => {
+       const { content, ...rest } = await doGenerate()
+       const modifiedContent = content.map((part) => {
+@@ -27,10 +28,10 @@ export function openrouterReasoningMiddleware(): LanguageModelMiddleware {
+       const { stream, ...rest } = await doStream()
+       return {
+         stream: stream.pipeThrough(
+-          new TransformStream<LanguageModelV2StreamPart, LanguageModelV2StreamPart>({
++          new TransformStream<LanguageModelV3StreamPart, LanguageModelV3StreamPart>({
+             transform(
+-              chunk: LanguageModelV2StreamPart,
+-              controller: TransformStreamDefaultController<LanguageModelV2StreamPart>
++              chunk: LanguageModelV3StreamPart,
++              controller: TransformStreamDefaultController<LanguageModelV3StreamPart>
+             ) {
+               if (chunk.type === 'reasoning-delta' && chunk.delta.includes(REDACTED_BLOCK)) {
+                 controller.enqueue({
+@@ -48,3 +49,14 @@ export function openrouterReasoningMiddleware(): LanguageModelMiddleware {
+     }
+   }
+ }
++
++export const createOpenrouterReasoningPlugin = () =>
++  definePlugin({
++    name: 'openrouterReasoning',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(createOpenrouterReasoningMiddleware())
++    }
++  })
+diff --git a/src/aiCore/middleware/qwenThinkingMiddleware.ts b/src/aiCore/plugins/qwenThinkingPlugin.ts
+similarity index 72%
+rename from src/aiCore/middleware/qwenThinkingMiddleware.ts
+rename to src/aiCore/plugins/qwenThinkingPlugin.ts
+index 931831a..44bcdef 100644
+--- a/src/aiCore/middleware/qwenThinkingMiddleware.ts
++++ b/src/aiCore/plugins/qwenThinkingPlugin.ts
+@@ -1,3 +1,4 @@
++import { definePlugin } from '@cherrystudio/ai-core'
+ import type { LanguageModelMiddleware } from 'ai'
+ 
+ /**
+@@ -7,11 +8,11 @@ import type { LanguageModelMiddleware } from 'ai'
+  * @param enableThinking - Whether thinking mode is enabled (based on reasoning_effort !== undefined)
+  * @returns LanguageModelMiddleware
+  */
+-export function qwenThinkingMiddleware(enableThinking: boolean): LanguageModelMiddleware {
++function createQwenThinkingMiddleware(enableThinking: boolean): LanguageModelMiddleware {
+   const suffix = enableThinking ? ' /think' : ' /no_think'
+ 
+   return {
+-    middlewareVersion: 'v2',
++    specificationVersion: 'v3',
+ 
+     transformParams: async ({ params }) => {
+       const transformedParams = { ...params }
+@@ -37,3 +38,14 @@ export function qwenThinkingMiddleware(enableThinking: boolean): LanguageModelMi
+     }
+   }
+ }
++
++export const createQwenThinkingPlugin = (enableThinking: boolean) =>
++  definePlugin({
++    name: 'qwenThinking',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(createQwenThinkingMiddleware(enableThinking))
++    }
++  })
+diff --git a/src/aiCore/plugins/reasoningExtractionPlugin.ts b/src/aiCore/plugins/reasoningExtractionPlugin.ts
+new file mode 100644
+index 0000000..ec9ee0f
+--- /dev/null
++++ b/src/aiCore/plugins/reasoningExtractionPlugin.ts
+@@ -0,0 +1,22 @@
++import { definePlugin } from '@cherrystudio/ai-core'
++import { extractReasoningMiddleware } from 'ai'
++
++/**
++ * Reasoning Extraction Plugin
++ * Extracts reasoning/thinking tags from OpenAI/Azure responses
++ * Uses AI SDK's built-in extractReasoningMiddleware
++ */
++export const createReasoningExtractionPlugin = (options: { tagName?: string } = {}) =>
++  definePlugin({
++    name: 'reasoningExtraction',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(
++        extractReasoningMiddleware({
++          tagName: options.tagName || 'thinking'
++        })
++      )
++    }
++  })
+diff --git a/src/aiCore/plugins/searchOrchestrationPlugin.ts b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+index 5b095a4..8d352da 100644
+--- a/src/aiCore/plugins/searchOrchestrationPlugin.ts
++++ b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+@@ -6,7 +6,13 @@
+  * 2. transformParams: 根据意图分析结果动态添加对应的工具
+  * 3. onRequestEnd: 自动记忆存储
+  */
+-import { type AiRequestContext, definePlugin } from '@cherrystudio/ai-core'
++import {
++  type AiPlugin,
++  type AiRequestContext,
++  definePlugin,
++  type StreamTextParams,
++  type StreamTextResult
++} from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ // import { generateObject } from '@cherrystudio/ai-core'
+ import {
+@@ -236,18 +242,21 @@ async function storeConversationMemory(
+ /**
+  * 🎯 搜索编排插件
+  */
+-export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string) => {
++export const searchOrchestrationPlugin = (
++  assistant: Assistant,
++  topicId: string
++): AiPlugin<StreamTextParams, StreamTextResult> => {
+   // 存储意图分析结果
+   const intentAnalysisResults: { [requestId: string]: ExtractResults } = {}
+   const userMessages: { [requestId: string]: ModelMessage } = {}
+ 
+-  return definePlugin({
++  return definePlugin<StreamTextParams, StreamTextResult>({
+     name: 'search-orchestration',
+     enforce: 'pre', // 确保在其他插件之前执行
+     /**
+      * 🔍 Step 1: 意图识别阶段
+      */
+-    onRequestStart: async (context: AiRequestContext) => {
++    onRequestStart: async (context) => {
+       // 没开启任何搜索则不进行意图分析
+       if (!(assistant.webSearchProviderId || assistant.knowledge_bases?.length || assistant.enableMemory)) return
+ 
+@@ -297,7 +306,7 @@ export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string)
+     /**
+      * 🔧 Step 2: 工具配置阶段
+      */
+-    transformParams: async (params: any, context: AiRequestContext) => {
++    transformParams: async (params, context) => {
+       // logger.info('🔧 Configuring tools based on intent...', context.requestId)
+ 
+       try {
+@@ -371,11 +380,12 @@ export const searchOrchestrationPlugin = (assistant: Assistant, topicId: string)
+      * 💾 Step 3: 记忆存储阶段
+      */
+ 
+-    onRequestEnd: async (context: AiRequestContext) => {
++    onRequestEnd: async (context) => {
+       // context.isAnalyzing = false
+       // logger.info('context.isAnalyzing', context, result)
+       // logger.info('💾 Starting memory storage...', context.requestId)
+       try {
++        // ✅ 类型安全访问：context.originalParams 已通过泛型正确类型化
+         const messages = context.originalParams.messages
+ 
+         if (messages && assistant) {
+diff --git a/src/aiCore/plugins/simulateStreamingPlugin.ts b/src/aiCore/plugins/simulateStreamingPlugin.ts
+new file mode 100644
+index 0000000..fc4c35d
+--- /dev/null
++++ b/src/aiCore/plugins/simulateStreamingPlugin.ts
+@@ -0,0 +1,18 @@
++import { definePlugin } from '@cherrystudio/ai-core'
++import { simulateStreamingMiddleware } from 'ai'
++
++/**
++ * Simulate Streaming Plugin
++ * Converts non-streaming responses to streaming format
++ * Uses AI SDK's built-in simulateStreamingMiddleware
++ */
++export const createSimulateStreamingPlugin = () =>
++  definePlugin({
++    name: 'simulateStreaming',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(simulateStreamingMiddleware())
++    }
++  })
+diff --git a/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts b/src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts
+similarity index 86%
+rename from src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
+rename to src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts
+index 3fc72be..b7e53b4 100644
+--- a/src/aiCore/middleware/skipGeminiThoughtSignatureMiddleware.ts
++++ b/src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts
+@@ -1,7 +1,8 @@
++import { definePlugin } from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ import type { LanguageModelMiddleware } from 'ai'
+ 
+-const logger = loggerService.withContext('skipGeminiThoughtSignatureMiddleware')
++const logger = loggerService.withContext('skipGeminiThoughtSignaturePlugin')
+ 
+ /**
+  * skip Gemini Thought Signature Middleware
+@@ -21,10 +22,10 @@ const logger = loggerService.withContext('skipGeminiThoughtSignatureMiddleware')
+  * @param aiSdkId AI SDK Provider ID
+  * @returns LanguageModelMiddleware
+  */
+-export function skipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageModelMiddleware {
++function createSkipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageModelMiddleware {
+   const MAGIC_STRING = 'skip_thought_signature_validator'
+   return {
+-    middlewareVersion: 'v2',
++    specificationVersion: 'v3',
+ 
+     transformParams: async ({ params }) => {
+       const transformedParams = { ...params }
+@@ -76,3 +77,14 @@ export function skipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageM
+     }
+   }
+ }
++
++export const createSkipGeminiThoughtSignaturePlugin = (aiSdkId: string) =>
++  definePlugin({
++    name: 'skipGeminiThoughtSignature',
++    enforce: 'pre',
++
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(createSkipGeminiThoughtSignatureMiddleware(aiSdkId))
++    }
++  })
+diff --git a/src/aiCore/plugins/telemetryPlugin.ts b/src/aiCore/plugins/telemetryPlugin.ts
+index 485d339..ab986cc 100644
+--- a/src/aiCore/plugins/telemetryPlugin.ts
++++ b/src/aiCore/plugins/telemetryPlugin.ts
+@@ -6,13 +6,15 @@
+  * 集成 AiSdkSpanAdapter 将 AI SDK trace 数据转换为现有格式
+  */
+ 
+-import { definePlugin } from '@cherrystudio/ai-core'
++import type { AiPlugin } from '@cherrystudio/ai-core'
++import { definePlugin, type StreamTextParams, type StreamTextResult } from '@cherrystudio/ai-core'
+ import { loggerService } from '@logger'
+ import type { Context, Span, SpanContext, Tracer } from '@opentelemetry/api'
+ import { context as otelContext, trace } from '@opentelemetry/api'
+ import { currentSpan } from '@renderer/services/SpanManagerService'
+ import { webTraceService } from '@renderer/services/WebTraceService'
+ import type { Assistant } from '@renderer/types'
++import type { TelemetrySettings } from 'ai'
+ 
+ import { AiSdkSpanAdapter } from '../trace/AiSdkSpanAdapter'
+ 
+@@ -59,6 +61,107 @@ class AdapterTracer {
+     })
+   }
+ 
++  startSpan(name: string, options?: any, context?: any): Span {
++    logger.debug('AdapterTracer.startSpan called', {
++      spanName: name,
++      topicId: this.topicId,
++      modelName: this.modelName
++    })
++
++    // 创建包含父 SpanContext 的上下文（如果有的话）
++    const createContextWithParent = () => {
++      if (this.cachedParentContext) {
++        return this.cachedParentContext
++      }
++      if (this.parentSpanContext) {
++        try {
++          const ctx = trace.setSpanContext(otelContext.active(), this.parentSpanContext)
++          logger.debug('Created active context with parent SpanContext for startSpan', {
++            spanName: name,
++            parentTraceId: this.parentSpanContext.traceId,
++            parentSpanId: this.parentSpanContext.spanId,
++            topicId: this.topicId
++          })
++          return ctx
++        } catch (error) {
++          logger.warn('Failed to create context with parent SpanContext in startSpan', error as Error)
++        }
++      }
++      return otelContext.active()
++    }
++
++    const ctx = context ?? createContextWithParent()
++    const span = this.originalTracer.startSpan(name, options, ctx)
++
++    // 注入父子关系属性（兜底重建层级用）
++    try {
++      if (this.parentSpanContext) {
++        span.setAttribute('trace.parentSpanId', this.parentSpanContext.spanId)
++        span.setAttribute('trace.parentTraceId', this.parentSpanContext.traceId)
++      }
++      if (this.topicId) {
++        span.setAttribute('trace.topicId', this.topicId)
++      }
++    } catch (e) {
++      logger.debug('Failed to set trace parent attributes in startSpan', e as Error)
++    }
++
++    // 包装span的end方法
++    const originalEnd = span.end.bind(span)
++    span.end = (endTime?: any) => {
++      logger.debug('AI SDK span.end() called in startSpan - about to convert span', {
++        spanName: name,
++        spanId: span.spanContext().spanId,
++        traceId: span.spanContext().traceId,
++        topicId: this.topicId,
++        modelName: this.modelName
++      })
++
++      // 调用原始 end 方法
++      originalEnd(endTime)
++
++      // 转换并保存 span 数据
++      try {
++        logger.debug('Converting AI SDK span to SpanEntity (from startSpan)', {
++          spanName: name,
++          spanId: span.spanContext().spanId,
++          traceId: span.spanContext().traceId,
++          topicId: this.topicId,
++          modelName: this.modelName
++        })
++        logger.silly('span', span)
++        const spanEntity = AiSdkSpanAdapter.convertToSpanEntity({
++          span,
++          topicId: this.topicId,
++          modelName: this.modelName
++        })
++
++        // 保存转换后的数据
++        window.api.trace.saveEntity(spanEntity)
++
++        logger.debug('AI SDK span converted and saved successfully (from startSpan)', {
++          spanName: name,
++          spanId: span.spanContext().spanId,
++          traceId: span.spanContext().traceId,
++          topicId: this.topicId,
++          modelName: this.modelName,
++          hasUsage: !!spanEntity.usage,
++          usage: spanEntity.usage
++        })
++      } catch (error) {
++        logger.error('Failed to convert AI SDK span (from startSpan)', error as Error, {
++          spanName: name,
++          spanId: span.spanContext().spanId,
++          traceId: span.spanContext().traceId,
++          topicId: this.topicId,
++          modelName: this.modelName
++        })
++      }
++    }
++
++    return span
++  }
++
+   startActiveSpan<F extends (span: Span) => any>(name: string, fn: F): ReturnType<F>
+   startActiveSpan<F extends (span: Span) => any>(name: string, options: any, fn: F): ReturnType<F>
+   startActiveSpan<F extends (span: Span) => any>(name: string, options: any, context: any, fn: F): ReturnType<F>
+@@ -187,10 +290,10 @@ class AdapterTracer {
+   }
+ }
+ 
+-export function createTelemetryPlugin(config: TelemetryPluginConfig) {
++export function createTelemetryPlugin(config: TelemetryPluginConfig): AiPlugin<StreamTextParams, StreamTextResult> {
+   const { enabled = true, recordInputs = true, recordOutputs = true, topicId } = config
+ 
+-  return definePlugin({
++  return definePlugin<StreamTextParams, StreamTextResult>({
+     name: 'telemetryPlugin',
+     enforce: 'pre', // 在其他插件之前执行，确保 telemetry 配置被正确注入
+ 
+@@ -275,7 +378,7 @@ export function createTelemetryPlugin(config: TelemetryPluginConfig) {
+         isEnabled: true,
+         recordInputs,
+         recordOutputs,
+-        tracer: adapterTracer, // 使用包装后的 tracer
++        tracer: adapterTracer,
+         functionId: `ai-request-${context.requestId}`,
+         metadata: {
+           providerId: context.providerId,
+@@ -286,11 +389,11 @@ export function createTelemetryPlugin(config: TelemetryPluginConfig) {
+           // 确保topicId也作为标准属性传递
+           'trace.topicId': effectiveTopicId,
+           'trace.modelName': modelName,
+-          // 添加父span信息用于调试
+-          parentSpanId: parentSpanContext?.spanId,
+-          parentTraceId: parentSpanContext?.traceId
++          // 添加父span信息用于调试（只在有值时添加）
++          ...(parentSpanContext?.spanId && { parentSpanId: parentSpanContext.spanId }),
++          ...(parentSpanContext?.traceId && { parentTraceId: parentSpanContext.traceId })
+         }
+-      }
++      } satisfies TelemetrySettings
+ 
+       // 如果有父span，尝试在telemetry配置中设置父上下文
+       if (parentSpan) {
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 9d15bd2..52bf89b 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -48,7 +48,7 @@ import { getMaxTokens, getTemperature, getTopP } from './modelParameters'
+ 
+ const logger = loggerService.withContext('parameterBuilder')
+ 
+-type ProviderDefinedTool = Extract<Tool<any, any>, { type: 'provider-defined' }>
++type ProviderDefinedTool = Extract<Tool<any, any>, { type: 'provider' }>
+ 
+ function mapVertexAIGatewayModelToProviderId(model: Model): BaseProviderId | undefined {
+   if (isAnthropicModel(model)) {
+@@ -63,9 +63,7 @@ function mapVertexAIGatewayModelToProviderId(model: Model): BaseProviderId | und
+   if (isOpenAIModel(model)) {
+     return 'openai'
+   }
+-  logger.warn(
+-    `[mapVertexAIGatewayModelToProviderId] Unknown model type for AI Gateway: ${model.id}. Web search will not be enabled.`
+-  )
++  logger.warn(`Unknown model type for AI Gateway: ${model.id}. Web search will not be enabled.`)
+   return undefined
+ }
+ 
+@@ -196,17 +194,12 @@ export async function buildStreamTextParams(
+       case 'anthropic':
+       case 'azure-anthropic':
+       case 'google-vertex-anthropic':
+-        tools.web_fetch = (
+-          ['anthropic', 'azure-anthropic'].includes(aiSdkProviderId)
+-            ? anthropic.tools.webFetch_20250910({
+-                maxUses: webSearchConfig.maxResults,
+-                blockedDomains: blockedDomains.length > 0 ? blockedDomains : undefined
+-              })
+-            : vertexAnthropic.tools.webFetch_20250910({
+-                maxUses: webSearchConfig.maxResults,
+-                blockedDomains: blockedDomains.length > 0 ? blockedDomains : undefined
+-              })
+-        ) as ProviderDefinedTool
++        if (['anthropic', 'azure-anthropic'].includes(aiSdkProviderId)) {
++          tools.web_fetch = anthropic.tools.webFetch_20250910({
++            maxUses: webSearchConfig.maxResults,
++            blockedDomains: blockedDomains.length > 0 ? blockedDomains : undefined
++          }) as ProviderDefinedTool
++        }
+         break
+     }
+   }
+diff --git a/src/aiCore/tools/KnowledgeSearchTool.ts b/src/aiCore/tools/KnowledgeSearchTool.ts
+index 9a1a94f..beb9e1b 100644
+--- a/src/aiCore/tools/KnowledgeSearchTool.ts
++++ b/src/aiCore/tools/KnowledgeSearchTool.ts
+@@ -17,7 +17,6 @@ export const knowledgeSearchTool = (
+   userMessage?: string
+ ) => {
+   return tool({
+-    name: 'builtin_knowledge_search',
+     description: `Knowledge base search tool for retrieving information from user's private knowledge base. This searches your local collection of documents, web content, notes, and other materials you have stored.
+ 
+ This tool has been configured with search parameters based on the conversation context:
+@@ -103,7 +102,7 @@ You can use this tool as-is, or provide additionalContext to refine the search f
+       // 返回结果
+       return knowledgeReferencesData
+     },
+-    toModelOutput: (results) => {
++    toModelOutput: ({ output: results }) => {
+       let summary = 'No search needed based on the query analysis.'
+       if (results.length > 0) {
+         summary = `Found ${results.length} relevant sources. Use [number] format to cite specific information.`
+diff --git a/src/aiCore/tools/MemorySearchTool.ts b/src/aiCore/tools/MemorySearchTool.ts
+index 5028f2e..e407dee 100644
+--- a/src/aiCore/tools/MemorySearchTool.ts
++++ b/src/aiCore/tools/MemorySearchTool.ts
+@@ -11,7 +11,6 @@ import { MemoryProcessor } from '../../services/MemoryProcessor'
+  */
+ export const memorySearchTool = () => {
+   return tool({
+-    name: 'builtin_memory_search',
+     description: 'Search through conversation memories and stored facts for relevant context',
+     inputSchema: z.object({
+       query: z.string().describe('Search query to find relevant memories'),
+diff --git a/src/aiCore/tools/WebSearchTool.ts b/src/aiCore/tools/WebSearchTool.ts
+index 9545b64..d70b07c 100644
+--- a/src/aiCore/tools/WebSearchTool.ts
++++ b/src/aiCore/tools/WebSearchTool.ts
+@@ -20,7 +20,6 @@ export const webSearchToolWithPreExtractedKeywords = (
+   const webSearchProvider = WebSearchService.getWebSearchProvider(webSearchProviderId)
+ 
+   return tool({
+-    name: 'builtin_web_search',
+     description: `Web search tool for finding current information, news, and real-time data from the internet.
+ 
+ This tool has been configured with search parameters based on the conversation context:
+@@ -71,7 +70,7 @@ You can use this tool as-is to search with the prepared queries, or provide addi
+ 
+       return searchResults
+     },
+-    toModelOutput: (results) => {
++    toModelOutput: ({ output: results }) => {
+       let summary = 'No search needed based on the query analysis.'
+       if (results.query && results.results.length > 0) {
+         summary = `Found ${results.results.length} relevant sources. Use [number] format to cite specific information.`
+diff --git a/src/aiCore/types/middlewareConfig.ts b/src/aiCore/types/middlewareConfig.ts
+new file mode 100644
+index 0000000..41e0160
+--- /dev/null
++++ b/src/aiCore/types/middlewareConfig.ts
+@@ -0,0 +1,27 @@
++import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugins'
++import type { MCPTool } from '@renderer/types'
++import type { Assistant, Message, Model, Provider } from '@renderer/types'
++import type { Chunk } from '@renderer/types/chunk'
++
++/**
++ * AI SDK 中间件配置项（用于插件构建）
++ */
++export interface AiSdkMiddlewareConfig {
++  streamOutput: boolean
++  onChunk?: (chunk: Chunk) => void
++  model?: Model
++  provider?: Provider
++  assistant?: Assistant
++  enableReasoning: boolean
++  isPromptToolUse: boolean
++  isSupportedToolUse: boolean
++  isImageGenerationEndpoint: boolean
++  enableWebSearch: boolean
++  enableGenerateImage: boolean
++  enableUrlContext: boolean
++  mcpTools?: MCPTool[]
++  uiMessages?: Message[]
++  webSearchPluginConfig?: WebSearchPluginConfig
++  knowledgeRecognition?: 'off' | 'on'
++  mcpMode?: string
++}
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index b6bd63e..c2f8bf6 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -3,14 +3,13 @@ import { type AnthropicProviderOptions } from '@ai-sdk/anthropic'
+ import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
+ import type { OpenAIResponsesProviderOptions } from '@ai-sdk/openai'
+ import type { XaiProviderOptions } from '@ai-sdk/xai'
+-import { baseProviderIdSchema, customProviderIdSchema, hasProviderConfig } from '@cherrystudio/ai-core/provider'
++import { baseProviderIdSchema, customProviderIdSchema } from '@cherrystudio/ai-core/provider'
+ import { loggerService } from '@logger'
+ import {
+   getModelSupportedVerbosity,
+   isAnthropicModel,
+   isGeminiModel,
+   isGrokModel,
+-  isInterleavedThinkingModel,
+   isOpenAIModel,
+   isOpenAIOpenWeightModel,
+   isQwenMTModel,
+@@ -606,7 +605,7 @@ function buildGenericProviderOptions(
+     enableGenerateImage: boolean
+   }
+ ): Record<string, any> {
+-  const { enableWebSearch, enableReasoning } = capabilities
++  const { enableWebSearch } = capabilities
+   let providerOptions: Record<string, any> = {}
+ 
+   const reasoningParams = getReasoningEffort(assistant, model)
+@@ -614,19 +613,6 @@ function buildGenericProviderOptions(
+     ...providerOptions,
+     ...reasoningParams
+   }
+-  if (enableReasoning) {
+-    if (isInterleavedThinkingModel(model)) {
+-      // sendReasoning is a patch specific to @ai-sdk/openai-compatible
+-      // Only apply when provider will actually use openai-compatible SDK
+-      // (i.e., no dedicated SDK registered OR explicitly openai-compatible)
+-      if (!hasProviderConfig(providerId) || providerId === 'openai-compatible') {
+-        providerOptions = {
+-          ...providerOptions,
+-          sendReasoning: true
+-        }
+-      }
+-    }
+-  }
+ 
+   if (enableWebSearch) {
+     const webSearchParams = getWebSearchParams(model)
+@@ -653,10 +639,6 @@ function buildGenericProviderOptions(
+     }
+   }
+ 
+-  if (isOpenAIModel(model)) {
+-    providerOptions.strictJsonSchema = false
+-  }
+-
+   return {
+     [providerId]: providerOptions
+   }
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 0c60efc..4a5b8ec 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -9,6 +9,7 @@ import {
+   findTokenLimit,
+   GEMINI_FLASH_MODEL_REGEX,
+   getModelSupportedReasoningEffortOptions,
++  isClaude46SeriesModel,
+   isDeepSeekHybridInferenceModel,
+   isDoubaoSeed18Model,
+   isDoubaoSeedAfter251015,
+@@ -18,7 +19,6 @@ import {
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+   isOpenAIReasoningModel,
+-  isOpus46Model,
+   isQwenAlwaysThinkModel,
+   isQwenReasoningModel,
+   isReasoningModel,
+@@ -559,7 +559,7 @@ export function getAnthropicThinkingBudget(
+  * Extracted from AnthropicAPIClient logic.
+  *
+  * Returns different parameter shapes depending on the model:
+- * - **Opus 4.6**: `{ thinking: { type: 'adaptive' }, effort: 'low' | 'medium' | 'high' | 'max' }`
++ * - **Claude 4.6**: `{ thinking: { type: 'adaptive' }, effort: 'low' | 'medium' | 'high' | 'max' }`
+  *   Uses the new adaptive thinking API with effort-based control.
+  * - **Other Claude models** (4.0, 4.1, 4.5, etc.): `{ thinking: { type: 'enabled', budgetTokens: number } }`
+  *   Uses the classic thinking API with explicit token budget.
+@@ -588,10 +588,10 @@ export function getAnthropicReasoningParams(
+ 
+   // Claude reasoning parameters
+   if (isSupportedThinkingTokenClaudeModel(model)) {
+-    // Opus 4.6 uses adaptive thinking + effort parameters
+-    // Map reasoningEffort to Opus 4.6 supported effort values
+-    if (isOpus46Model(model)) {
+-      // Opus 4.6 supports: low, medium, high, max
++    // Claude 4.6 uses adaptive thinking + effort parameters
++    // Map reasoningEffort to Claude 4.6 supported effort values
++    if (isClaude46SeriesModel(model)) {
++      // Claude 4.6 supports: low, medium, high, max
+       // Mapping rules: default/none -> no effort (uses default high)
+       //                minimal/low -> low
+       //                medium -> medium
+@@ -772,8 +772,8 @@ export function getBedrockReasoningParams(
+     return {}
+   }
+ 
+-  // Opus 4.6 uses adaptive thinking + maxReasoningEffort
+-  if (isOpus46Model(model)) {
++  // Claude 4.6 uses adaptive thinking + maxReasoningEffort
++  if (isClaude46SeriesModel(model)) {
+     const effortMap = {
+       auto: undefined,
+       minimal: 'low',
+@@ -834,3 +834,21 @@ export function getCustomParameters(assistant: Assistant): Record<string, any> {
+     }, {}) || {}
+   )
+ }
++
++/**
++ * Get reasoning tag name based on model ID
++ * Used for extractReasoningMiddleware configuration
++ */
++export function getReasoningTagName(modelId: string | undefined): string {
++  const tagName = {
++    reasoning: 'reasoning',
++    think: 'think',
++    thought: 'thought',
++    seedThink: 'seed:think'
++  }
++
++  if (modelId?.includes('gpt-oss')) return tagName.reasoning
++  if (modelId?.includes('gemini')) return tagName.thought
++  if (modelId?.includes('seed-oss-36b')) return tagName.seedThink
++  return tagName.think
++}
