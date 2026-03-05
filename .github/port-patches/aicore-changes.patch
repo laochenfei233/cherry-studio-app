@@ -1,0 +1,633 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index fcea6ac..6a7cad8 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -9,7 +9,7 @@ import { WEB_SEARCH_SOURCE } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { ProviderSpecificError } from '@renderer/types/provider-specific-error'
+-import { formatErrorMessage } from '@renderer/utils/error'
++import { formatErrorMessage, isAbortError } from '@renderer/utils/error'
+ import { convertLinks, flushLinkConverterBuffer } from '@renderer/utils/linkConverter'
+ import type { ClaudeCodeRawValue } from '@shared/agents/claudecode/types'
+ import { AISDKError, type TextStreamPart, type ToolSet } from 'ai'
+@@ -65,13 +65,23 @@ export class AiSdkToChunkAdapter {
+    * @returns 最终的文本内容
+    */
+   async processStream(aiSdkResult: any): Promise<string> {
+-    // 如果是流式且有 fullStream
+-    if (aiSdkResult.fullStream) {
+-      await this.readFullStream(aiSdkResult.fullStream)
+-    }
++    try {
++      // 如果是流式且有 fullStream
++      if (aiSdkResult.fullStream) {
++        await this.readFullStream(aiSdkResult.fullStream)
++      }
+ 
+-    // 使用 streamResult.text 获取最终结果
+-    return await aiSdkResult.text
++      // 使用 streamResult.text 获取最终结果
++      return await aiSdkResult.text
++    } catch (error: any) {
++      // abort 时，AI SDK 通常会先通过流发送 'abort' chunk（在 readFullStream 中 convertAndEmitChunk
++      // 转为 ERROR chunk 发出）。随后 aiSdkResult.text 会抛出 AbortError
++      // 这里捕获它以避免 transformMessagesAndFetch 的 catch 再次发送重复的 ERROR chunk
++      if (isAbortError(error)) {
++        return ''
++      }
++      throw error
++    }
+   }
+ 
+   /**
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index e8a30e0..cae49ff 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -307,18 +307,12 @@ export default class ModernAiProvider {
+     params: StreamTextParams,
+     config: ModernAiProviderConfig
+   ): Promise<CompletionsResult> {
+-    // const modelId = this.model!.id
+-    // logger.info('Starting modernCompletions', {
+-    //   modelId,
+-    //   providerId: this.config!.providerId,
+-    //   topicId: config.topicId,
+-    //   hasOnChunk: !!config.onChunk,
+-    //   hasTools: !!params.tools && Object.keys(params.tools).length > 0,
+-    //   toolCount: params.tools ? Object.keys(params.tools).length : 0
+-    // })
+-
+     // 根据条件构建插件数组
+-    const plugins = buildPlugins(config)
++    const plugins = buildPlugins({
++      provider: this.actualProvider,
++      model: this.model!,
++      config
++    })
+ 
+     // 用构建好的插件数组创建executor
+     const executor = createExecutor(this.config!.providerId, this.config!.options, plugins)
+diff --git a/src/aiCore/plugins/PluginBuilder.ts b/src/aiCore/plugins/PluginBuilder.ts
+index 74227d1..760f24c 100644
+--- a/src/aiCore/plugins/PluginBuilder.ts
++++ b/src/aiCore/plugins/PluginBuilder.ts
+@@ -3,7 +3,7 @@ import { createPromptToolUsePlugin, webSearchPlugin } from '@cherrystudio/ai-cor
+ import { loggerService } from '@logger'
+ import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+-import type { Assistant } from '@renderer/types'
++import type { Assistant, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+ import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ 
+@@ -23,107 +23,115 @@ import { createSkipGeminiThoughtSignaturePlugin } from './skipGeminiThoughtSigna
+ import { createTelemetryPlugin } from './telemetryPlugin'
+ 
+ const logger = loggerService.withContext('PluginBuilder')
++
++/**
++ * 构建插件的上下文参数
++ *
++ * provider 和 model 是必选的 — 由 ModernAiProvider 内部注入，
++ * 不再依赖调用方手动传入，从根本上避免遗漏。
++ */
++export interface BuildPluginsContext {
++  provider: Provider
++  model: Model
++  config: AiSdkMiddlewareConfig & { assistant: Assistant; topicId?: string }
++}
++
+ /**
+  * 根据条件构建插件数组
+  */
+-export function buildPlugins(
+-  middlewareConfig: AiSdkMiddlewareConfig & { assistant: Assistant; topicId?: string }
+-): AiPlugin[] {
++export function buildPlugins({ provider, model, config }: BuildPluginsContext): AiPlugin[] {
+   const plugins: AiPlugin<any, any>[] = []
+ 
+-  if (middlewareConfig.topicId && getEnableDeveloperMode()) {
++  if (config.topicId && getEnableDeveloperMode()) {
+     // 0. 添加 telemetry 插件
+     plugins.push(
+       createTelemetryPlugin({
+         enabled: true,
+-        topicId: middlewareConfig.topicId,
+-        assistant: middlewareConfig.assistant
++        topicId: config.topicId,
++        assistant: config.assistant
+       })
+     )
+   }
+ 
+   // === AI SDK Middleware Plugins ===
++  // 注意：wrapLanguageModel 会 .reverse() middleware 数组，
++  // 数组中靠前的 middleware 反转后变成最外层包装。
++  // extractReasoning 必须在 simulateStreaming 之前推入，
++  // 这样反转后 extractReasoning 在外层，其 wrapStream（状态机）
++  // 能处理 simulateStreaming 生成的模拟流中的未闭合 <think> 标签。
++
++  // 0.1 Reasoning extraction for OpenAI/Azure providers
++  const providerType = provider.type
++  if (providerType === 'openai' || providerType === 'azure-openai') {
++    const tagName = getReasoningTagName(model.id.toLowerCase())
++    plugins.push(createReasoningExtractionPlugin({ tagName }))
++  }
+ 
+-  // 0.1 Simulate streaming for non-streaming requests
+-  if (!middlewareConfig.streamOutput) {
++  // 0.2 Simulate streaming for non-streaming requests (must be AFTER reasoning extraction in array)
++  if (!config.streamOutput) {
+     plugins.push(createSimulateStreamingPlugin())
+   }
+ 
+-  // 0.2 Reasoning extraction for OpenAI/Azure providers
+-  if (middlewareConfig.provider) {
+-    const providerType = middlewareConfig.provider.type
+-    if (providerType === 'openai' || providerType === 'azure-openai') {
+-      const tagName = getReasoningTagName(middlewareConfig.model?.id.toLowerCase())
+-      plugins.push(createReasoningExtractionPlugin({ tagName }))
+-    }
+-
+-    if (providerType === 'anthropic' && middlewareConfig.provider.anthropicCacheControl?.tokenThreshold) {
+-      plugins.push(createAnthropicCachePlugin())
+-    }
++  if (provider.anthropicCacheControl?.tokenThreshold) {
++    plugins.push(createAnthropicCachePlugin(provider))
+   }
+ 
+   // 0.3 OpenRouter reasoning redaction
+-  if (middlewareConfig.provider?.id === SystemProviderIds.openrouter) {
++  if (provider.id === SystemProviderIds.openrouter) {
+     plugins.push(createOpenrouterReasoningPlugin())
+   }
+ 
+   // 0.4 OVMS no-think for MCP tools
+-  if (middlewareConfig.provider?.id === 'ovms' && middlewareConfig.mcpTools && middlewareConfig.mcpTools.length > 0) {
++  if (provider.id === 'ovms' && config.mcpTools && config.mcpTools.length > 0) {
+     plugins.push(createNoThinkPlugin())
+   }
+ 
+   // 0.5 Qwen thinking control for providers without enable_thinking support
+   if (
+-    middlewareConfig.provider &&
+-    middlewareConfig.model &&
+-    !isOllamaProvider(middlewareConfig.provider) &&
+-    isSupportedThinkingTokenQwenModel(middlewareConfig.model) &&
+-    !isSupportEnableThinkingProvider(middlewareConfig.provider)
++    !isOllamaProvider(provider) &&
++    isSupportedThinkingTokenQwenModel(model) &&
++    !isSupportEnableThinkingProvider(provider)
+   ) {
+-    const enableThinking = middlewareConfig.assistant?.settings?.reasoning_effort !== undefined
++    const enableThinking = config.assistant?.settings?.reasoning_effort !== undefined
+     plugins.push(createQwenThinkingPlugin(enableThinking))
+   }
+ 
+   // 0.6 OpenRouter Gemini image generation
+-  if (
+-    middlewareConfig.model &&
+-    middlewareConfig.provider &&
+-    isOpenRouterGeminiGenerateImageModel(middlewareConfig.model, middlewareConfig.provider)
+-  ) {
++  if (isOpenRouterGeminiGenerateImageModel(model, provider)) {
+     plugins.push(createOpenrouterGenerateImagePlugin())
+   }
+ 
+   // 0.7 Skip Gemini3 thought signature
+-  if (middlewareConfig.model && middlewareConfig.provider && isGemini3Model(middlewareConfig.model)) {
+-    const aiSdkId = getAiSdkProviderId(middlewareConfig.provider)
++  if (isGemini3Model(model)) {
++    const aiSdkId = getAiSdkProviderId(provider)
+     plugins.push(createSkipGeminiThoughtSignaturePlugin(aiSdkId))
+   }
+ 
+   // 1. 模型内置搜索
+-  if (middlewareConfig.enableWebSearch && middlewareConfig.webSearchPluginConfig) {
+-    plugins.push(webSearchPlugin(middlewareConfig.webSearchPluginConfig))
++  if (config.enableWebSearch && config.webSearchPluginConfig) {
++    plugins.push(webSearchPlugin(config.webSearchPluginConfig))
+   }
+   // 2. 支持工具调用时添加搜索插件
+-  if (middlewareConfig.isSupportedToolUse || middlewareConfig.isPromptToolUse) {
+-    plugins.push(searchOrchestrationPlugin(middlewareConfig.assistant, middlewareConfig.topicId || ''))
++  if (config.isSupportedToolUse || config.isPromptToolUse) {
++    plugins.push(searchOrchestrationPlugin(config.assistant, config.topicId || ''))
+   }
+ 
+   // 3. 推理模型时添加推理插件
+-  // if (middlewareConfig.enableReasoning) {
++  // if (config.enableReasoning) {
+   //   plugins.push(reasoningTimePlugin)
+   // }
+ 
+   // 4. 启用Prompt工具调用时添加工具插件
+-  if (middlewareConfig.isPromptToolUse) {
++  if (config.isPromptToolUse) {
+     plugins.push(
+       createPromptToolUsePlugin({
+         enabled: true,
+-        mcpMode: middlewareConfig.mcpMode
++        mcpMode: config.mcpMode
+       })
+     )
+   }
+ 
+-  // if (middlewareConfig.enableUrlContext && middlewareConfig.) {
++  // if (config.enableUrlContext && config.) {
+   //   plugins.push(googleToolsPlugin({ urlContext: true }))
+   // }
+ 
+diff --git a/src/aiCore/plugins/anthropicCachePlugin.ts b/src/aiCore/plugins/anthropicCachePlugin.ts
+index eeac5c3..7edcfba 100644
+--- a/src/aiCore/plugins/anthropicCachePlugin.ts
++++ b/src/aiCore/plugins/anthropicCachePlugin.ts
+@@ -85,12 +85,12 @@ function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
+   }
+ }
+ 
+-export const createAnthropicCachePlugin = () =>
++export const createAnthropicCachePlugin = (provider: Provider) =>
+   definePlugin({
+     name: 'anthropicCache',
+     enforce: 'pre',
+     configureContext: (context) => {
+       context.middlewares = context.middlewares || []
+-      context.middlewares.push(anthropicCacheMiddleware(context.provider))
++      context.middlewares.push(anthropicCacheMiddleware(provider))
+     }
+   })
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 58b4834..7980a6f 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -20,7 +20,7 @@ import {
+ import type { Assistant, Model } from '@renderer/types'
+ import { defaultTimeout } from '@shared/config/constant'
+ 
+-import { getAnthropicThinkingBudget } from '../utils/reasoning'
++import { getThinkingBudget } from '../utils/reasoning'
+ 
+ /**
+  * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
+@@ -115,7 +115,7 @@ export function getMaxTokens(assistant: Assistant, model: Model): number | undef
+   const provider = getProviderByModel(model)
+   if (isSupportedThinkingTokenClaudeModel(model) && ['anthropic', 'aws-bedrock'].includes(provider.type)) {
+     const { reasoning_effort: reasoningEffort } = assistantSettings
+-    const budget = getAnthropicThinkingBudget(maxTokens, reasoningEffort, model.id)
++    const budget = getThinkingBudget(maxTokens, reasoningEffort, model.id)
+     if (budget) {
+       maxTokens -= budget
+     }
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 52bf89b..8dc9b40 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -77,6 +77,7 @@ export async function buildStreamTextParams(
+   provider: Provider,
+   options: {
+     mcpTools?: MCPTool[]
++    allowedTools?: string[]
+     webSearchProviderId?: string
+     webSearchConfig?: CherryWebSearchConfig
+     requestOptions?: {
+@@ -128,7 +129,7 @@ export async function buildStreamTextParams(
+ 
+   const enableGenerateImage = !!(isGenerateImageModel(model) && assistant.enableGenerateImage)
+ 
+-  let tools = setupToolsConfig(mcpTools)
++  let tools = setupToolsConfig(mcpTools, options.allowedTools)
+ 
+   // 构建真正的 providerOptions
+   const webSearchConfig: CherryWebSearchConfig = {
+@@ -269,6 +270,7 @@ export async function buildGenerateTextParams(
+   provider: Provider,
+   options: {
+     mcpTools?: MCPTool[]
++    allowedTools?: string[]
+     enableTools?: boolean
+   } = {}
+ ): Promise<any> {
+diff --git a/src/aiCore/types/middlewareConfig.ts b/src/aiCore/types/middlewareConfig.ts
+index 41e0160..3c61f32 100644
+--- a/src/aiCore/types/middlewareConfig.ts
++++ b/src/aiCore/types/middlewareConfig.ts
+@@ -1,16 +1,18 @@
+ import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugins'
+ import type { MCPTool } from '@renderer/types'
+-import type { Assistant, Message, Model, Provider } from '@renderer/types'
++import type { Assistant, Message } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
+ 
+ /**
+  * AI SDK 中间件配置项（用于插件构建）
++ *
++ * 注意：provider 和 model 不在此接口中。
++ * 它们是 ModernAiProvider 的固有属性（构造时确定），
++ * 由 ModernAiProvider 内部注入到 buildPlugins，避免调用方遗漏。
+  */
+ export interface AiSdkMiddlewareConfig {
+   streamOutput: boolean
+   onChunk?: (chunk: Chunk) => void
+-  model?: Model
+-  provider?: Provider
+   assistant?: Assistant
+   enableReasoning: boolean
+   isPromptToolUse: boolean
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index df7d69d..a9cd2fb 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -11,12 +11,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import {
+   getAnthropicReasoningParams,
+-  getAnthropicThinkingBudget,
+   getBedrockReasoningParams,
+   getCustomParameters,
+   getGeminiReasoningParams,
+   getOpenAIReasoningParams,
+   getReasoningEffort,
++  getThinkingBudget,
+   getXAIReasoningParams
+ } from '../reasoning'
+ 
+@@ -91,6 +91,7 @@ vi.mock('@renderer/config/models', async (importOriginal) => {
+     isSupportedThinkingTokenHunyuanModel: vi.fn(() => false),
+     isSupportedThinkingTokenModel: vi.fn(() => false),
+     isGPT51SeriesModel: vi.fn(() => false),
++    isGemini3ThinkingTokenModel: vi.fn(() => false),
+     findTokenLimit: vi.fn(actual.findTokenLimit)
+   }
+ })
+@@ -393,6 +394,54 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({ reasoning_effort: 'medium' })
+     })
+ 
++    it('should return camelCase reasoningEffort for Gemini 3 models', async () => {
++      const {
++        isReasoningModel,
++        isOpenAIDeepResearchModel,
++        isSupportedThinkingTokenGeminiModel,
++        isGemini3ThinkingTokenModel,
++        isQwenReasoningModel,
++        isSupportedThinkingTokenClaudeModel,
++        isSupportedThinkingTokenDoubaoModel,
++        isSupportedThinkingTokenZhipuModel,
++        isSupportedReasoningEffortModel,
++        isSupportedThinkingTokenQwenModel,
++        isSupportedThinkingTokenHunyuanModel,
++        isDeepSeekHybridInferenceModel
++      } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isOpenAIDeepResearchModel).mockReturnValue(false)
++      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(isGemini3ThinkingTokenModel).mockReturnValue(true)
++      vi.mocked(isQwenReasoningModel).mockReturnValue(false)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(isSupportedThinkingTokenDoubaoModel).mockReturnValue(false)
++      vi.mocked(isSupportedThinkingTokenZhipuModel).mockReturnValue(false)
++      vi.mocked(isSupportedReasoningEffortModel).mockReturnValue(false)
++      vi.mocked(isSupportedThinkingTokenQwenModel).mockReturnValue(false)
++      vi.mocked(isSupportedThinkingTokenHunyuanModel).mockReturnValue(false)
++      vi.mocked(isDeepSeekHybridInferenceModel).mockReturnValue(false)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: 'custom-provider'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'high'
++        }
++      } as Assistant
++
++      const result = getReasoningEffort(assistant, model)
++      // Should use camelCase 'reasoningEffort' for AI SDK openai-compatible provider compatibility
++      expect(result).toEqual({ reasoningEffort: 'high' })
++    })
++
+     it('should return empty for groq provider', async () => {
+       const { getProviderByModel } = await import('@renderer/services/AssistantService')
+ 
+@@ -997,14 +1046,14 @@ describe('reasoning utils', () => {
+     })
+   })
+ 
+-  describe('getAnthropicThinkingBudget', () => {
++  describe('getThinkingBudget', () => {
+     it('should return undefined when reasoningEffort is undefined', async () => {
+-      const result = getAnthropicThinkingBudget(4096, undefined, 'claude-3-7-sonnet')
++      const result = getThinkingBudget(4096, undefined, 'claude-3-7-sonnet')
+       expect(result).toBeUndefined()
+     })
+ 
+     it('should return undefined when reasoningEffort is none', async () => {
+-      const result = getAnthropicThinkingBudget(4096, 'none', 'claude-3-7-sonnet')
++      const result = getThinkingBudget(4096, 'none', 'claude-3-7-sonnet')
+       expect(result).toBeUndefined()
+     })
+ 
+@@ -1012,7 +1061,7 @@ describe('reasoning utils', () => {
+       const { findTokenLimit } = await import('@renderer/config/models')
+       vi.mocked(findTokenLimit).mockReturnValue(undefined)
+ 
+-      const result = getAnthropicThinkingBudget(4096, 'medium', 'unknown-model')
++      const result = getThinkingBudget(4096, 'medium', 'unknown-model')
+       expect(result).toBeUndefined()
+     })
+ 
+@@ -1020,7 +1069,7 @@ describe('reasoning utils', () => {
+       const { findTokenLimit } = await import('@renderer/config/models')
+       vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
+ 
+-      const result = getAnthropicThinkingBudget(4096, 'medium', 'claude-3-7-sonnet')
++      const result = getThinkingBudget(4096, 'medium', 'claude-3-7-sonnet')
+       // EFFORT_RATIO['medium'] = 0.5
+       // budget = Math.floor((32768 - 1024) * 0.5 + 1024)
+       // = Math.floor(31744 * 0.5 + 1024) = Math.floor(15872 + 1024) = 16896
+@@ -1033,7 +1082,7 @@ describe('reasoning utils', () => {
+       const { findTokenLimit } = await import('@renderer/config/models')
+       vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
+ 
+-      const result = getAnthropicThinkingBudget(undefined, 'medium', 'claude-3-7-sonnet')
++      const result = getThinkingBudget(undefined, 'medium', 'claude-3-7-sonnet')
+       // When maxTokens is undefined, budget is not constrained by maxTokens
+       // EFFORT_RATIO['medium'] = 0.5
+       // budget = Math.floor((32768 - 1024) * 0.5 + 1024)
+@@ -1046,7 +1095,7 @@ describe('reasoning utils', () => {
+       const { findTokenLimit } = await import('@renderer/config/models')
+       vi.mocked(findTokenLimit).mockReturnValue({ min: 100, max: 1000 })
+ 
+-      const result = getAnthropicThinkingBudget(500, 'low', 'claude-3-7-sonnet')
++      const result = getThinkingBudget(500, 'low', 'claude-3-7-sonnet')
+       // EFFORT_RATIO['low'] = 0.05
+       // budget = Math.floor((1000 - 100) * 0.05 + 100)
+       // = Math.floor(900 * 0.05 + 100) = Math.floor(45 + 100) = 145
+@@ -1059,7 +1108,7 @@ describe('reasoning utils', () => {
+       const { findTokenLimit } = await import('@renderer/config/models')
+       vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
+ 
+-      const result = getAnthropicThinkingBudget(8192, 'high', 'claude-3-7-sonnet')
++      const result = getThinkingBudget(8192, 'high', 'claude-3-7-sonnet')
+       // EFFORT_RATIO['high'] = 0.8
+       // budget = Math.floor((32768 - 1024) * 0.8 + 1024)
+       // = Math.floor(31744 * 0.8 + 1024) = Math.floor(25395.2 + 1024) = 26419
+@@ -1072,7 +1121,7 @@ describe('reasoning utils', () => {
+       const { findTokenLimit } = await import('@renderer/config/models')
+       vi.mocked(findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
+ 
+-      const result = getAnthropicThinkingBudget(undefined, 'high', 'claude-3-7-sonnet')
++      const result = getThinkingBudget(undefined, 'high', 'claude-3-7-sonnet')
+       // When maxTokens is undefined, budget is not constrained by maxTokens
+       // EFFORT_RATIO['high'] = 0.8
+       // budget = Math.floor((32768 - 1024) * 0.8 + 1024)
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index fd38030..76f3d22 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -9,14 +9,17 @@ import type { JSONSchema7 } from 'json-schema'
+ const logger = loggerService.withContext('MCP-utils')
+ 
+ // Setup tools configuration based on provided parameters
+-export function setupToolsConfig(mcpTools?: MCPTool[]): Record<string, Tool<any, any>> | undefined {
++export function setupToolsConfig(
++  mcpTools?: MCPTool[],
++  allowedTools?: string[]
++): Record<string, Tool<any, any>> | undefined {
+   let tools: ToolSet = {}
+ 
+   if (!mcpTools?.length) {
+     return undefined
+   }
+ 
+-  tools = convertMcpToolsToAiSdkTools(mcpTools)
++  tools = convertMcpToolsToAiSdkTools(mcpTools, allowedTools)
+ 
+   return tools
+ }
+@@ -76,7 +79,7 @@ export function mcpResultToTextSummary(result: MCPCallToolResponse): string {
+ /**
+  * 将 MCPTool 转换为 AI SDK 工具格式
+  */
+-export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[]): ToolSet {
++export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[], allowedTools?: string[]): ToolSet {
+   const tools: ToolSet = {}
+ 
+   for (const mcpTool of mcpTools) {
+@@ -88,7 +91,7 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[]): ToolSet {
+       execute: async (params, { toolCallId }) => {
+         // 检查是否启用自动批准
+         const server = getMcpServerByTool(mcpTool)
+-        const isAutoApproveEnabled = isToolAutoApproved(mcpTool, server)
++        const isAutoApproveEnabled = isToolAutoApproved(mcpTool, server, allowedTools)
+ 
+         let confirmed = true
+ 
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index c2f8bf6..a3d2d30 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -40,7 +40,7 @@ import { type AiSdkParam, isAiSdkParam, type OpenAIVerbosity } from '@renderer/t
+ import { isSupportServiceTierProvider, isSupportVerbosityProvider } from '@renderer/utils/provider'
+ import type { JSONValue } from 'ai'
+ import { t } from 'i18next'
+-import type { OllamaCompletionProviderOptions } from 'ollama-ai-provider-v2'
++import type { OllamaProviderOptions } from 'ollama-ai-provider-v2'
+ 
+ import { addAnthropicHeaders } from '../prepareParams/header'
+ import { getAiSdkProviderId } from '../provider/factory'
+@@ -573,19 +573,27 @@ function buildOllamaProviderOptions(
+     enableWebSearch: boolean
+     enableGenerateImage: boolean
+   }
+-): Record<string, OllamaCompletionProviderOptions> {
++): Record<string, OllamaProviderOptions> {
+   const { enableReasoning } = capabilities
+-  const providerOptions: OllamaCompletionProviderOptions = {}
++  const providerOptions: OllamaProviderOptions = {}
+   const reasoningEffort = assistant.settings?.reasoning_effort
+   if (enableReasoning) {
+     if (isOpenAIOpenWeightModel(model)) {
+-      // For gpt-oss models, Ollama accepts: 'low' | 'medium' | 'high'
++      // gpt-oss models accept 'low' | 'medium' | 'high' string values
+       if (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high') {
+         providerOptions.think = reasoningEffort
++      } else if (reasoningEffort === 'none') {
++        providerOptions.think = false
++      } else {
++        providerOptions.think = true
+       }
+     } else {
+-      providerOptions.think = !['none', undefined].includes(reasoningEffort)
++      // Other models: boolean only. undefined defaults to true (user enabled reasoning)
++      providerOptions.think = reasoningEffort !== 'none'
+     }
++  } else {
++    // Explicitly disable thinking when reasoning is turned off (fixes Issue #11612)
++    providerOptions.think = false
+   }
+   return {
+     ollama: providerOptions
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 4a5b8ec..5dade03 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -406,7 +406,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#openai_compatibility
+     if (isGemini3ThinkingTokenModel(model)) {
+       return {
+-        reasoning_effort: reasoningEffort
++        reasoningEffort
+       }
+     }
+     if (reasoningEffort === 'auto') {
+@@ -529,7 +529,7 @@ export function getOpenAIReasoningParams(
+   return {}
+ }
+ 
+-export function getAnthropicThinkingBudget(
++export function getThinkingBudget(
+   maxTokens: number | undefined,
+   reasoningEffort: string | undefined,
+   modelId: string
+@@ -612,7 +612,7 @@ export function getAnthropicReasoningParams(
+ 
+     // Other Claude models continue using enabled + budgetTokens
+     const { maxTokens } = getAssistantSettings(assistant)
+-    const budgetTokens = getAnthropicThinkingBudget(maxTokens, reasoningEffort, model.id)
++    const budgetTokens = getThinkingBudget(maxTokens, reasoningEffort, model.id)
+ 
+     return {
+       thinking: {
+@@ -620,9 +620,12 @@ export function getAnthropicReasoningParams(
+         budgetTokens: budgetTokens
+       }
+     }
++  } else {
++    // 其他使用claude端點的模型，比如Kimi,Minimax等等
++    const { maxTokens } = getAssistantSettings(assistant)
++    const budgetTokens = getThinkingBudget(maxTokens, reasoningEffort, model.id)
++    return budgetTokens ? { thinking: { type: 'enabled', budgetTokens } } : { thinking: { type: 'enabled' } }
+   }
+-
+-  return {}
+ }
+ 
+ type GoogleThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinkingConfig']>['thinkingLevel']
+@@ -793,7 +796,7 @@ export function getBedrockReasoningParams(
+ 
+   // Other Claude models use enabled + budgetTokens
+   const { maxTokens } = getAssistantSettings(assistant)
+-  const budgetTokens = getAnthropicThinkingBudget(maxTokens, reasoningEffort, model.id)
++  const budgetTokens = getThinkingBudget(maxTokens, reasoningEffort, model.id)
+   return {
+     reasoningConfig: {
+       type: 'enabled',
