@@ -1,0 +1,1457 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index 6a7cad8..e1993fe 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -6,7 +6,7 @@
+ import { loggerService } from '@logger'
+ import type { AISDKWebSearchResult, MCPTool, WebSearchResults, WebSearchSource } from '@renderer/types'
+ import { WEB_SEARCH_SOURCE } from '@renderer/types'
+-import type { Chunk } from '@renderer/types/chunk'
++import type { Chunk, ProviderMetadata } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { ProviderSpecificError } from '@renderer/types/provider-specific-error'
+ import { formatErrorMessage, isAbortError } from '@renderer/utils/error'
+@@ -32,6 +32,7 @@ export class AiSdkToChunkAdapter {
+   private firstTokenTimestamp: number | null = null
+   private hasTextContent = false
+   private getSessionWasCleared?: () => boolean
++  private providerId?: string
+ 
+   constructor(
+     private onChunk: (chunk: Chunk) => void,
+@@ -39,13 +40,15 @@ export class AiSdkToChunkAdapter {
+     accumulate?: boolean,
+     enableWebSearch?: boolean,
+     onSessionUpdate?: (sessionId: string) => void,
+-    getSessionWasCleared?: () => boolean
++    getSessionWasCleared?: () => boolean,
++    providerId?: string
+   ) {
+     this.toolCallHandler = new ToolCallChunkHandler(onChunk, mcpTools)
+     this.accumulate = accumulate
+     this.enableWebSearch = enableWebSearch || false
+     this.onSessionUpdate = onSessionUpdate
+     this.getSessionWasCleared = getSessionWasCleared
++    this.providerId = providerId
+   }
+ 
+   private markFirstTokenIfNeeded() {
+@@ -94,7 +97,8 @@ export class AiSdkToChunkAdapter {
+       text: '',
+       reasoningContent: '',
+       webSearchResults: [],
+-      reasoningId: ''
++      reasoningId: '',
++      providerMetadata: undefined as ProviderMetadata | undefined
+     }
+     this.resetTimingState()
+     this.responseStartTimestamp = Date.now()
+@@ -151,7 +155,13 @@ export class AiSdkToChunkAdapter {
+    */
+   private convertAndEmitChunk(
+     chunk: TextStreamPart<any>,
+-    final: { text: string; reasoningContent: string; webSearchResults: AISDKWebSearchResult[]; reasoningId: string }
++    final: {
++      text: string
++      reasoningContent: string
++      webSearchResults: AISDKWebSearchResult[]
++      reasoningId: string
++      providerMetadata: ProviderMetadata | undefined
++    }
+   ) {
+     logger.silly(`AI SDK chunk type: ${chunk.type}`, chunk)
+     switch (chunk.type) {
+@@ -207,12 +217,25 @@ export class AiSdkToChunkAdapter {
+           final.text = finalText
+         }
+ 
++        // Extract thoughtSignature from providerMetadata.google and preserve it
++        const newSignature = chunk.providerMetadata?.google?.thoughtSignature as string | undefined
++        if (newSignature) {
++          final.providerMetadata = {
++            ...final.providerMetadata,
++            google: {
++              ...final.providerMetadata?.google,
++              thoughtSignature: newSignature
++            }
++          }
++        }
++
+         // Only emit chunk if there's text to send
+         if (finalText) {
+           this.markFirstTokenIfNeeded()
+           this.onChunk({
+             type: ChunkType.TEXT_DELTA,
+-            text: this.accumulate ? final.text : finalText
++            text: this.accumulate ? final.text : finalText,
++            providerMetadata: final.providerMetadata
+           })
+         }
+         break
+@@ -220,9 +243,12 @@ export class AiSdkToChunkAdapter {
+       case 'text-end':
+         this.onChunk({
+           type: ChunkType.TEXT_COMPLETE,
+-          text: (chunk.providerMetadata?.text?.value as string) ?? final.text ?? ''
++          text: (chunk.providerMetadata?.text?.value as string) ?? final.text ?? '',
++          providerMetadata: final.providerMetadata
+         })
+         final.text = ''
++        // Clear providerMetadata for next text block
++        final.providerMetadata = undefined
+         break
+       case 'reasoning-start':
+         // if (final.reasoningId !== chunk.id) {
+@@ -301,7 +327,7 @@ export class AiSdkToChunkAdapter {
+             }
+           })
+         } else if (final.webSearchResults.length) {
+-          const providerName = Object.keys(providerMetadata || {})[0]
++          const providerName: string | undefined = Object.keys(providerMetadata || {})[0] || this.providerId
+           const sourceMap: Record<string, WebSearchSource> = {
+             [WEB_SEARCH_SOURCE.OPENAI]: WEB_SEARCH_SOURCE.OPENAI_RESPONSE,
+             [WEB_SEARCH_SOURCE.ANTHROPIC]: WEB_SEARCH_SOURCE.ANTHROPIC,
+@@ -312,9 +338,10 @@ export class AiSdkToChunkAdapter {
+             [WEB_SEARCH_SOURCE.HUNYUAN]: WEB_SEARCH_SOURCE.HUNYUAN,
+             [WEB_SEARCH_SOURCE.ZHIPU]: WEB_SEARCH_SOURCE.ZHIPU,
+             [WEB_SEARCH_SOURCE.GROK]: WEB_SEARCH_SOURCE.GROK,
++            xai: WEB_SEARCH_SOURCE.GROK,
+             [WEB_SEARCH_SOURCE.WEBSEARCH]: WEB_SEARCH_SOURCE.WEBSEARCH
+           }
+-          const source = sourceMap[providerName] || WEB_SEARCH_SOURCE.AISDK
++          const source = (providerName && sourceMap[providerName]) || WEB_SEARCH_SOURCE.AISDK
+ 
+           this.onChunk({
+             type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index cae49ff..15a302a 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -320,7 +320,15 @@ export default class ModernAiProvider {
+     // 创建带有中间件的执行器
+     if (config.onChunk) {
+       const accumulate = this.model!.supported_text_delta !== false // true and undefined
+-      const adapter = new AiSdkToChunkAdapter(config.onChunk, config.mcpTools, accumulate, config.enableWebSearch)
++      const adapter = new AiSdkToChunkAdapter(
++        config.onChunk,
++        config.mcpTools,
++        accumulate,
++        config.enableWebSearch,
++        undefined,
++        undefined,
++        this.config!.providerId
++      )
+ 
+       const streamResult = await executor.streamText({
+         ...params,
+diff --git a/src/aiCore/plugins/PluginBuilder.ts b/src/aiCore/plugins/PluginBuilder.ts
+index 760f24c..60fb3d7 100644
+--- a/src/aiCore/plugins/PluginBuilder.ts
++++ b/src/aiCore/plugins/PluginBuilder.ts
+@@ -1,13 +1,12 @@
+ import type { AiPlugin } from '@cherrystudio/ai-core'
+ import { createPromptToolUsePlugin, webSearchPlugin } from '@cherrystudio/ai-core/built-in/plugins'
+ import { loggerService } from '@logger'
+-import { isGemini3Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
++import { isGemini3Model, isQwen35Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+ import type { Assistant, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+ import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ 
+-import { getAiSdkProviderId } from '../provider/factory'
+ import type { AiSdkMiddlewareConfig } from '../types/middlewareConfig'
+ import { isOpenRouterGeminiGenerateImageModel } from '../utils/image'
+ import { getReasoningTagName } from '../utils/reasoning'
+@@ -90,6 +89,7 @@ export function buildPlugins({ provider, model, config }: BuildPluginsContext):
+   if (
+     !isOllamaProvider(provider) &&
+     isSupportedThinkingTokenQwenModel(model) &&
++    !isQwen35Model(model) &&
+     !isSupportEnableThinkingProvider(provider)
+   ) {
+     const enableThinking = config.assistant?.settings?.reasoning_effort !== undefined
+@@ -101,10 +101,9 @@ export function buildPlugins({ provider, model, config }: BuildPluginsContext):
+     plugins.push(createOpenrouterGenerateImagePlugin())
+   }
+ 
+-  // 0.7 Skip Gemini3 thought signature
++  // 0.7 Skip Gemini3 thought signature for OpenAI-compatible API
+   if (isGemini3Model(model)) {
+-    const aiSdkId = getAiSdkProviderId(provider)
+-    plugins.push(createSkipGeminiThoughtSignaturePlugin(aiSdkId))
++    plugins.push(createSkipGeminiThoughtSignaturePlugin())
+   }
+ 
+   // 1. 模型内置搜索
+diff --git a/src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts b/src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts
+index b7e53b4..9dc71a3 100644
+--- a/src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts
++++ b/src/aiCore/plugins/skipGeminiThoughtSignaturePlugin.ts
+@@ -6,23 +6,16 @@ const logger = loggerService.withContext('skipGeminiThoughtSignaturePlugin')
+ 
+ /**
+  * skip Gemini Thought Signature Middleware
+- * 由于多模型客户端请求的复杂性（可以中途切换其他模型），这里选择通过中间件方式添加跳过所有 Gemini3 思考签名
+- * Due to the complexity of multi-model client requests (which can switch to other models mid-process),
+- * it was decided to add a skip for all Gemini3 thinking signatures via middleware.
+  *
+- * Handles multiple cases:
+- * 1. Parts from a previous Gemini response that already have providerOptions.google.thoughtSignature
+- *    -> Replace with magic string to skip validation
+- * 2. Reasoning parts from conversation replay (ThinkingMessageBlock -> { type: 'reasoning' })
+- *    that have NO providerOptions at all (lost during message serialization/deserialization)
+- *    -> Add providerOptions with magic string
+- * 3. Tool-call parts that need thought_signature for OpenAI-compatible API
+- *    -> Add providerOptions.openaiCompatible.extra_content.google.thought_signature
++ * Handles:
++ * - Tool-call parts need thought_signature for OpenAI-compatible API
++ *   -> Add providerOptions.openaiCompatible.extra_content.google.thought_signature
++ *
++ * Note: Thought signature for text/reasoning parts is now handled in messageConverter.
+  *
+- * @param aiSdkId AI SDK Provider ID
+  * @returns LanguageModelMiddleware
+  */
+-function createSkipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageModelMiddleware {
++function createSkipGeminiThoughtSignatureMiddleware(): LanguageModelMiddleware {
+   const MAGIC_STRING = 'skip_thought_signature_validator'
+   return {
+     specificationVersion: 'v3',
+@@ -35,22 +28,12 @@ function createSkipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageMo
+         transformedParams.prompt = transformedParams.prompt.map((message) => {
+           if (typeof message.content !== 'string') {
+             for (const part of message.content) {
+-              const hasExistingSignature = part?.providerOptions?.[aiSdkId]?.thoughtSignature
+-              const isReasoningPart = part.type === 'reasoning'
+               const isToolCallPart = part.type === 'tool-call'
+ 
+-              // Case 1 & 2: Native Gemini path - add thoughtSignature to google providerOptions
+-              if (hasExistingSignature || isReasoningPart) {
+-                if (!part.providerOptions) {
+-                  part.providerOptions = {}
+-                }
+-                if (!part.providerOptions[aiSdkId]) {
+-                  part.providerOptions[aiSdkId] = {}
+-                }
+-                part.providerOptions[aiSdkId].thoughtSignature = MAGIC_STRING
+-              }
++              // Note: text part and reasoning part do not require thought signature validation
++              // They are handled by messageConverter now
+ 
+-              // Case 3: OpenAI-compatible path - add extra_content for tool-call parts
++              // Case: OpenAI-compatible path - add extra_content for tool-call parts
+               // All tool-calls need the signature for Gemini OpenAI-compatible API
+               if (isToolCallPart) {
+                 if (!part.providerOptions) {
+@@ -78,13 +61,13 @@ function createSkipGeminiThoughtSignatureMiddleware(aiSdkId: string): LanguageMo
+   }
+ }
+ 
+-export const createSkipGeminiThoughtSignaturePlugin = (aiSdkId: string) =>
++export const createSkipGeminiThoughtSignaturePlugin = () =>
+   definePlugin({
+     name: 'skipGeminiThoughtSignature',
+     enforce: 'pre',
+ 
+     configureContext: (context) => {
+       context.middlewares = context.middlewares || []
+-      context.middlewares.push(createSkipGeminiThoughtSignatureMiddleware(aiSdkId))
++      context.middlewares.push(createSkipGeminiThoughtSignatureMiddleware())
+     }
+   })
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index 45c0d34..c5cf73b 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -5,6 +5,7 @@ import {
+   AssistantMessageStatus,
+   type FileMessageBlock,
+   type ImageMessageBlock,
++  type MainTextMessageBlock,
+   MessageBlockStatus,
+   MessageBlockType,
+   type ThinkingMessageBlock,
+@@ -35,13 +36,15 @@ type MockableMessage = Message & {
+   __mockFileBlocks?: FileMessageBlock[]
+   __mockImageBlocks?: ImageMessageBlock[]
+   __mockThinkingBlocks?: ThinkingMessageBlock[]
++  __mockMainTextBlocks?: MainTextMessageBlock[]
+ }
+ 
+ vi.mock('@renderer/utils/messageUtils/find', () => ({
+   getMainTextContent: (message: Message) => (message as MockableMessage).__mockContent ?? '',
+   findFileBlocks: (message: Message) => (message as MockableMessage).__mockFileBlocks ?? [],
+   findImageBlocks: (message: Message) => (message as MockableMessage).__mockImageBlocks ?? [],
+-  findThinkingBlocks: (message: Message) => (message as MockableMessage).__mockThinkingBlocks ?? []
++  findThinkingBlocks: (message: Message) => (message as MockableMessage).__mockThinkingBlocks ?? [],
++  findMainTextBlocks: (message: Message) => (message as MockableMessage).__mockMainTextBlocks ?? []
+ }))
+ 
+ import { convertMessagesToSdkMessages, convertMessageToSdkParam } from '../messageConverter'
+@@ -123,6 +126,19 @@ const createThinkingBlock = (
+   ...overrides
+ })
+ 
++const createMainTextBlock = (
++  messageId: string,
++  overrides: Partial<Omit<MainTextMessageBlock, 'type' | 'messageId'>> = {}
++): MainTextMessageBlock => ({
++  id: overrides.id ?? `main-text-block-${++blockCounter}`,
++  messageId,
++  type: MessageBlockType.MAIN_TEXT,
++  createdAt: overrides.createdAt ?? new Date(2024, 0, 1, 0, 0, blockCounter).toISOString(),
++  status: overrides.status ?? MessageBlockStatus.SUCCESS,
++  content: overrides.content ?? '',
++  ...overrides
++})
++
+ describe('messageConverter', () => {
+   beforeEach(() => {
+     convertFileBlockToFilePartMock.mockReset()
+@@ -305,6 +321,110 @@ describe('messageConverter', () => {
+         content: [{ type: 'text', text: 'Trimmed answer' }]
+       })
+     })
++
++    it('includes thoughtSignature in providerOptions for Gemini thought signature persistence', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = 'Here is my answer'
++      message.__mockMainTextBlocks = [
++        createMainTextBlock(message.id, {
++          content: 'Here is my answer',
++          metadata: { thoughtSignature: 'test-thought-signature-token' }
++        })
++      ]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [
++          {
++            type: 'text',
++            text: 'Here is my answer',
++            providerOptions: {
++              google: {
++                thoughtSignature: 'test-thought-signature-token'
++              }
++            }
++          }
++        ]
++      })
++    })
++
++    it('does not include providerOptions when no thoughtSignature is present', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = 'Plain answer'
++      message.__mockMainTextBlocks = [createMainTextBlock(message.id, { content: 'Plain answer' })]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [{ type: 'text', text: 'Plain answer' }]
++      })
++    })
++
++    it('uses thoughtSignature from the first matching MainTextBlock when multiple exist', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = 'Answer text'
++      message.__mockMainTextBlocks = [
++        createMainTextBlock(message.id, { content: 'Answer text', metadata: { thoughtSignature: 'first-signature' } }),
++        createMainTextBlock(message.id, {
++          content: 'Another block',
++          metadata: { thoughtSignature: 'second-signature' }
++        })
++      ]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [
++          {
++            type: 'text',
++            text: 'Answer text',
++            providerOptions: {
++              google: {
++                thoughtSignature: 'first-signature'
++              }
++            }
++          }
++        ]
++      })
++    })
++
++    it('combines reasoning blocks with thoughtSignature text part', async () => {
++      const model = createModel()
++      const message = createMessage('assistant')
++      message.__mockContent = 'Final answer'
++      message.__mockThinkingBlocks = [createThinkingBlock(message.id, { content: 'Thinking step' })]
++      message.__mockMainTextBlocks = [
++        createMainTextBlock(message.id, {
++          content: 'Final answer',
++          metadata: { thoughtSignature: 'sig-with-reasoning' }
++        })
++      ]
++
++      const result = await convertMessageToSdkParam(message, false, model)
++
++      expect(result).toEqual({
++        role: 'assistant',
++        content: [
++          { type: 'reasoning', text: 'Thinking step' },
++          {
++            type: 'text',
++            text: 'Final answer',
++            providerOptions: {
++              google: {
++                thoughtSignature: 'sig-with-reasoning'
++              }
++            }
++          }
++        ]
++      })
++    })
+   })
+ 
+   describe('convertMessagesToSdkMessages', () => {
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index 98c62f9..331bb3a 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -7,10 +7,16 @@ import type { ReasoningPart } from '@ai-sdk/provider-utils'
+ import { loggerService } from '@logger'
+ import { isImageEnhancementModel, isVisionModel } from '@renderer/config/models'
+ import type { Message, Model } from '@renderer/types'
+-import type { FileMessageBlock, ImageMessageBlock, ThinkingMessageBlock } from '@renderer/types/newMessage'
++import type {
++  FileMessageBlock,
++  ImageMessageBlock,
++  MainTextMessageBlock,
++  ThinkingMessageBlock
++} from '@renderer/types/newMessage'
+ import {
+   findFileBlocks,
+   findImageBlocks,
++  findMainTextBlocks,
+   findThinkingBlocks,
+   getMainTextContent
+ } from '@renderer/utils/messageUtils/find'
+@@ -42,10 +48,18 @@ export async function convertMessageToSdkParam(
+   const fileBlocks = findFileBlocks(message)
+   const imageBlocks = findImageBlocks(message)
+   const reasoningBlocks = findThinkingBlocks(message)
++  const mainTextBlocks = findMainTextBlocks(message)
+   if (message.role === 'user' || message.role === 'system') {
+     return convertMessageToUserModelMessage(content, fileBlocks, imageBlocks, isVisionModel, model)
+   } else {
+-    return convertMessageToAssistantModelMessage(content, fileBlocks, imageBlocks, reasoningBlocks, model)
++    return convertMessageToAssistantModelMessage(
++      content,
++      fileBlocks,
++      imageBlocks,
++      reasoningBlocks,
++      mainTextBlocks,
++      model
++    )
+   }
+ }
+ 
+@@ -163,6 +177,7 @@ async function convertMessageToAssistantModelMessage(
+   fileBlocks: FileMessageBlock[],
+   imageBlocks: ImageMessageBlock[],
+   thinkingBlocks: ThinkingMessageBlock[],
++  mainTextBlocks: MainTextMessageBlock[],
+   model?: Model
+ ): Promise<AssistantModelMessage> {
+   const parts: Array<TextPart | ReasoningPart | FilePart> = []
+@@ -173,9 +188,25 @@ async function convertMessageToAssistantModelMessage(
+   }
+ 
+   // Add text content after reasoning blocks, only if non-empty after trimming
++  // Also add thoughtSignature from MainTextBlock metadata for Gemini thought signature persistence
+   const trimmedContent = content?.trim()
+   if (trimmedContent) {
+-    parts.push({ type: 'text', text: trimmedContent })
++    // Find the first MainTextBlock with thoughtSignature
++    const thoughtSignature = mainTextBlocks.find((block) => block.metadata?.thoughtSignature)?.metadata
++      ?.thoughtSignature
++
++    const textPart: TextPart = { type: 'text', text: trimmedContent }
++
++    // Add providerOptions with thoughtSignature if available (for Gemini)
++    if (thoughtSignature) {
++      textPart.providerOptions = {
++        google: {
++          thoughtSignature
++        }
++      }
++    }
++
++    parts.push(textPart)
+   }
+ 
+   for (const fileBlock of fileBlocks) {
+diff --git a/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts b/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
+index 288cc2e..3074d61 100644
+--- a/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
++++ b/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
+@@ -57,13 +57,17 @@ vi.mock('@renderer/services/ProviderService', () => ({
+ }))
+ 
+ // Mock config modules
+-vi.mock('@renderer/config/models', () => ({
+-  isOpenAIModel: vi.fn(() => false),
+-  isQwenMTModel: vi.fn(() => false),
+-  isSupportFlexServiceTierModel: vi.fn(() => false),
+-  isSupportVerbosityModel: vi.fn(() => false),
+-  getModelSupportedVerbosity: vi.fn(() => [])
+-}))
++vi.mock('@renderer/config/models', async (importOriginal) => {
++  const actual: any = await importOriginal()
++  return {
++    ...actual,
++    isOpenAIModel: vi.fn(() => false),
++    isQwenMTModel: vi.fn(() => false),
++    isSupportFlexServiceTierModel: vi.fn(() => false),
++    isSupportVerbosityModel: vi.fn(() => false),
++    getModelSupportedVerbosity: vi.fn(() => [])
++  }
++})
+ 
+ vi.mock('@renderer/config/translate', () => ({
+   mapLanguageToQwenMTModel: vi.fn()
+diff --git a/src/aiCore/utils/__tests__/mcp.test.ts b/src/aiCore/utils/__tests__/mcp.test.ts
+index c11165f..9cd08a9 100644
+--- a/src/aiCore/utils/__tests__/mcp.test.ts
++++ b/src/aiCore/utils/__tests__/mcp.test.ts
+@@ -31,7 +31,8 @@ vi.mock('@renderer/utils/mcp-tools', () => ({
+ }))
+ 
+ vi.mock('@renderer/utils/userConfirmation', () => ({
+-  requestToolConfirmation: vi.fn(async () => true)
++  requestToolConfirmation: vi.fn(async () => true),
++  sendToolApprovalNotification: vi.fn()
+ }))
+ 
+ describe('mcp utils', () => {
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index a6c9a6c..7e06d07 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -1118,6 +1118,106 @@ describe('options utils', () => {
+         })
+       })
+ 
++      it('should auto-convert reasoning_effort to reasoningEffort for openai-compatible provider (issue #11987)', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        // Simulate Volcano Engine (Doubao) or similar OpenAI-compatible provider
++        const volcengineProvider = {
++          id: 'openai-compatible',
++          name: 'Volcano Engine',
++          type: 'openai',
++          apiKey: 'test-key',
++          apiHost: 'https://ark.cn-beijing.volces.com/api/v3',
++          models: [] as Model[]
++        } as Provider
++
++        const doubaoModel: Model = {
++          id: 'doubao-seed-1.8-thinking',
++          name: 'Doubao Seed 1.8 Thinking',
++          provider: 'openai-compatible'
++        } as Model
++
++        // User configures reasoning_effort (snake_case) following API docs
++        vi.mocked(getCustomParameters).mockReturnValue({
++          reasoning_effort: 'high'
++        })
++
++        const result = buildProviderOptions(mockAssistant, doubaoModel, volcengineProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // buildProviderOptions converts reasoning_effort → reasoningEffort for openai-compatible
++        expect(result.providerOptions['openai-compatible']).toHaveProperty('reasoningEffort')
++        expect(result.providerOptions['openai-compatible'].reasoningEffort).toBe('high')
++        expect(result.providerOptions['openai-compatible']).not.toHaveProperty('reasoning_effort')
++      })
++
++      it('should NOT convert reasoning_effort for non-openai-compatible providers', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        const openaiProvider: Provider = {
++          id: SystemProviderIds.openai,
++          name: 'OpenAI',
++          type: 'openai-response',
++          apiKey: 'test-key',
++          apiHost: 'https://api.openai.com/v1',
++          isSystem: true
++        } as Provider
++
++        // User configures reasoning_effort for native OpenAI provider
++        vi.mocked(getCustomParameters).mockReturnValue({
++          reasoning_effort: 'high'
++        })
++
++        const result = buildProviderOptions(mockAssistant, mockModel, openaiProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Native OpenAI provider should keep reasoning_effort as-is
++        expect(result.providerOptions.openai).toHaveProperty('reasoning_effort')
++        expect(result.providerOptions.openai.reasoning_effort).toBe('high')
++        expect(result.providerOptions.openai).not.toHaveProperty('reasoningEffort')
++      })
++
++      it('should not overwrite existing reasoningEffort when converting for openai-compatible', async () => {
++        const { getCustomParameters } = await import('../reasoning')
++
++        const volcengineProvider = {
++          id: 'openai-compatible',
++          name: 'Volcano Engine',
++          type: 'openai',
++          apiKey: 'test-key',
++          apiHost: 'https://ark.cn-beijing.volces.com/api/v3',
++          models: [] as Model[]
++        } as Provider
++
++        const doubaoModel: Model = {
++          id: 'doubao-seed-1.8-thinking',
++          name: 'Doubao Seed 1.8 Thinking',
++          provider: 'openai-compatible'
++        } as Model
++
++        // User configures both forms
++        vi.mocked(getCustomParameters).mockReturnValue({
++          reasoningEffort: 'low',
++          reasoning_effort: 'high'
++        })
++
++        const result = buildProviderOptions(mockAssistant, doubaoModel, volcengineProvider, {
++          enableReasoning: false,
++          enableWebSearch: false,
++          enableGenerateImage: false
++        })
++
++        // Explicit reasoningEffort should be preserved, reasoning_effort removed
++        expect(result.providerOptions['openai-compatible'].reasoningEffort).toBe('low')
++        expect(result.providerOptions['openai-compatible']).not.toHaveProperty('reasoning_effort')
++      })
++
+       it('should handle cross-provider configurations', async () => {
+         const { getCustomParameters } = await import('../reasoning')
+ 
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index a9cd2fb..2b28878 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -7,7 +7,7 @@ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import type { SettingsState } from '@renderer/store/settings'
+ import type { Assistant, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import {
+   getAnthropicReasoningParams,
+@@ -707,10 +707,16 @@ describe('reasoning utils', () => {
+   })
+ 
+   describe('getGeminiReasoningParams', () => {
+-    it('should return empty for non-reasoning model', async () => {
+-      const { isReasoningModel } = await import('@renderer/config/models')
++    // Use beforeAll to avoid per-test dynamic imports while keeping compatibility
++    // with the async vi.mock factory (static imports of the mocked module break other tests)
++    let mockModels: any
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(false)
++    beforeAll(async () => {
++      mockModels = await import('@renderer/config/models')
++    })
++
++    it('should return empty for non-reasoning model', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(false)
+ 
+       const model: Model = {
+         id: 'gemini-2.0-flash',
+@@ -728,11 +734,69 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({})
+     })
+ 
+-    it('should disable thinking for Flash models when reasoning effort is none', async () => {
+-      const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
++    it('should return empty when isReasoningModel is true but not a Gemini thinking model', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(false)
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(true)
+-      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      const model: Model = {
++        id: 'some-reasoning-model',
++        name: 'Some Model',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should return empty when reasoning effort is not set', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {}
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should return empty when reasoning effort is default', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'default' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should disable thinking for Flash models when reasoning effort is none', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+       const model: Model = {
+         id: 'gemini-2.5-flash',
+@@ -757,11 +821,218 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
+-    it('should enable thinking with budget for reasoning effort', async () => {
+-      const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
++    it('should disable thinking for non-Flash models when reasoning effort is none (no thinkingBudget)', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(true)
+-      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: false
++        }
++      })
++    })
++
++    it('should include thinkingLevel for Gemini 3 model with none effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'none' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: false,
++          thinkingLevel: 'minimal'
++        }
++      })
++    })
++
++    it('should return thinkingLevel for Gemini 3 model with low effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'low' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'low'
++        }
++      })
++    })
++
++    it('should return thinkingLevel medium for Gemini 3 model with medium effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'medium' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'medium'
++        }
++      })
++    })
++
++    it('should return thinkingLevel high for Gemini 3 model with high effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'high'
++        }
++      })
++    })
++
++    it('should return thinkingLevel high for Gemini 3 model with xhigh effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'high'
++        }
++      })
++    })
++
++    it('should use undefined thinkingLevel for Gemini 3 model with auto effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'auto' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // auto maps to undefined thinkingLevel (let API decide), stays in Gemini 3 branch
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: undefined
++        }
++      })
++    })
++
++    it('should return thinkingLevel minimal for Gemini 3 model with minimal effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'minimal' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'minimal'
++        }
++      })
++    })
++
++    it('should enable thinking with budget for reasoning effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+       const model: Model = {
+         id: 'gemini-2.5-pro',
+@@ -786,11 +1057,35 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
+-    it('should enable thinking without budget for auto effort ratio > 1', async () => {
+-      const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
++    it('should compute thinkingBudget for old models with xhigh effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(true)
+-      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // EFFORT_RATIO['xhigh'] = 0.9, which is NOT > 1, so it should compute a budget
++      expect(result).toEqual({
++        thinkingConfig: {
++          thinkingBudget: expect.any(Number),
++          includeThoughts: true
++        }
++      })
++    })
++
++    it('should return thinkingBudget -1 for old models with auto effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+       const model: Model = {
+         id: 'gemini-2.5-pro',
+@@ -814,6 +1109,60 @@ describe('reasoning utils', () => {
+         }
+       })
+     })
++
++    it('should omit thinkingBudget for old models when no token limit is found', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'gemini-2.5-pro-unknown',
++        name: 'Gemini 2.5 Pro Unknown',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'medium' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // budget = Math.floor((0 - 0) * 0.5 + 0) = 0, so no thinkingBudget
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true
++        }
++      })
++    })
++
++    it('should calculate correct thinkingBudget for low effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
++
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'low' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // EFFORT_RATIO['low'] = 0.05
++      // budget = Math.floor((32768 - 1024) * 0.05 + 1024) = Math.floor(1587.2 + 1024) = 2611
++      expect(result).toEqual({
++        thinkingConfig: {
++          thinkingBudget: 2611,
++          includeThoughts: true
++        }
++      })
++    })
+   })
+ 
+   describe('getXAIReasoningParams', () => {
+diff --git a/src/aiCore/utils/__tests__/websearch.test.ts b/src/aiCore/utils/__tests__/websearch.test.ts
+index 5c95a66..ee788d4 100644
+--- a/src/aiCore/utils/__tests__/websearch.test.ts
++++ b/src/aiCore/utils/__tests__/websearch.test.ts
+@@ -254,42 +254,43 @@ describe('websearch utils', () => {
+     })
+ 
+     describe('xai provider', () => {
+-      it('should return xai search options', () => {
++      it('should return xai search options with enableImageUnderstanding when no excludeDomains', () => {
+         const result = buildProviderBuiltinWebSearchConfig('xai', defaultWebSearchConfig)
+ 
+         expect(result).toEqual({
+-          xai: {
+-            maxSearchResults: 30,
+-            returnCitations: true,
+-            sources: [{ type: 'web', excludedWebsites: [] }, { type: 'news' }, { type: 'x' }],
+-            mode: 'on'
+-          }
++          xai: { enableImageUnderstanding: true },
++          'xai-xsearch': { enableImageUnderstanding: true }
+         })
+       })
+ 
+-      it('should limit excluded websites to 5', () => {
++      it('should include excludedDomains when excludeDomains provided', () => {
+         const config: CherryWebSearchConfig = {
+           searchWithTime: true,
+           maxResults: 40,
+-          excludeDomains: ['site1.com', 'site2.com', 'site3.com', 'site4.com', 'site5.com', 'site6.com', 'site7.com']
++          excludeDomains: ['site1.com', 'site2.com']
+         }
+ 
+         const result = buildProviderBuiltinWebSearchConfig('xai', config)
+ 
+-        expect(result?.xai?.sources).toBeDefined()
+-        const webSource = result?.xai?.sources?.[0]
+-        if (webSource && webSource.type === 'web') {
+-          expect(webSource.excludedWebsites).toHaveLength(5)
+-        }
++        expect(result).toEqual({
++          xai: {
++            enableImageUnderstanding: true,
++            excludedDomains: ['site1.com', 'site2.com']
++          },
++          'xai-xsearch': { enableImageUnderstanding: true }
++        })
+       })
+ 
+-      it('should include all sources types', () => {
+-        const result = buildProviderBuiltinWebSearchConfig('xai', defaultWebSearchConfig)
++      it('should limit excluded domains to 5', () => {
++        const config: CherryWebSearchConfig = {
++          searchWithTime: true,
++          maxResults: 40,
++          excludeDomains: ['site1.com', 'site2.com', 'site3.com', 'site4.com', 'site5.com', 'site6.com', 'site7.com']
++        }
++
++        const result = buildProviderBuiltinWebSearchConfig('xai', config)
+ 
+-        expect(result?.xai?.sources).toHaveLength(3)
+-        expect(result?.xai?.sources?.[0].type).toBe('web')
+-        expect(result?.xai?.sources?.[1].type).toBe('news')
+-        expect(result?.xai?.sources?.[2].type).toBe('x')
++        expect(result?.xai?.excludedDomains).toHaveLength(5)
+       })
+     })
+ 
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index 76f3d22..842be36 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -1,7 +1,8 @@
+ import { loggerService } from '@logger'
++import store from '@renderer/store'
+ import type { MCPCallToolResponse, MCPTool, MCPToolResponse } from '@renderer/types'
+ import { callMCPTool, getMcpServerByTool, isToolAutoApproved } from '@renderer/utils/mcp-tools'
+-import { requestToolConfirmation } from '@renderer/utils/userConfirmation'
++import { requestToolConfirmation, sendToolApprovalNotification } from '@renderer/utils/userConfirmation'
+ import { type Tool, type ToolSet } from 'ai'
+ import { jsonSchema, tool } from 'ai'
+ import type { JSONSchema7 } from 'json-schema'
+@@ -91,11 +92,36 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[], allowedTools?:
+       execute: async (params, { toolCallId }) => {
+         // 检查是否启用自动批准
+         const server = getMcpServerByTool(mcpTool)
+-        const isAutoApproveEnabled = isToolAutoApproved(mcpTool, server, allowedTools)
++        let isAutoApproveEnabled = isToolAutoApproved(mcpTool, server, allowedTools)
++
++        // For hub invoke/exec, resolve the underlying tool and check its server's auto-approve config
++        if (
++          !isAutoApproveEnabled &&
++          mcpTool.serverId === 'hub' &&
++          (mcpTool.name === 'invoke' || mcpTool.name === 'exec')
++        ) {
++          const underlyingToolName = (params as Record<string, unknown>)?.name as string | undefined
++          if (underlyingToolName) {
++            try {
++              const resolved = await window.api.mcp.resolveHubTool(underlyingToolName)
++              if (resolved) {
++                const underlyingServer = store.getState().mcp.servers.find((s) => s.id === resolved.serverId)
++                if (underlyingServer) {
++                  isAutoApproveEnabled = !underlyingServer.disabledAutoApproveTools?.includes(resolved.toolName)
++                }
++              }
++            } catch (err) {
++              logger.warn('Failed to resolve hub tool for auto-approve check', err as Error)
++            }
++          }
++        }
+ 
+         let confirmed = true
+ 
+         if (!isAutoApproveEnabled) {
++          // Send system notification for tool approval
++          sendToolApprovalNotification(mcpTool.name)
++
+           // 请求用户确认
+           logger.debug(`Requesting user confirmation for tool: ${mcpTool.name}`)
+           confirmed = await requestToolConfirmation(toolCallId)
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index a3d2d30..23a8295 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -283,6 +283,16 @@ export function buildProviderOptions(
+   const actualAiSdkProviderIds = Object.keys(providerSpecificOptions)
+   const primaryAiSdkProviderId = actualAiSdkProviderIds[0] // Use the first one as primary for non-scoped params
+ 
++  // For openai-compatible providers, auto-convert reasoning_effort (snake_case) to reasoningEffort (camelCase).
++  // The AI SDK's openai-compatible provider overwrites reasoning_effort to undefined,
++  // but accepts reasoningEffort. See: https://github.com/CherryHQ/cherry-studio/issues/11987
++  if (primaryAiSdkProviderId === 'openai-compatible' && 'reasoning_effort' in providerParams) {
++    if (!('reasoningEffort' in providerParams)) {
++      providerParams.reasoningEffort = providerParams.reasoning_effort
++    }
++    delete providerParams.reasoning_effort
++  }
++
+   /**
+    * Merge custom parameters into providerSpecificOptions.
+    * Simple logic:
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 5dade03..1d13d4d 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -19,6 +19,7 @@ import {
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+   isOpenAIReasoningModel,
++  isQwen35Model,
+   isQwenAlwaysThinkModel,
+   isQwenReasoningModel,
+   isReasoningModel,
+@@ -42,6 +43,7 @@ import type { Assistant, Model, ReasoningEffortOption } from '@renderer/types'
+ import { EFFORT_RATIO, isSystemProvider, SystemProviderIds } from '@renderer/types'
+ import type { OpenAIReasoningSummary } from '@renderer/types/aiCoreTypes'
+ import type { ReasoningEffortOptionalParams } from '@renderer/types/sdk'
++import { getLowerBaseModelName } from '@renderer/utils'
+ import { isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import { toInteger } from 'lodash'
+ 
+@@ -143,6 +145,16 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       }
+     }
+ 
++    // Qwen 3.5 without direct enable_thinking
++    // https://huggingface.co/Qwen/Qwen3.5-397B-A17B#instruct-or-non-thinking-mode
++    if (isQwen35Model(model)) {
++      return {
++        chat_template_kwargs: {
++          enable_thinking: false
++        }
++      }
++    }
++
+     logger.warn(`Model ${model.id} doesn't match any disable reasoning behavior. Fallback to empty reasoning param.`)
+     return {}
+   }
+@@ -371,11 +383,21 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+ 
+   // Qwen models, use enable_thinking
+   if (isQwenReasoningModel(model)) {
+-    const thinkConfig = {
+-      enable_thinking: isQwenAlwaysThinkModel(model) || !isSupportEnableThinkingProvider(provider) ? undefined : true,
+-      thinking_budget: budgetTokens
++    const supportEnableThinking = isSupportEnableThinkingProvider(provider)
++    const enableThinkingConfig = isQwenAlwaysThinkModel(model) ? {} : { enable_thinking: true }
++    if (supportEnableThinking) {
++      return {
++        ...enableThinkingConfig,
++        thinking_budget: budgetTokens
++      }
++    } else {
++      return {
++        thinking_budget: budgetTokens,
++        chat_template_kwargs: {
++          ...enableThinkingConfig
++        }
++      }
+     }
+-    return thinkConfig
+   }
+ 
+   // Hunyuan models, use enable_thinking
+@@ -632,8 +654,11 @@ type GoogleThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinki
+ 
+ function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): GoogleThinkingLevel {
+   switch (reasoningEffort) {
++    case 'auto':
+     case 'default':
+       return undefined
++    case 'none':
++      return 'minimal'
+     case 'minimal':
+       return 'minimal'
+     case 'low':
+@@ -641,10 +666,12 @@ function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): Googl
+     case 'medium':
+       return 'medium'
+     case 'high':
++    case 'xhigh':
+       return 'high'
+     default:
+-      logger.warn('Unknown thinking level for Gemini. Fallback to medium instead.', { reasoningEffort })
+-      return 'medium'
++      // Enforce all possible values are handled
++      reasoningEffort satisfies never
++      return undefined
+   }
+ }
+ 
+@@ -658,7 +685,7 @@ export function getGeminiReasoningParams(
+   assistant: Assistant,
+   model: Model
+ ): Pick<GoogleGenerativeAIProviderOptions, 'thinkingConfig'> {
+-  if (!isReasoningModel(model)) {
++  if (!isReasoningModel(model) || !isSupportedThinkingTokenGeminiModel(model)) {
+     return {}
+   }
+ 
+@@ -668,34 +695,43 @@ export function getGeminiReasoningParams(
+     return {}
+   }
+ 
+-  // Gemini 推理参数
+-  if (isSupportedThinkingTokenGeminiModel(model)) {
+-    if (reasoningEffort === undefined || reasoningEffort === 'none') {
+-      return {
+-        thinkingConfig: {
+-          includeThoughts: false,
+-          ...(GEMINI_FLASH_MODEL_REGEX.test(model.id) ? { thinkingBudget: 0 } : {})
+-        }
++  let thinkingLevel: GoogleThinkingLevel | null = null
++  const includeThoughts = reasoningEffort !== 'none'
++
++  // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
++  if (isGemini3ThinkingTokenModel(model)) {
++    thinkingLevel = mapToGeminiThinkingLevel(reasoningEffort)
++    if (thinkingLevel === 'minimal' && getLowerBaseModelName(model.id).includes('pro')) {
++      thinkingLevel = 'low'
++    }
++  }
++
++  if (thinkingLevel !== null) {
++    // Gemini 3 branch. thinkingLevel can be undefined (auto) or a specific level.
++    return {
++      thinkingConfig: {
++        includeThoughts,
++        thinkingLevel
+       }
+     }
++  } else {
++    // Old models
++    const effortRatio = EFFORT_RATIO[reasoningEffort]
+ 
+-    // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
+-    if (isGemini3ThinkingTokenModel(model)) {
++    if (reasoningEffort === 'auto') {
+       return {
+         thinkingConfig: {
+-          includeThoughts: true,
+-          thinkingLevel: mapToGeminiThinkingLevel(reasoningEffort)
++          includeThoughts,
++          thinkingBudget: -1
+         }
+       }
+     }
+ 
+-    const effortRatio = EFFORT_RATIO[reasoningEffort]
+-
+-    if (effortRatio > 1) {
++    if (reasoningEffort === 'none') {
+       return {
+         thinkingConfig: {
+-          thinkingBudget: -1,
+-          includeThoughts: true
++          includeThoughts,
++          ...(GEMINI_FLASH_MODEL_REGEX.test(model.id) ? { thinkingBudget: 0 } : {})
+         }
+       }
+     }
+@@ -705,13 +741,11 @@ export function getGeminiReasoningParams(
+ 
+     return {
+       thinkingConfig: {
+-        ...(budget > 0 ? { thinkingBudget: budget } : {}),
+-        includeThoughts: true
++        includeThoughts,
++        ...(budget > 0 ? { thinkingBudget: budget } : {})
+       }
+     }
+   }
+-
+-  return {}
+ }
+ 
+ /**
+diff --git a/src/aiCore/utils/websearch.ts b/src/aiCore/utils/websearch.ts
+index 14a9913..60649b8 100644
+--- a/src/aiCore/utils/websearch.ts
++++ b/src/aiCore/utils/websearch.ts
+@@ -1,7 +1,9 @@
+ import type {
+   AnthropicSearchConfig,
+   OpenAISearchConfig,
+-  WebSearchPluginConfig
++  WebSearchPluginConfig,
++  XAIWebSearchConfig,
++  XAIXSearchConfig
+ } from '@cherrystudio/ai-core/core/plugins/built-in/webSearchPlugin/helper'
+ import type { BaseProviderId } from '@cherrystudio/ai-core/provider'
+ import { isOpenAIDeepResearchModel, isOpenAIWebSearchChatCompletionOnlyModel } from '@renderer/config/models'
+@@ -9,8 +11,6 @@ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+ import type { Model } from '@renderer/types'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ 
+-const X_AI_MAX_SEARCH_RESULT = 30
+-
+ export function getWebSearchParams(model: Model): Record<string, any> {
+   if (model.provider === 'hunyuan') {
+     return { enable_enhancement: true, citation: true, search_info: true }
+@@ -82,20 +82,18 @@ export function buildProviderBuiltinWebSearchConfig(
+     }
+     case 'xai': {
+       const excludeDomains = mapRegexToPatterns(webSearchConfig.excludeDomains)
++      const xaiWebConfig: XAIWebSearchConfig = {
++        enableImageUnderstanding: true
++      }
++      if (excludeDomains.length > 0) {
++        xaiWebConfig.excludedDomains = excludeDomains.slice(0, 5)
++      }
++      const xaiXSearchConfig: XAIXSearchConfig = {
++        enableImageUnderstanding: true
++      }
+       return {
+-        xai: {
+-          maxSearchResults: Math.min(webSearchConfig.maxResults, X_AI_MAX_SEARCH_RESULT),
+-          returnCitations: true,
+-          sources: [
+-            {
+-              type: 'web',
+-              excludedWebsites: excludeDomains.slice(0, Math.min(excludeDomains.length, 5))
+-            },
+-            { type: 'news' },
+-            { type: 'x' }
+-          ],
+-          mode: 'on'
+-        }
++        xai: xaiWebConfig,
++        'xai-xsearch': xaiXSearchConfig
+       }
+     }
+     case 'openrouter': {
