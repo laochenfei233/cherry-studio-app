@@ -1,0 +1,1478 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index b99e469..0b43fcc 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -10,6 +10,7 @@ import type { Chunk, ProviderMetadata } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { ProviderSpecificError } from '@renderer/types/provider-specific-error'
+ import { formatErrorMessage, isAbortError } from '@renderer/utils/error'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { convertLinks, flushLinkConverterBuffer } from '@renderer/utils/linkConverter'
+ import type { ClaudeCodeRawValue } from '@shared/agents/claudecode/types'
+ import { AISDKError, type TextStreamPart, type ToolSet } from 'ai'
+@@ -32,6 +33,8 @@ export class AiSdkToChunkAdapter {
+   private firstTokenTimestamp: number | null = null
+   private hasTextContent = false
+   private getSessionWasCleared?: () => boolean
++  private providerId?: string
++  private idleTimeout?: IdleTimeoutHandle
+ 
+   constructor(
+     private onChunk: (chunk: Chunk) => void,
+@@ -39,13 +42,17 @@ export class AiSdkToChunkAdapter {
+     accumulate?: boolean,
+     enableWebSearch?: boolean,
+     onSessionUpdate?: (sessionId: string) => void,
+-    getSessionWasCleared?: () => boolean
++    getSessionWasCleared?: () => boolean,
++    providerId?: string,
++    idleTimeout?: IdleTimeoutHandle
+   ) {
+     this.toolCallHandler = new ToolCallChunkHandler(onChunk, mcpTools)
+     this.accumulate = accumulate
+     this.enableWebSearch = enableWebSearch || false
+     this.onSessionUpdate = onSessionUpdate
+     this.getSessionWasCleared = getSessionWasCleared
++    this.providerId = providerId
++    this.idleTimeout = idleTimeout
+   }
+ 
+   private markFirstTokenIfNeeded() {
+@@ -107,6 +114,9 @@ export class AiSdkToChunkAdapter {
+       while (true) {
+         const { done, value } = await reader.read()
+ 
++        // Reset idle timeout on every chunk received from the stream
++        this.idleTimeout?.reset()
++
+         if (done) {
+           // Flush any remaining content from link converter buffer if web search is enabled
+           if (this.enableWebSearch) {
+@@ -128,6 +138,8 @@ export class AiSdkToChunkAdapter {
+     } finally {
+       reader.releaseLock()
+       this.resetTimingState()
++      // Clean up the idle timeout timer when the stream ends
++      this.idleTimeout?.cleanup()
+     }
+   }
+ 
+@@ -324,7 +336,7 @@ export class AiSdkToChunkAdapter {
+             }
+           })
+         } else if (final.webSearchResults.length) {
+-          const providerName = Object.keys(providerMetadata || {})[0]
++          const providerName: string | undefined = Object.keys(providerMetadata || {})[0] || this.providerId
+           const sourceMap: Record<string, WebSearchSource> = {
+             [WEB_SEARCH_SOURCE.OPENAI]: WEB_SEARCH_SOURCE.OPENAI_RESPONSE,
+             [WEB_SEARCH_SOURCE.ANTHROPIC]: WEB_SEARCH_SOURCE.ANTHROPIC,
+@@ -335,9 +347,10 @@ export class AiSdkToChunkAdapter {
+             [WEB_SEARCH_SOURCE.HUNYUAN]: WEB_SEARCH_SOURCE.HUNYUAN,
+             [WEB_SEARCH_SOURCE.ZHIPU]: WEB_SEARCH_SOURCE.ZHIPU,
+             [WEB_SEARCH_SOURCE.GROK]: WEB_SEARCH_SOURCE.GROK,
++            xai: WEB_SEARCH_SOURCE.GROK,
+             [WEB_SEARCH_SOURCE.WEBSEARCH]: WEB_SEARCH_SOURCE.WEBSEARCH
+           }
+-          const source = sourceMap[providerName] || WEB_SEARCH_SOURCE.AISDK
++          const source = (providerName && sourceMap[providerName]) || WEB_SEARCH_SOURCE.AISDK
+ 
+           this.onChunk({
+             type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index cae49ff..26e53c6 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -17,6 +17,7 @@ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+ import { type Assistant, type GenerateImageParams, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { SUPPORTED_IMAGE_ENDPOINT_LIST } from '@renderer/utils'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+ import { gateway, type LanguageModel, type Provider as AiSdkProvider } from 'ai'
+ 
+@@ -42,6 +43,7 @@ export type ModernAiProviderConfig = AiSdkMiddlewareConfig & {
+   // topicId for tracing
+   topicId?: string
+   callType: string
++  idleTimeout?: IdleTimeoutHandle
+ }
+ 
+ export default class ModernAiProvider {
+@@ -116,6 +118,10 @@ export default class ModernAiProvider {
+     return this.actualProvider
+   }
+ 
++  /**
++   * Note: This method routes text completions through `modernCompletions`,
++   * which only calls `streamText` (no `generateText` path).
++   */
+   public async completions(modelId: string, params: StreamTextParams, providerConfig: ModernAiProviderConfig) {
+     // 检查model是否存在
+     if (!this.model) {
+@@ -302,6 +308,10 @@ export default class ModernAiProvider {
+   /**
+    * 使用现代化AI SDK的completions实现
+    */
++  /**
++   * Note: This implementation always uses `executor.streamText` and never
++   * calls `generateText`, even when `onChunk` is not provided.
++   */
+   private async modernCompletions(
+     model: LanguageModel,
+     params: StreamTextParams,
+@@ -320,7 +330,16 @@ export default class ModernAiProvider {
+     // 创建带有中间件的执行器
+     if (config.onChunk) {
+       const accumulate = this.model!.supported_text_delta !== false // true and undefined
+-      const adapter = new AiSdkToChunkAdapter(config.onChunk, config.mcpTools, accumulate, config.enableWebSearch)
++      const adapter = new AiSdkToChunkAdapter(
++        config.onChunk,
++        config.mcpTools,
++        accumulate,
++        config.enableWebSearch,
++        undefined,
++        undefined,
++        this.config!.providerId,
++        config.idleTimeout
++      )
+ 
+       const streamResult = await executor.streamText({
+         ...params,
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index 78124b9..b154223 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -50,7 +50,7 @@ import { isJSON, parseJSON } from '@renderer/utils'
+ import { addAbortController, removeAbortController } from '@renderer/utils/abortController'
+ import { findFileBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+ import { isSupportServiceTierProvider } from '@renderer/utils/provider'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import { defaultAppHeaders } from '@shared/utils'
+ import { isEmpty } from 'lodash'
+ 
+@@ -267,7 +267,7 @@ export abstract class BaseApiClient<
+     if (isSupportFlexServiceTierModel(model)) {
+       return 15 * 1000 * 60
+     }
+-    return defaultTimeout
++    return DEFAULT_TIMEOUT
+   }
+ 
+   public async getMessageContent(
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index 52e721b..abbb800 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -54,7 +54,7 @@ import {
+   mcpToolsToGeminiTools
+ } from '@renderer/utils/mcp-tools'
+ import { findFileBlocks, findImageBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+-import { defaultTimeout, MB } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT, MB } from '@shared/config/constant'
+ import { getTrailingApiVersion, withoutTrailingApiVersion } from '@shared/utils'
+ import { t } from 'i18next'
+ 
+@@ -117,7 +117,7 @@ export class GeminiAPIClient extends BaseApiClient<
+         aspectRatio: imageSize,
+         abortSignal: signal,
+         httpOptions: {
+-          timeout: defaultTimeout
++          timeout: DEFAULT_TIMEOUT
+         }
+       }
+       const response = await sdk.models.generateImages({
+diff --git a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+index 298179a..8ac0741 100644
+--- a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
++++ b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+@@ -4,7 +4,7 @@ import { isDedicatedImageGenerationModel } from '@renderer/config/models'
+ import FileManager from '@renderer/services/FileManager'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { findImageBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import type { BaseApiClient } from '../../clients/BaseApiClient'
+ import type { CompletionsParams, CompletionsResult, GenericChunk } from '../schemas'
+@@ -77,7 +77,7 @@ export const ImageGenerationMiddleware: CompletionsMiddleware =
+ 
+           const startTime = Date.now()
+           let response: OpenAI.Images.ImagesResponse
+-          const options = { signal, timeout: defaultTimeout }
++          const options = { signal, timeout: DEFAULT_TIMEOUT }
+ 
+           if (imageFiles.length > 0) {
+             const model = assistant.model
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index a4f345e..d0cd8a7 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -1,6 +1,6 @@
+ import type { Assistant, AssistantSettings, Model, Topic } from '@renderer/types'
+ import { TopicType } from '@renderer/types'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import { describe, expect, it, vi } from 'vitest'
+ 
+ import { getTemperature, getTimeout, getTopP } from '../modelParameters'
+@@ -212,7 +212,7 @@ describe('modelParameters', () => {
+     it('falls back to the default timeout otherwise', () => {
+       const model = createModel({ id: 'gpt-4o', provider: 'openai', group: 'openai' })
+ 
+-      expect(getTimeout(model)).toBe(defaultTimeout)
++      expect(getTimeout(model)).toBe(DEFAULT_TIMEOUT)
+     })
+   })
+ })
+diff --git a/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+new file mode 100644
+index 0000000..9bf22e6
+--- /dev/null
++++ b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+@@ -0,0 +1,225 @@
++/**
++ * Tests for parameterBuilder maxToolCalls functionality
++ * These tests verify the maxToolCalls calculation and validation logic in isolation
++ */
++import { describe, expect, it } from 'vitest'
++
++// Mirror the constants from parameterBuilder.ts
++const MIN_TOOL_CALLS = 1
++const MAX_TOOL_CALLS = 100
++const DEFAULT_MAX_TOOL_CALLS = 20
++const DEFAULT_ENABLE_MAX_TOOL_CALLS = true
++
++/**
++ * Validates and clamps maxToolCalls to valid range
++ * Mirrors the logic in parameterBuilder.ts
++ */
++function validateMaxToolCalls(value: number | undefined): number {
++  if (value === undefined || value < MIN_TOOL_CALLS || value > MAX_TOOL_CALLS) {
++    return DEFAULT_MAX_TOOL_CALLS
++  }
++  return value
++}
++
++/**
++ * Calculate the effective max tool calls based on assistant settings
++ * Mirrors the logic in parameterBuilder.ts
++ */
++function calculateEffectiveMaxToolCalls(settings?: { maxToolCalls?: number; enableMaxToolCalls?: boolean }): {
++  stopWhen: number | null
++  maxToolCalls: number
++} {
++  const enableMaxToolCalls = settings?.enableMaxToolCalls ?? DEFAULT_ENABLE_MAX_TOOL_CALLS
++
++  if (!enableMaxToolCalls) {
++    // When disabled, don't pass stopWhen (return null to indicate no stopWhen)
++    return { stopWhen: null, maxToolCalls: DEFAULT_MAX_TOOL_CALLS }
++  }
++
++  // When enabled, validate and use user-defined value
++  const maxToolCalls = validateMaxToolCalls(settings?.maxToolCalls)
++  return { stopWhen: maxToolCalls, maxToolCalls }
++}
++
++describe('validateMaxToolCalls', () => {
++  it('returns valid values as-is', () => {
++    expect(validateMaxToolCalls(1)).toBe(1)
++    expect(validateMaxToolCalls(50)).toBe(50)
++    expect(validateMaxToolCalls(100)).toBe(100)
++  })
++
++  it('clamps values above 100 to default', () => {
++    const result = validateMaxToolCalls(999)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++
++  it('clamps zero to default', () => {
++    const result = validateMaxToolCalls(0)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++
++  it('clamps negative values to default', () => {
++    const result = validateMaxToolCalls(-5)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++
++  it('returns default when value is undefined', () => {
++    const result = validateMaxToolCalls(undefined)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++})
++
++describe('maxToolCalls calculation logic', () => {
++  describe('default behavior', () => {
++    it('uses default value 20 when settings are undefined', () => {
++      const result = calculateEffectiveMaxToolCalls(undefined)
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++
++    it('uses default value 20 when settings is empty object', () => {
++      const result = calculateEffectiveMaxToolCalls({})
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++
++    it('uses default value 20 when maxToolCalls is undefined', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true
++        // maxToolCalls is undefined
++      })
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++
++    it('uses custom value when maxToolCalls is set and enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 50
++      })
++      expect(result.maxToolCalls).toBe(50)
++      expect(result.stopWhen).toBe(50)
++    })
++  })
++
++  describe('custom values when enabled', () => {
++    it('uses custom value when enableMaxToolCalls is true and maxToolCalls is set', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 50
++      })
++      expect(result.stopWhen).toBe(50)
++    })
++
++    it('uses custom value at minimum boundary (1)', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 1
++      })
++      expect(result.stopWhen).toBe(1)
++    })
++
++    it('uses custom value at maximum boundary (100)', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 100
++      })
++      expect(result.stopWhen).toBe(100)
++    })
++
++    it('clamps values above 100 to default when enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 999
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('clamps zero to default when enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 0
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('clamps negative values to default when enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: -5
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++  })
++
++  describe('disabled behavior', () => {
++    it('does not pass stopWhen when enableMaxToolCalls is false', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: false,
++        maxToolCalls: 50
++      })
++      // When disabled, stopWhen should be null (indicating no stopWhen passed)
++      expect(result.stopWhen).toBeNull()
++    })
++
++    it('does not pass stopWhen when both enableMaxToolCalls is false and maxToolCalls is undefined', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: false
++      })
++      expect(result.stopWhen).toBeNull()
++    })
++
++    it('falls back to default when disabled with invalid maxToolCalls', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: false,
++        maxToolCalls: 999
++      })
++      // When disabled, maxToolCalls should still be default (for reference)
++      expect(result.maxToolCalls).toBe(DEFAULT_MAX_TOOL_CALLS)
++      expect(result.stopWhen).toBeNull()
++    })
++  })
++
++  describe('backward compatibility', () => {
++    it('maintains backward compatibility - existing assistants without new fields use default', () => {
++      // Simulate an old assistant without the new fields
++      const oldSettings = {
++        // Old assistants don't have enableMaxToolCalls or maxToolCalls
++        temperature: 0.7,
++        contextCount: 10
++      }
++      const result = calculateEffectiveMaxToolCalls(
++        oldSettings as { maxToolCalls?: number; enableMaxToolCalls?: boolean }
++      )
++      // Should default to enabled with 20 for backward compatibility
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++  })
++
++  describe('security - invalid values from imported/migrated settings', () => {
++    it('validates extremely large values from imported settings', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 999999
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('validates negative values from imported settings', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: -100
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('validates zero from imported settings', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 0
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++  })
++})
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 7980a6f..d6673a8 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -18,7 +18,7 @@ import {
+   getProviderByModel
+ } from '@renderer/services/AssistantService'
+ import type { Assistant, Model } from '@renderer/types'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import { getThinkingBudget } from '../utils/reasoning'
+ 
+@@ -97,7 +97,7 @@ export function getTimeout(model: Model): number {
+   if (isSupportedFlexServiceTier(model)) {
+     return 15 * 1000 * 60
+   }
+-  return defaultTimeout
++  return DEFAULT_TIMEOUT
+ }
+ 
+ export function getMaxTokens(assistant: Assistant, model: Model): number | undefined {
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 8dc9b40..c92cc93 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -13,6 +13,7 @@ import type { AnthropicSearchConfig, WebSearchPluginConfig } from '@cherrystudio
+ import { isBaseProvider } from '@cherrystudio/ai-core/core/providers/schemas'
+ import type { BaseProviderId } from '@cherrystudio/ai-core/provider'
+ import { loggerService } from '@logger'
++import { MAX_TOOL_CALLS, MIN_TOOL_CALLS } from '@renderer/config/constant'
+ import {
+   isAnthropicModel,
+   isFixedReasoningModel,
+@@ -27,15 +28,17 @@ import {
+   isWebSearchModel
+ } from '@renderer/config/models'
+ import { getHubModeSystemPrompt } from '@renderer/config/prompts-code-mode'
+-import { getDefaultModel } from '@renderer/services/AssistantService'
++import { DEFAULT_ASSISTANT_SETTINGS, getDefaultModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+ import type { Model } from '@renderer/types'
+ import { type Assistant, getEffectiveMcpMode, type MCPTool, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
++import { IdleTimeoutController, type IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
+ import { isAIGatewayProvider, isAwsBedrockProvider, isSupportUrlContextProvider } from '@renderer/utils/provider'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import type { ModelMessage, Tool } from 'ai'
+ import { stepCountIs } from 'ai'
+ 
+@@ -48,6 +51,19 @@ import { getMaxTokens, getTemperature, getTopP } from './modelParameters'
+ 
+ const logger = loggerService.withContext('parameterBuilder')
+ 
++/**
++ * Validates and clamps maxToolCalls to valid range
++ * Falls back to DEFAULT_ASSISTANT_SETTINGS.maxToolCalls if invalid
++ * @param value - The maxToolCalls value from settings
++ * @returns Validated maxToolCalls value
++ */
++function validateMaxToolCalls(value: number | undefined): number {
++  if (value === undefined || value < MIN_TOOL_CALLS || value > MAX_TOOL_CALLS) {
++    return DEFAULT_ASSISTANT_SETTINGS.maxToolCalls
++  }
++  return value
++}
++
+ type ProviderDefinedTool = Extract<Tool<any, any>, { type: 'provider' }>
+ 
+ function mapVertexAIGatewayModelToProviderId(model: Model): BaseProviderId | undefined {
+@@ -83,7 +99,7 @@ export async function buildStreamTextParams(
+     requestOptions?: {
+       signal?: AbortSignal
+       timeout?: number
+-      headers?: Record<string, string>
++      headers?: Record<string, string | undefined>
+     }
+   }
+ ): Promise<{
+@@ -96,8 +112,20 @@ export async function buildStreamTextParams(
+     enableUrlContext: boolean
+   }
+   webSearchPluginConfig?: WebSearchPluginConfig
++  idleTimeout: IdleTimeoutHandle
+ }> {
+-  const { mcpTools } = options
++  const { mcpTools, requestOptions = {} } = options
++  // No caller currently provides a custom timeout; defaultTimeout (10 min) is the fallback.
++  const { signal: externalSignal, timeout = DEFAULT_TIMEOUT, headers: inputHeaders = {} } = requestOptions
++
++  // Use an idle timeout that resets every time a stream chunk is received,
++  // instead of a fixed total timeout that starts from the initial request.
++  const idleTimeout = new IdleTimeoutController(timeout)
++  const signals = [idleTimeout.signal]
++  if (externalSignal) {
++    signals.push(externalSignal)
++  }
++  const finalSignal = AbortSignal.any(signals)
+ 
+   const model = assistant.model || getDefaultModel()
+   const aiSdkProviderId = getAiSdkProviderId(provider)
+@@ -205,7 +233,7 @@ export async function buildStreamTextParams(
+     }
+   }
+ 
+-  let headers: Record<string, string | undefined> = options.requestOptions?.headers ?? {}
++  let headers = inputHeaders
+ 
+   if (isAnthropicModel(model) && !isAwsBedrockProvider(provider)) {
+     const betaHeaders = addAnthropicHeaders(assistant, model)
+@@ -220,6 +248,12 @@ export async function buildStreamTextParams(
+   // Note: standardParams (topK, frequencyPenalty, presencePenalty, stopSequences, seed)
+   // are extracted from custom parameters and passed directly to streamText()
+   // instead of being placed in providerOptions
++
++  // Get max tool calls from assistant settings
++  // When enabled, validate and use user-defined value (1-100)
++  // When disabled, don't pass stopWhen - let AI SDK use its own default
++  const enableMaxToolCalls = assistant.settings?.enableMaxToolCalls ?? DEFAULT_ASSISTANT_SETTINGS.enableMaxToolCalls
++
+   const params: StreamTextParams = {
+     messages: sdkMessages,
+     maxOutputTokens: getMaxTokens(assistant, model),
+@@ -227,13 +261,19 @@ export async function buildStreamTextParams(
+     topP: getTopP(assistant, model),
+     // Include AI SDK standard params extracted from custom parameters
+     ...standardParams,
+-    abortSignal: options.requestOptions?.signal,
++    abortSignal: finalSignal,
+     headers,
+     providerOptions,
+-    stopWhen: stepCountIs(20),
+     maxRetries: 0
+   }
+ 
++  // Only add stopWhen when explicitly enabled and validated
++  if (enableMaxToolCalls) {
++    const maxToolCalls = validateMaxToolCalls(assistant.settings?.maxToolCalls)
++    params.stopWhen = stepCountIs(maxToolCalls)
++  }
++  // When disabled, don't pass stopWhen - let AI SDK use its own default
++
+   if (tools) {
+     params.tools = tools
+   }
+@@ -257,7 +297,8 @@ export async function buildStreamTextParams(
+     params,
+     modelId: model.id,
+     capabilities: { enableReasoning, enableWebSearch, enableGenerateImage, enableUrlContext },
+-    webSearchPluginConfig
++    webSearchPluginConfig,
++    idleTimeout
+   }
+ }
+ 
+diff --git a/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts b/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
+index 288cc2e..3074d61 100644
+--- a/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
++++ b/src/aiCore/utils/__tests__/extractAiSdkStandardParams.test.ts
+@@ -57,13 +57,17 @@ vi.mock('@renderer/services/ProviderService', () => ({
+ }))
+ 
+ // Mock config modules
+-vi.mock('@renderer/config/models', () => ({
+-  isOpenAIModel: vi.fn(() => false),
+-  isQwenMTModel: vi.fn(() => false),
+-  isSupportFlexServiceTierModel: vi.fn(() => false),
+-  isSupportVerbosityModel: vi.fn(() => false),
+-  getModelSupportedVerbosity: vi.fn(() => [])
+-}))
++vi.mock('@renderer/config/models', async (importOriginal) => {
++  const actual: any = await importOriginal()
++  return {
++    ...actual,
++    isOpenAIModel: vi.fn(() => false),
++    isQwenMTModel: vi.fn(() => false),
++    isSupportFlexServiceTierModel: vi.fn(() => false),
++    isSupportVerbosityModel: vi.fn(() => false),
++    getModelSupportedVerbosity: vi.fn(() => [])
++  }
++})
+ 
+ vi.mock('@renderer/config/translate', () => ({
+   mapLanguageToQwenMTModel: vi.fn()
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 7e06d07..a2f75d8 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -45,7 +45,8 @@ vi.mock('@cherrystudio/ai-core/provider', async (importOriginal) => {
+           'gateway',
+           'aihubmix',
+           'newapi',
+-          'ollama'
++          'ollama',
++          'poe'
+         ]
+         if (customProviders.includes(id)) {
+           return { success: true, data: id }
+@@ -433,6 +434,53 @@ describe('options utils', () => {
+       })
+     })
+ 
++    describe('Poe provider', () => {
++      const poeProvider: Provider = {
++        id: SystemProviderIds.poe,
++        name: 'Poe',
++        type: 'openai',
++        apiKey: 'test-key',
++        apiHost: 'https://api.poe.com/v1',
++        isSystem: true
++      } as Provider
++
++      const poeModel: Model = {
++        id: 'openai/gpt-4',
++        name: 'GPT-4',
++        provider: SystemProviderIds.poe
++      } as Model
++
++      it('should deep merge Poe extra_body reasoning and web search parameters', async () => {
++        const { getReasoningEffort } = await import('../reasoning')
++        const { getWebSearchParams } = await import('../websearch')
++
++        vi.mocked(getReasoningEffort).mockReturnValue({
++          extra_body: {
++            reasoning_effort: 'medium'
++          }
++        })
++        vi.mocked(getWebSearchParams).mockReturnValue({
++          extra_body: {
++            web_search: true
++          }
++        })
++
++        const result = buildProviderOptions(mockAssistant, poeModel, poeProvider, {
++          enableReasoning: true,
++          enableWebSearch: true,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('poe')
++        expect(result.providerOptions.poe).toMatchObject({
++          extra_body: {
++            reasoning_effort: 'medium',
++            web_search: true
++          }
++        })
++      })
++    })
++
+     describe('Custom parameters', () => {
+       it('should merge custom provider-specific parameters', async () => {
+         const { getCustomParameters } = await import('../reasoning')
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index a9cd2fb..2b28878 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -7,7 +7,7 @@ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import type { SettingsState } from '@renderer/store/settings'
+ import type { Assistant, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import {
+   getAnthropicReasoningParams,
+@@ -707,10 +707,16 @@ describe('reasoning utils', () => {
+   })
+ 
+   describe('getGeminiReasoningParams', () => {
+-    it('should return empty for non-reasoning model', async () => {
+-      const { isReasoningModel } = await import('@renderer/config/models')
++    // Use beforeAll to avoid per-test dynamic imports while keeping compatibility
++    // with the async vi.mock factory (static imports of the mocked module break other tests)
++    let mockModels: any
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(false)
++    beforeAll(async () => {
++      mockModels = await import('@renderer/config/models')
++    })
++
++    it('should return empty for non-reasoning model', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(false)
+ 
+       const model: Model = {
+         id: 'gemini-2.0-flash',
+@@ -728,11 +734,69 @@ describe('reasoning utils', () => {
+       expect(result).toEqual({})
+     })
+ 
+-    it('should disable thinking for Flash models when reasoning effort is none', async () => {
+-      const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
++    it('should return empty when isReasoningModel is true but not a Gemini thinking model', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(false)
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(true)
+-      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      const model: Model = {
++        id: 'some-reasoning-model',
++        name: 'Some Model',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should return empty when reasoning effort is not set', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {}
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should return empty when reasoning effort is default', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'default' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({})
++    })
++
++    it('should disable thinking for Flash models when reasoning effort is none', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+       const model: Model = {
+         id: 'gemini-2.5-flash',
+@@ -757,11 +821,218 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
+-    it('should enable thinking with budget for reasoning effort', async () => {
+-      const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
++    it('should disable thinking for non-Flash models when reasoning effort is none (no thinkingBudget)', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(true)
+-      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: false
++        }
++      })
++    })
++
++    it('should include thinkingLevel for Gemini 3 model with none effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'none' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: false,
++          thinkingLevel: 'minimal'
++        }
++      })
++    })
++
++    it('should return thinkingLevel for Gemini 3 model with low effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'low' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'low'
++        }
++      })
++    })
++
++    it('should return thinkingLevel medium for Gemini 3 model with medium effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'medium' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'medium'
++        }
++      })
++    })
++
++    it('should return thinkingLevel high for Gemini 3 model with high effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'high'
++        }
++      })
++    })
++
++    it('should return thinkingLevel high for Gemini 3 model with xhigh effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'high'
++        }
++      })
++    })
++
++    it('should use undefined thinkingLevel for Gemini 3 model with auto effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'auto' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // auto maps to undefined thinkingLevel (let API decide), stays in Gemini 3 branch
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: undefined
++        }
++      })
++    })
++
++    it('should return thinkingLevel minimal for Gemini 3 model with minimal effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isGemini3ThinkingTokenModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemini-3-flash-preview',
++        name: 'Gemini 3 Flash',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'minimal' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'minimal'
++        }
++      })
++    })
++
++    it('should enable thinking with budget for reasoning effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+       const model: Model = {
+         id: 'gemini-2.5-pro',
+@@ -786,11 +1057,35 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
+-    it('should enable thinking without budget for auto effort ratio > 1', async () => {
+-      const { isReasoningModel, isSupportedThinkingTokenGeminiModel } = await import('@renderer/config/models')
++    it('should compute thinkingBudget for old models with xhigh effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+-      vi.mocked(isReasoningModel).mockReturnValue(true)
+-      vi.mocked(isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // EFFORT_RATIO['xhigh'] = 0.9, which is NOT > 1, so it should compute a budget
++      expect(result).toEqual({
++        thinkingConfig: {
++          thinkingBudget: expect.any(Number),
++          includeThoughts: true
++        }
++      })
++    })
++
++    it('should return thinkingBudget -1 for old models with auto effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+ 
+       const model: Model = {
+         id: 'gemini-2.5-pro',
+@@ -814,6 +1109,60 @@ describe('reasoning utils', () => {
+         }
+       })
+     })
++
++    it('should omit thinkingBudget for old models when no token limit is found', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'gemini-2.5-pro-unknown',
++        name: 'Gemini 2.5 Pro Unknown',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'medium' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // budget = Math.floor((0 - 0) * 0.5 + 0) = 0, so no thinkingBudget
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true
++        }
++      })
++    })
++
++    it('should calculate correct thinkingBudget for low effort', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.findTokenLimit).mockReturnValue({ min: 1024, max: 32768 })
++
++      const model: Model = {
++        id: 'gemini-2.5-pro',
++        name: 'Gemini 2.5 Pro',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'low' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      // EFFORT_RATIO['low'] = 0.05
++      // budget = Math.floor((32768 - 1024) * 0.05 + 1024) = Math.floor(1587.2 + 1024) = 2611
++      expect(result).toEqual({
++        thinkingConfig: {
++          thinkingBudget: 2611,
++          includeThoughts: true
++        }
++      })
++    })
+   })
+ 
+   describe('getXAIReasoningParams', () => {
+diff --git a/src/aiCore/utils/__tests__/websearch.test.ts b/src/aiCore/utils/__tests__/websearch.test.ts
+index 5c95a66..d3518e9 100644
+--- a/src/aiCore/utils/__tests__/websearch.test.ts
++++ b/src/aiCore/utils/__tests__/websearch.test.ts
+@@ -68,6 +68,22 @@ describe('websearch utils', () => {
+       })
+     })
+ 
++    it('should return extra_body with web_search for poe provider', () => {
++      const model: Model = {
++        id: 'Gemini-3-Flash',
++        name: 'Gemini 3 Flash',
++        provider: 'poe'
++      } as Model
++
++      const result = getWebSearchParams(model)
++
++      expect(result).toEqual({
++        extra_body: {
++          web_search: true
++        }
++      })
++    })
++
+     it('should return empty object for other providers', () => {
+       const model: Model = {
+         id: 'gpt-4',
+@@ -254,42 +270,43 @@ describe('websearch utils', () => {
+     })
+ 
+     describe('xai provider', () => {
+-      it('should return xai search options', () => {
++      it('should return xai search options with enableImageUnderstanding when no excludeDomains', () => {
+         const result = buildProviderBuiltinWebSearchConfig('xai', defaultWebSearchConfig)
+ 
+         expect(result).toEqual({
+-          xai: {
+-            maxSearchResults: 30,
+-            returnCitations: true,
+-            sources: [{ type: 'web', excludedWebsites: [] }, { type: 'news' }, { type: 'x' }],
+-            mode: 'on'
+-          }
++          xai: { enableImageUnderstanding: true },
++          'xai-xsearch': { enableImageUnderstanding: true }
+         })
+       })
+ 
+-      it('should limit excluded websites to 5', () => {
++      it('should include excludedDomains when excludeDomains provided', () => {
+         const config: CherryWebSearchConfig = {
+           searchWithTime: true,
+           maxResults: 40,
+-          excludeDomains: ['site1.com', 'site2.com', 'site3.com', 'site4.com', 'site5.com', 'site6.com', 'site7.com']
++          excludeDomains: ['site1.com', 'site2.com']
+         }
+ 
+         const result = buildProviderBuiltinWebSearchConfig('xai', config)
+ 
+-        expect(result?.xai?.sources).toBeDefined()
+-        const webSource = result?.xai?.sources?.[0]
+-        if (webSource && webSource.type === 'web') {
+-          expect(webSource.excludedWebsites).toHaveLength(5)
+-        }
++        expect(result).toEqual({
++          xai: {
++            enableImageUnderstanding: true,
++            excludedDomains: ['site1.com', 'site2.com']
++          },
++          'xai-xsearch': { enableImageUnderstanding: true }
++        })
+       })
+ 
+-      it('should include all sources types', () => {
+-        const result = buildProviderBuiltinWebSearchConfig('xai', defaultWebSearchConfig)
++      it('should limit excluded domains to 5', () => {
++        const config: CherryWebSearchConfig = {
++          searchWithTime: true,
++          maxResults: 40,
++          excludeDomains: ['site1.com', 'site2.com', 'site3.com', 'site4.com', 'site5.com', 'site6.com', 'site7.com']
++        }
++
++        const result = buildProviderBuiltinWebSearchConfig('xai', config)
+ 
+-        expect(result?.xai?.sources).toHaveLength(3)
+-        expect(result?.xai?.sources?.[0].type).toBe('web')
+-        expect(result?.xai?.sources?.[1].type).toBe('news')
+-        expect(result?.xai?.sources?.[2].type).toBe('x')
++        expect(result?.xai?.excludedDomains).toHaveLength(5)
+       })
+     })
+ 
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 23a8295..2e9a764 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -13,6 +13,7 @@ import {
+   isOpenAIModel,
+   isOpenAIOpenWeightModel,
+   isQwenMTModel,
++  isReasoningModel,
+   isSupportFlexServiceTierModel,
+   isSupportVerbosityModel
+ } from '@renderer/config/models'
+@@ -40,6 +41,7 @@ import { type AiSdkParam, isAiSdkParam, type OpenAIVerbosity } from '@renderer/t
+ import { isSupportServiceTierProvider, isSupportVerbosityProvider } from '@renderer/utils/provider'
+ import type { JSONValue } from 'ai'
+ import { t } from 'i18next'
++import { merge } from 'lodash'
+ import type { OllamaProviderOptions } from 'ollama-ai-provider-v2'
+ 
+ import { addAnthropicHeaders } from '../prepareParams/header'
+@@ -381,7 +383,12 @@ function buildOpenAIProviderOptions(
+     const reasoningParams = getOpenAIReasoningParams(assistant, model)
+     providerOptions = {
+       ...providerOptions,
+-      ...reasoningParams
++      ...reasoningParams,
++      // TODO: Remove this workaround after migrating to @ai-sdk/open-responses (#13462)
++      // Bypass @ai-sdk/openai's model ID allowlist for reasoning detection.
++      // Third-party providers often use non-canonical model IDs (e.g., "openai/gpt-5.2")
++      // that fail the SDK's startsWith() checks, causing reasoning params to be silently dropped.
++      ...(isReasoningModel(model) && { forceReasoning: true })
+     }
+   }
+   const provider = getProviderById(model.provider)
+@@ -634,10 +641,7 @@ function buildGenericProviderOptions(
+ 
+   if (enableWebSearch) {
+     const webSearchParams = getWebSearchParams(model)
+-    providerOptions = {
+-      ...providerOptions,
+-      ...webSearchParams
+-    }
++    providerOptions = merge({}, providerOptions, webSearchParams)
+   }
+ 
+   // 特殊处理 Qwen MT
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 87114c5..1d13d4d 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -43,6 +43,7 @@ import type { Assistant, Model, ReasoningEffortOption } from '@renderer/types'
+ import { EFFORT_RATIO, isSystemProvider, SystemProviderIds } from '@renderer/types'
+ import type { OpenAIReasoningSummary } from '@renderer/types/aiCoreTypes'
+ import type { ReasoningEffortOptionalParams } from '@renderer/types/sdk'
++import { getLowerBaseModelName } from '@renderer/utils'
+ import { isSupportEnableThinkingProvider } from '@renderer/utils/provider'
+ import { toInteger } from 'lodash'
+ 
+@@ -653,8 +654,11 @@ type GoogleThinkingLevel = NonNullable<GoogleGenerativeAIProviderOptions['thinki
+ 
+ function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): GoogleThinkingLevel {
+   switch (reasoningEffort) {
++    case 'auto':
+     case 'default':
+       return undefined
++    case 'none':
++      return 'minimal'
+     case 'minimal':
+       return 'minimal'
+     case 'low':
+@@ -662,10 +666,12 @@ function mapToGeminiThinkingLevel(reasoningEffort: ReasoningEffortOption): Googl
+     case 'medium':
+       return 'medium'
+     case 'high':
++    case 'xhigh':
+       return 'high'
+     default:
+-      logger.warn('Unknown thinking level for Gemini. Fallback to medium instead.', { reasoningEffort })
+-      return 'medium'
++      // Enforce all possible values are handled
++      reasoningEffort satisfies never
++      return undefined
+   }
+ }
+ 
+@@ -679,7 +685,7 @@ export function getGeminiReasoningParams(
+   assistant: Assistant,
+   model: Model
+ ): Pick<GoogleGenerativeAIProviderOptions, 'thinkingConfig'> {
+-  if (!isReasoningModel(model)) {
++  if (!isReasoningModel(model) || !isSupportedThinkingTokenGeminiModel(model)) {
+     return {}
+   }
+ 
+@@ -689,34 +695,43 @@ export function getGeminiReasoningParams(
+     return {}
+   }
+ 
+-  // Gemini 推理参数
+-  if (isSupportedThinkingTokenGeminiModel(model)) {
+-    if (reasoningEffort === undefined || reasoningEffort === 'none') {
+-      return {
+-        thinkingConfig: {
+-          includeThoughts: false,
+-          ...(GEMINI_FLASH_MODEL_REGEX.test(model.id) ? { thinkingBudget: 0 } : {})
+-        }
++  let thinkingLevel: GoogleThinkingLevel | null = null
++  const includeThoughts = reasoningEffort !== 'none'
++
++  // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
++  if (isGemini3ThinkingTokenModel(model)) {
++    thinkingLevel = mapToGeminiThinkingLevel(reasoningEffort)
++    if (thinkingLevel === 'minimal' && getLowerBaseModelName(model.id).includes('pro')) {
++      thinkingLevel = 'low'
++    }
++  }
++
++  if (thinkingLevel !== null) {
++    // Gemini 3 branch. thinkingLevel can be undefined (auto) or a specific level.
++    return {
++      thinkingConfig: {
++        includeThoughts,
++        thinkingLevel
+       }
+     }
++  } else {
++    // Old models
++    const effortRatio = EFFORT_RATIO[reasoningEffort]
+ 
+-    // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
+-    if (isGemini3ThinkingTokenModel(model)) {
++    if (reasoningEffort === 'auto') {
+       return {
+         thinkingConfig: {
+-          includeThoughts: true,
+-          thinkingLevel: mapToGeminiThinkingLevel(reasoningEffort)
++          includeThoughts,
++          thinkingBudget: -1
+         }
+       }
+     }
+ 
+-    const effortRatio = EFFORT_RATIO[reasoningEffort]
+-
+-    if (effortRatio > 1) {
++    if (reasoningEffort === 'none') {
+       return {
+         thinkingConfig: {
+-          thinkingBudget: -1,
+-          includeThoughts: true
++          includeThoughts,
++          ...(GEMINI_FLASH_MODEL_REGEX.test(model.id) ? { thinkingBudget: 0 } : {})
+         }
+       }
+     }
+@@ -726,13 +741,11 @@ export function getGeminiReasoningParams(
+ 
+     return {
+       thinkingConfig: {
+-        ...(budget > 0 ? { thinkingBudget: budget } : {}),
+-        includeThoughts: true
++        includeThoughts,
++        ...(budget > 0 ? { thinkingBudget: budget } : {})
+       }
+     }
+   }
+-
+-  return {}
+ }
+ 
+ /**
+diff --git a/src/aiCore/utils/websearch.ts b/src/aiCore/utils/websearch.ts
+index 14a9913..339d776 100644
+--- a/src/aiCore/utils/websearch.ts
++++ b/src/aiCore/utils/websearch.ts
+@@ -1,7 +1,9 @@
+ import type {
+   AnthropicSearchConfig,
+   OpenAISearchConfig,
+-  WebSearchPluginConfig
++  WebSearchPluginConfig,
++  XAIWebSearchConfig,
++  XAIXSearchConfig
+ } from '@cherrystudio/ai-core/core/plugins/built-in/webSearchPlugin/helper'
+ import type { BaseProviderId } from '@cherrystudio/ai-core/provider'
+ import { isOpenAIDeepResearchModel, isOpenAIWebSearchChatCompletionOnlyModel } from '@renderer/config/models'
+@@ -9,8 +11,6 @@ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+ import type { Model } from '@renderer/types'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
+ 
+-const X_AI_MAX_SEARCH_RESULT = 30
+-
+ export function getWebSearchParams(model: Model): Record<string, any> {
+   if (model.provider === 'hunyuan') {
+     return { enable_enhancement: true, citation: true, search_info: true }
+@@ -25,6 +25,15 @@ export function getWebSearchParams(model: Model): Record<string, any> {
+     }
+   }
+ 
++  // https://creator.poe.com/docs/external-applications/openai-compatible-api#using-custom-parameters-with-extra_body
++  if (model.provider === 'poe') {
++    return {
++      extra_body: {
++        web_search: true
++      }
++    }
++  }
++
+   if (isOpenAIWebSearchChatCompletionOnlyModel(model)) {
+     return {
+       web_search_options: {}
+@@ -82,20 +91,18 @@ export function buildProviderBuiltinWebSearchConfig(
+     }
+     case 'xai': {
+       const excludeDomains = mapRegexToPatterns(webSearchConfig.excludeDomains)
++      const xaiWebConfig: XAIWebSearchConfig = {
++        enableImageUnderstanding: true
++      }
++      if (excludeDomains.length > 0) {
++        xaiWebConfig.excludedDomains = excludeDomains.slice(0, 5)
++      }
++      const xaiXSearchConfig: XAIXSearchConfig = {
++        enableImageUnderstanding: true
++      }
+       return {
+-        xai: {
+-          maxSearchResults: Math.min(webSearchConfig.maxResults, X_AI_MAX_SEARCH_RESULT),
+-          returnCitations: true,
+-          sources: [
+-            {
+-              type: 'web',
+-              excludedWebsites: excludeDomains.slice(0, Math.min(excludeDomains.length, 5))
+-            },
+-            { type: 'news' },
+-            { type: 'x' }
+-          ],
+-          mode: 'on'
+-        }
++        xai: xaiWebConfig,
++        'xai-xsearch': xaiXSearchConfig
+       }
+     }
+     case 'openrouter': {
