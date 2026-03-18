@@ -1,0 +1,1080 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index e1993fe..0b43fcc 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -10,6 +10,7 @@ import type { Chunk, ProviderMetadata } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { ProviderSpecificError } from '@renderer/types/provider-specific-error'
+ import { formatErrorMessage, isAbortError } from '@renderer/utils/error'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { convertLinks, flushLinkConverterBuffer } from '@renderer/utils/linkConverter'
+ import type { ClaudeCodeRawValue } from '@shared/agents/claudecode/types'
+ import { AISDKError, type TextStreamPart, type ToolSet } from 'ai'
+@@ -33,6 +34,7 @@ export class AiSdkToChunkAdapter {
+   private hasTextContent = false
+   private getSessionWasCleared?: () => boolean
+   private providerId?: string
++  private idleTimeout?: IdleTimeoutHandle
+ 
+   constructor(
+     private onChunk: (chunk: Chunk) => void,
+@@ -41,7 +43,8 @@ export class AiSdkToChunkAdapter {
+     enableWebSearch?: boolean,
+     onSessionUpdate?: (sessionId: string) => void,
+     getSessionWasCleared?: () => boolean,
+-    providerId?: string
++    providerId?: string,
++    idleTimeout?: IdleTimeoutHandle
+   ) {
+     this.toolCallHandler = new ToolCallChunkHandler(onChunk, mcpTools)
+     this.accumulate = accumulate
+@@ -49,6 +52,7 @@ export class AiSdkToChunkAdapter {
+     this.onSessionUpdate = onSessionUpdate
+     this.getSessionWasCleared = getSessionWasCleared
+     this.providerId = providerId
++    this.idleTimeout = idleTimeout
+   }
+ 
+   private markFirstTokenIfNeeded() {
+@@ -110,6 +114,9 @@ export class AiSdkToChunkAdapter {
+       while (true) {
+         const { done, value } = await reader.read()
+ 
++        // Reset idle timeout on every chunk received from the stream
++        this.idleTimeout?.reset()
++
+         if (done) {
+           // Flush any remaining content from link converter buffer if web search is enabled
+           if (this.enableWebSearch) {
+@@ -131,6 +138,8 @@ export class AiSdkToChunkAdapter {
+     } finally {
+       reader.releaseLock()
+       this.resetTimingState()
++      // Clean up the idle timeout timer when the stream ends
++      this.idleTimeout?.cleanup()
+     }
+   }
+ 
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index 15a302a..6590819 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -17,6 +17,7 @@ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+ import { type Assistant, type GenerateImageParams, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { SUPPORTED_IMAGE_ENDPOINT_LIST } from '@renderer/utils'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+ import { gateway, type LanguageModel, type Provider as AiSdkProvider } from 'ai'
+ 
+@@ -42,6 +43,7 @@ export type ModernAiProviderConfig = AiSdkMiddlewareConfig & {
+   // topicId for tracing
+   topicId?: string
+   callType: string
++  idleTimeout?: IdleTimeoutHandle
+ }
+ 
+ export default class ModernAiProvider {
+@@ -116,6 +118,10 @@ export default class ModernAiProvider {
+     return this.actualProvider
+   }
+ 
++  /**
++   * Note: This method routes text completions through `modernCompletions`,
++   * which only calls `streamText` (no `generateText` path).
++   */
+   public async completions(modelId: string, params: StreamTextParams, providerConfig: ModernAiProviderConfig) {
+     // 检查model是否存在
+     if (!this.model) {
+@@ -302,6 +308,10 @@ export default class ModernAiProvider {
+   /**
+    * 使用现代化AI SDK的completions实现
+    */
++  /**
++   * Note: This implementation always uses `executor.streamText` and never
++   * calls `generateText`, even when `onChunk` is not provided.
++   */
+   private async modernCompletions(
+     model: LanguageModel,
+     params: StreamTextParams,
+@@ -327,7 +337,8 @@ export default class ModernAiProvider {
+         config.enableWebSearch,
+         undefined,
+         undefined,
+-        this.config!.providerId
++        this.config!.providerId,
++        config.idleTimeout
+       )
+ 
+       const streamResult = await executor.streamText({
+@@ -342,20 +353,45 @@ export default class ModernAiProvider {
+         getText: () => finalText
+       }
+     } else {
++      // Since no onChunk is provided, the external consumer would not handle error chunk.
++      // So we need to capture the actual stream error so we can throw it instead of the
++      // generic NoTextGeneratedError ("No output generated. Check the stream
++      // for errors.") that AI SDK raises when streamResult.text is accessed
++      // after a failed stream.
++      let streamError: unknown = undefined
++
+       const streamResult = await executor.streamText({
+         ...params,
+-        model
++        model,
++        onError({ error }) {
++          streamError = error
++        }
+       })
+ 
+       // 强制消费流,不然await streamResult.text会阻塞
+-      await streamResult?.consumeStream()
++      await streamResult?.consumeStream({
++        onError(error) {
++          if (!streamError) {
++            streamError = error
++          }
++        }
++      })
+ 
+-      const finalText = await streamResult.text
+-      const usage = await streamResult.totalUsage
++      try {
++        const finalText = await streamResult.text
++        const usage = await streamResult.totalUsage
+ 
+-      return {
+-        getText: () => finalText,
+-        usage
++        return {
++          getText: () => finalText,
++          usage
++        }
++      } catch (error) {
++        // If we captured the real stream error, throw that instead of the
++        // generic NoTextGeneratedError so callers get actionable diagnostics.
++        if (streamError) {
++          throw streamError
++        }
++        throw error
+       }
+     }
+   }
+diff --git a/src/aiCore/legacy/clients/BaseApiClient.ts b/src/aiCore/legacy/clients/BaseApiClient.ts
+index 78124b9..b154223 100644
+--- a/src/aiCore/legacy/clients/BaseApiClient.ts
++++ b/src/aiCore/legacy/clients/BaseApiClient.ts
+@@ -50,7 +50,7 @@ import { isJSON, parseJSON } from '@renderer/utils'
+ import { addAbortController, removeAbortController } from '@renderer/utils/abortController'
+ import { findFileBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+ import { isSupportServiceTierProvider } from '@renderer/utils/provider'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import { defaultAppHeaders } from '@shared/utils'
+ import { isEmpty } from 'lodash'
+ 
+@@ -267,7 +267,7 @@ export abstract class BaseApiClient<
+     if (isSupportFlexServiceTierModel(model)) {
+       return 15 * 1000 * 60
+     }
+-    return defaultTimeout
++    return DEFAULT_TIMEOUT
+   }
+ 
+   public async getMessageContent(
+diff --git a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+index 52e721b..abbb800 100644
+--- a/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/GeminiAPIClient.ts
+@@ -54,7 +54,7 @@ import {
+   mcpToolsToGeminiTools
+ } from '@renderer/utils/mcp-tools'
+ import { findFileBlocks, findImageBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+-import { defaultTimeout, MB } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT, MB } from '@shared/config/constant'
+ import { getTrailingApiVersion, withoutTrailingApiVersion } from '@shared/utils'
+ import { t } from 'i18next'
+ 
+@@ -117,7 +117,7 @@ export class GeminiAPIClient extends BaseApiClient<
+         aspectRatio: imageSize,
+         abortSignal: signal,
+         httpOptions: {
+-          timeout: defaultTimeout
++          timeout: DEFAULT_TIMEOUT
+         }
+       }
+       const response = await sdk.models.generateImages({
+diff --git a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+index 298179a..8ac0741 100644
+--- a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
++++ b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+@@ -4,7 +4,7 @@ import { isDedicatedImageGenerationModel } from '@renderer/config/models'
+ import FileManager from '@renderer/services/FileManager'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { findImageBlocks, getMainTextContent } from '@renderer/utils/messageUtils/find'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import type { BaseApiClient } from '../../clients/BaseApiClient'
+ import type { CompletionsParams, CompletionsResult, GenericChunk } from '../schemas'
+@@ -77,7 +77,7 @@ export const ImageGenerationMiddleware: CompletionsMiddleware =
+ 
+           const startTime = Date.now()
+           let response: OpenAI.Images.ImagesResponse
+-          const options = { signal, timeout: defaultTimeout }
++          const options = { signal, timeout: DEFAULT_TIMEOUT }
+ 
+           if (imageFiles.length > 0) {
+             const model = assistant.model
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index a4f345e..d0cd8a7 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -1,6 +1,6 @@
+ import type { Assistant, AssistantSettings, Model, Topic } from '@renderer/types'
+ import { TopicType } from '@renderer/types'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import { describe, expect, it, vi } from 'vitest'
+ 
+ import { getTemperature, getTimeout, getTopP } from '../modelParameters'
+@@ -212,7 +212,7 @@ describe('modelParameters', () => {
+     it('falls back to the default timeout otherwise', () => {
+       const model = createModel({ id: 'gpt-4o', provider: 'openai', group: 'openai' })
+ 
+-      expect(getTimeout(model)).toBe(defaultTimeout)
++      expect(getTimeout(model)).toBe(DEFAULT_TIMEOUT)
+     })
+   })
+ })
+diff --git a/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+new file mode 100644
+index 0000000..9bf22e6
+--- /dev/null
++++ b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+@@ -0,0 +1,225 @@
++/**
++ * Tests for parameterBuilder maxToolCalls functionality
++ * These tests verify the maxToolCalls calculation and validation logic in isolation
++ */
++import { describe, expect, it } from 'vitest'
++
++// Mirror the constants from parameterBuilder.ts
++const MIN_TOOL_CALLS = 1
++const MAX_TOOL_CALLS = 100
++const DEFAULT_MAX_TOOL_CALLS = 20
++const DEFAULT_ENABLE_MAX_TOOL_CALLS = true
++
++/**
++ * Validates and clamps maxToolCalls to valid range
++ * Mirrors the logic in parameterBuilder.ts
++ */
++function validateMaxToolCalls(value: number | undefined): number {
++  if (value === undefined || value < MIN_TOOL_CALLS || value > MAX_TOOL_CALLS) {
++    return DEFAULT_MAX_TOOL_CALLS
++  }
++  return value
++}
++
++/**
++ * Calculate the effective max tool calls based on assistant settings
++ * Mirrors the logic in parameterBuilder.ts
++ */
++function calculateEffectiveMaxToolCalls(settings?: { maxToolCalls?: number; enableMaxToolCalls?: boolean }): {
++  stopWhen: number | null
++  maxToolCalls: number
++} {
++  const enableMaxToolCalls = settings?.enableMaxToolCalls ?? DEFAULT_ENABLE_MAX_TOOL_CALLS
++
++  if (!enableMaxToolCalls) {
++    // When disabled, don't pass stopWhen (return null to indicate no stopWhen)
++    return { stopWhen: null, maxToolCalls: DEFAULT_MAX_TOOL_CALLS }
++  }
++
++  // When enabled, validate and use user-defined value
++  const maxToolCalls = validateMaxToolCalls(settings?.maxToolCalls)
++  return { stopWhen: maxToolCalls, maxToolCalls }
++}
++
++describe('validateMaxToolCalls', () => {
++  it('returns valid values as-is', () => {
++    expect(validateMaxToolCalls(1)).toBe(1)
++    expect(validateMaxToolCalls(50)).toBe(50)
++    expect(validateMaxToolCalls(100)).toBe(100)
++  })
++
++  it('clamps values above 100 to default', () => {
++    const result = validateMaxToolCalls(999)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++
++  it('clamps zero to default', () => {
++    const result = validateMaxToolCalls(0)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++
++  it('clamps negative values to default', () => {
++    const result = validateMaxToolCalls(-5)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++
++  it('returns default when value is undefined', () => {
++    const result = validateMaxToolCalls(undefined)
++    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++  })
++})
++
++describe('maxToolCalls calculation logic', () => {
++  describe('default behavior', () => {
++    it('uses default value 20 when settings are undefined', () => {
++      const result = calculateEffectiveMaxToolCalls(undefined)
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++
++    it('uses default value 20 when settings is empty object', () => {
++      const result = calculateEffectiveMaxToolCalls({})
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++
++    it('uses default value 20 when maxToolCalls is undefined', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true
++        // maxToolCalls is undefined
++      })
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++
++    it('uses custom value when maxToolCalls is set and enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 50
++      })
++      expect(result.maxToolCalls).toBe(50)
++      expect(result.stopWhen).toBe(50)
++    })
++  })
++
++  describe('custom values when enabled', () => {
++    it('uses custom value when enableMaxToolCalls is true and maxToolCalls is set', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 50
++      })
++      expect(result.stopWhen).toBe(50)
++    })
++
++    it('uses custom value at minimum boundary (1)', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 1
++      })
++      expect(result.stopWhen).toBe(1)
++    })
++
++    it('uses custom value at maximum boundary (100)', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 100
++      })
++      expect(result.stopWhen).toBe(100)
++    })
++
++    it('clamps values above 100 to default when enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 999
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('clamps zero to default when enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 0
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('clamps negative values to default when enabled', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: -5
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++  })
++
++  describe('disabled behavior', () => {
++    it('does not pass stopWhen when enableMaxToolCalls is false', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: false,
++        maxToolCalls: 50
++      })
++      // When disabled, stopWhen should be null (indicating no stopWhen passed)
++      expect(result.stopWhen).toBeNull()
++    })
++
++    it('does not pass stopWhen when both enableMaxToolCalls is false and maxToolCalls is undefined', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: false
++      })
++      expect(result.stopWhen).toBeNull()
++    })
++
++    it('falls back to default when disabled with invalid maxToolCalls', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: false,
++        maxToolCalls: 999
++      })
++      // When disabled, maxToolCalls should still be default (for reference)
++      expect(result.maxToolCalls).toBe(DEFAULT_MAX_TOOL_CALLS)
++      expect(result.stopWhen).toBeNull()
++    })
++  })
++
++  describe('backward compatibility', () => {
++    it('maintains backward compatibility - existing assistants without new fields use default', () => {
++      // Simulate an old assistant without the new fields
++      const oldSettings = {
++        // Old assistants don't have enableMaxToolCalls or maxToolCalls
++        temperature: 0.7,
++        contextCount: 10
++      }
++      const result = calculateEffectiveMaxToolCalls(
++        oldSettings as { maxToolCalls?: number; enableMaxToolCalls?: boolean }
++      )
++      // Should default to enabled with 20 for backward compatibility
++      expect(result.maxToolCalls).toBe(20)
++      expect(result.stopWhen).toBe(20)
++    })
++  })
++
++  describe('security - invalid values from imported/migrated settings', () => {
++    it('validates extremely large values from imported settings', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 999999
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('validates negative values from imported settings', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: -100
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++
++    it('validates zero from imported settings', () => {
++      const result = calculateEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
++        maxToolCalls: 0
++      })
++      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
++    })
++  })
++})
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 7980a6f..d6673a8 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -18,7 +18,7 @@ import {
+   getProviderByModel
+ } from '@renderer/services/AssistantService'
+ import type { Assistant, Model } from '@renderer/types'
+-import { defaultTimeout } from '@shared/config/constant'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import { getThinkingBudget } from '../utils/reasoning'
+ 
+@@ -97,7 +97,7 @@ export function getTimeout(model: Model): number {
+   if (isSupportedFlexServiceTier(model)) {
+     return 15 * 1000 * 60
+   }
+-  return defaultTimeout
++  return DEFAULT_TIMEOUT
+ }
+ 
+ export function getMaxTokens(assistant: Assistant, model: Model): number | undefined {
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 8dc9b40..c92cc93 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -13,6 +13,7 @@ import type { AnthropicSearchConfig, WebSearchPluginConfig } from '@cherrystudio
+ import { isBaseProvider } from '@cherrystudio/ai-core/core/providers/schemas'
+ import type { BaseProviderId } from '@cherrystudio/ai-core/provider'
+ import { loggerService } from '@logger'
++import { MAX_TOOL_CALLS, MIN_TOOL_CALLS } from '@renderer/config/constant'
+ import {
+   isAnthropicModel,
+   isFixedReasoningModel,
+@@ -27,15 +28,17 @@ import {
+   isWebSearchModel
+ } from '@renderer/config/models'
+ import { getHubModeSystemPrompt } from '@renderer/config/prompts-code-mode'
+-import { getDefaultModel } from '@renderer/services/AssistantService'
++import { DEFAULT_ASSISTANT_SETTINGS, getDefaultModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import type { CherryWebSearchConfig } from '@renderer/store/websearch'
+ import type { Model } from '@renderer/types'
+ import { type Assistant, getEffectiveMcpMode, type MCPTool, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
++import { IdleTimeoutController, type IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
+ import { isAIGatewayProvider, isAwsBedrockProvider, isSupportUrlContextProvider } from '@renderer/utils/provider'
++import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import type { ModelMessage, Tool } from 'ai'
+ import { stepCountIs } from 'ai'
+ 
+@@ -48,6 +51,19 @@ import { getMaxTokens, getTemperature, getTopP } from './modelParameters'
+ 
+ const logger = loggerService.withContext('parameterBuilder')
+ 
++/**
++ * Validates and clamps maxToolCalls to valid range
++ * Falls back to DEFAULT_ASSISTANT_SETTINGS.maxToolCalls if invalid
++ * @param value - The maxToolCalls value from settings
++ * @returns Validated maxToolCalls value
++ */
++function validateMaxToolCalls(value: number | undefined): number {
++  if (value === undefined || value < MIN_TOOL_CALLS || value > MAX_TOOL_CALLS) {
++    return DEFAULT_ASSISTANT_SETTINGS.maxToolCalls
++  }
++  return value
++}
++
+ type ProviderDefinedTool = Extract<Tool<any, any>, { type: 'provider' }>
+ 
+ function mapVertexAIGatewayModelToProviderId(model: Model): BaseProviderId | undefined {
+@@ -83,7 +99,7 @@ export async function buildStreamTextParams(
+     requestOptions?: {
+       signal?: AbortSignal
+       timeout?: number
+-      headers?: Record<string, string>
++      headers?: Record<string, string | undefined>
+     }
+   }
+ ): Promise<{
+@@ -96,8 +112,20 @@ export async function buildStreamTextParams(
+     enableUrlContext: boolean
+   }
+   webSearchPluginConfig?: WebSearchPluginConfig
++  idleTimeout: IdleTimeoutHandle
+ }> {
+-  const { mcpTools } = options
++  const { mcpTools, requestOptions = {} } = options
++  // No caller currently provides a custom timeout; defaultTimeout (10 min) is the fallback.
++  const { signal: externalSignal, timeout = DEFAULT_TIMEOUT, headers: inputHeaders = {} } = requestOptions
++
++  // Use an idle timeout that resets every time a stream chunk is received,
++  // instead of a fixed total timeout that starts from the initial request.
++  const idleTimeout = new IdleTimeoutController(timeout)
++  const signals = [idleTimeout.signal]
++  if (externalSignal) {
++    signals.push(externalSignal)
++  }
++  const finalSignal = AbortSignal.any(signals)
+ 
+   const model = assistant.model || getDefaultModel()
+   const aiSdkProviderId = getAiSdkProviderId(provider)
+@@ -205,7 +233,7 @@ export async function buildStreamTextParams(
+     }
+   }
+ 
+-  let headers: Record<string, string | undefined> = options.requestOptions?.headers ?? {}
++  let headers = inputHeaders
+ 
+   if (isAnthropicModel(model) && !isAwsBedrockProvider(provider)) {
+     const betaHeaders = addAnthropicHeaders(assistant, model)
+@@ -220,6 +248,12 @@ export async function buildStreamTextParams(
+   // Note: standardParams (topK, frequencyPenalty, presencePenalty, stopSequences, seed)
+   // are extracted from custom parameters and passed directly to streamText()
+   // instead of being placed in providerOptions
++
++  // Get max tool calls from assistant settings
++  // When enabled, validate and use user-defined value (1-100)
++  // When disabled, don't pass stopWhen - let AI SDK use its own default
++  const enableMaxToolCalls = assistant.settings?.enableMaxToolCalls ?? DEFAULT_ASSISTANT_SETTINGS.enableMaxToolCalls
++
+   const params: StreamTextParams = {
+     messages: sdkMessages,
+     maxOutputTokens: getMaxTokens(assistant, model),
+@@ -227,13 +261,19 @@ export async function buildStreamTextParams(
+     topP: getTopP(assistant, model),
+     // Include AI SDK standard params extracted from custom parameters
+     ...standardParams,
+-    abortSignal: options.requestOptions?.signal,
++    abortSignal: finalSignal,
+     headers,
+     providerOptions,
+-    stopWhen: stepCountIs(20),
+     maxRetries: 0
+   }
+ 
++  // Only add stopWhen when explicitly enabled and validated
++  if (enableMaxToolCalls) {
++    const maxToolCalls = validateMaxToolCalls(assistant.settings?.maxToolCalls)
++    params.stopWhen = stepCountIs(maxToolCalls)
++  }
++  // When disabled, don't pass stopWhen - let AI SDK use its own default
++
+   if (tools) {
+     params.tools = tools
+   }
+@@ -257,7 +297,8 @@ export async function buildStreamTextParams(
+     params,
+     modelId: model.id,
+     capabilities: { enableReasoning, enableWebSearch, enableGenerateImage, enableUrlContext },
+-    webSearchPluginConfig
++    webSearchPluginConfig,
++    idleTimeout
+   }
+ }
+ 
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index b1d8e34..fb0c576 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -540,6 +540,7 @@ describe('Azure OpenAI traditional API routing', () => {
+     const config = providerToAiSdkConfig(provider, createModel('gpt-4o', 'GPT-4o', provider.id))
+ 
+     expect(config.providerId).toBe('azure')
++    expect(config.options.mode).toBe('chat')
+     expect(config.options.apiVersion).toBe('2024-02-15-preview')
+     expect(config.options.useDeploymentBasedUrls).toBe(true)
+   })
+@@ -548,12 +549,14 @@ describe('Azure OpenAI traditional API routing', () => {
+     const v1Provider = createAzureProvider('v1')
+     const v1Config = providerToAiSdkConfig(v1Provider, createModel('gpt-4o', 'GPT-4o', v1Provider.id))
+     expect(v1Config.providerId).toBe('azure-responses')
++    expect(v1Config.options.mode).toBe('responses')
+     expect(v1Config.options.apiVersion).toBe('v1')
+     expect(v1Config.options.useDeploymentBasedUrls).toBeUndefined()
+ 
+     const previewProvider = createAzureProvider('preview')
+     const previewConfig = providerToAiSdkConfig(previewProvider, createModel('gpt-4o', 'GPT-4o', previewProvider.id))
+     expect(previewConfig.providerId).toBe('azure-responses')
++    expect(previewConfig.options.mode).toBe('responses')
+     expect(previewConfig.options.apiVersion).toBe('preview')
+     expect(previewConfig.options.useDeploymentBasedUrls).toBeUndefined()
+   })
+diff --git a/src/aiCore/utils/__tests__/mcp.test.ts b/src/aiCore/utils/__tests__/mcp.test.ts
+index 9cd08a9..3203dd2 100644
+--- a/src/aiCore/utils/__tests__/mcp.test.ts
++++ b/src/aiCore/utils/__tests__/mcp.test.ts
+@@ -32,7 +32,9 @@ vi.mock('@renderer/utils/mcp-tools', () => ({
+ 
+ vi.mock('@renderer/utils/userConfirmation', () => ({
+   requestToolConfirmation: vi.fn(async () => true),
+-  sendToolApprovalNotification: vi.fn()
++  sendToolApprovalNotification: vi.fn(),
++  setToolIdToNameMapping: vi.fn(),
++  confirmSameNameTools: vi.fn()
+ }))
+ 
+ describe('mcp utils', () => {
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 7e06d07..a2f75d8 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -45,7 +45,8 @@ vi.mock('@cherrystudio/ai-core/provider', async (importOriginal) => {
+           'gateway',
+           'aihubmix',
+           'newapi',
+-          'ollama'
++          'ollama',
++          'poe'
+         ]
+         if (customProviders.includes(id)) {
+           return { success: true, data: id }
+@@ -433,6 +434,53 @@ describe('options utils', () => {
+       })
+     })
+ 
++    describe('Poe provider', () => {
++      const poeProvider: Provider = {
++        id: SystemProviderIds.poe,
++        name: 'Poe',
++        type: 'openai',
++        apiKey: 'test-key',
++        apiHost: 'https://api.poe.com/v1',
++        isSystem: true
++      } as Provider
++
++      const poeModel: Model = {
++        id: 'openai/gpt-4',
++        name: 'GPT-4',
++        provider: SystemProviderIds.poe
++      } as Model
++
++      it('should deep merge Poe extra_body reasoning and web search parameters', async () => {
++        const { getReasoningEffort } = await import('../reasoning')
++        const { getWebSearchParams } = await import('../websearch')
++
++        vi.mocked(getReasoningEffort).mockReturnValue({
++          extra_body: {
++            reasoning_effort: 'medium'
++          }
++        })
++        vi.mocked(getWebSearchParams).mockReturnValue({
++          extra_body: {
++            web_search: true
++          }
++        })
++
++        const result = buildProviderOptions(mockAssistant, poeModel, poeProvider, {
++          enableReasoning: true,
++          enableWebSearch: true,
++          enableGenerateImage: false
++        })
++
++        expect(result.providerOptions).toHaveProperty('poe')
++        expect(result.providerOptions.poe).toMatchObject({
++          extra_body: {
++            reasoning_effort: 'medium',
++            web_search: true
++          }
++        })
++      })
++    })
++
+     describe('Custom parameters', () => {
+       it('should merge custom provider-specific parameters', async () => {
+         const { getCustomParameters } = await import('../reasoning')
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 2b28878..cba3c05 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -704,6 +704,114 @@ describe('reasoning utils', () => {
+         }
+       })
+     })
++
++    it('should use fallback budgetTokens when findTokenLimit returns undefined for Claude model', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
++        '@renderer/config/models'
++      )
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'claude-unknown-model',
++        name: 'Claude Unknown',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'high',
++          maxTokens: 8192
++        }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: {
++          type: 'enabled',
++          budgetTokens: expect.any(Number)
++        }
++      })
++      // budgetTokens must be present and >= 1024 (the minimum enforced by computeBudgetTokens)
++      const thinking = result.thinking as { type: 'enabled'; budgetTokens?: number }
++      expect(thinking.budgetTokens).toBeGreaterThanOrEqual(1024)
++    })
++
++    it('should use fallback budgetTokens for non-Claude model on Anthropic endpoint when token limit is unknown', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
++        '@renderer/config/models'
++      )
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'kimi-reasoning-model',
++        name: 'Kimi Reasoning',
++        provider: 'custom-provider'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'medium',
++          maxTokens: 4096
++        }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      // Non-Claude models on Anthropic endpoint should also get fallback budgetTokens
++      expect(result).toEqual({
++        thinking: {
++          type: 'enabled',
++          budgetTokens: expect.any(Number)
++        }
++      })
++      const thinking = result.thinking as { type: 'enabled'; budgetTokens?: number }
++      expect(thinking.budgetTokens).toBeGreaterThanOrEqual(1024)
++    })
++
++    it('should produce different fallback budgetTokens for different effort levels', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
++        '@renderer/config/models'
++      )
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'claude-unknown-model',
++        name: 'Claude Unknown',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const lowAssistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'low', maxTokens: 4096 }
++      } as Assistant
++
++      const highAssistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high', maxTokens: 4096 }
++      } as Assistant
++
++      const lowResult = getAnthropicReasoningParams(lowAssistant, model)
++      const highResult = getAnthropicReasoningParams(highAssistant, model)
++
++      // Higher effort should produce higher or equal budgetTokens
++      const lowThinking = lowResult.thinking as { type: 'enabled'; budgetTokens?: number }
++      const highThinking = highResult.thinking as { type: 'enabled'; budgetTokens?: number }
++      expect(highThinking.budgetTokens).toBeGreaterThanOrEqual(lowThinking.budgetTokens!)
++    })
+   })
+ 
+   describe('getGeminiReasoningParams', () => {
+diff --git a/src/aiCore/utils/__tests__/websearch.test.ts b/src/aiCore/utils/__tests__/websearch.test.ts
+index ee788d4..d3518e9 100644
+--- a/src/aiCore/utils/__tests__/websearch.test.ts
++++ b/src/aiCore/utils/__tests__/websearch.test.ts
+@@ -68,6 +68,22 @@ describe('websearch utils', () => {
+       })
+     })
+ 
++    it('should return extra_body with web_search for poe provider', () => {
++      const model: Model = {
++        id: 'Gemini-3-Flash',
++        name: 'Gemini 3 Flash',
++        provider: 'poe'
++      } as Model
++
++      const result = getWebSearchParams(model)
++
++      expect(result).toEqual({
++        extra_body: {
++          web_search: true
++        }
++      })
++    })
++
+     it('should return empty object for other providers', () => {
+       const model: Model = {
+         id: 'gpt-4',
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index 842be36..fddafc3 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -2,7 +2,12 @@ import { loggerService } from '@logger'
+ import store from '@renderer/store'
+ import type { MCPCallToolResponse, MCPTool, MCPToolResponse } from '@renderer/types'
+ import { callMCPTool, getMcpServerByTool, isToolAutoApproved } from '@renderer/utils/mcp-tools'
+-import { requestToolConfirmation, sendToolApprovalNotification } from '@renderer/utils/userConfirmation'
++import {
++  confirmSameNameTools,
++  requestToolConfirmation,
++  sendToolApprovalNotification,
++  setToolIdToNameMapping
++} from '@renderer/utils/userConfirmation'
+ import { type Tool, type ToolSet } from 'ai'
+ import { jsonSchema, tool } from 'ai'
+ import type { JSONSchema7 } from 'json-schema'
+@@ -119,12 +124,26 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[], allowedTools?:
+         let confirmed = true
+ 
+         if (!isAutoApproveEnabled) {
++          // Register mapping so confirmSameNameTools can batch-confirm pending tools.
++          // For hub invoke/exec, use the underlying tool name so tools targeting the
++          // same underlying server+tool are grouped together.
++          const mappingName =
++            mcpTool.serverId === 'hub' && (mcpTool.name === 'invoke' || mcpTool.name === 'exec')
++              ? ((params as Record<string, unknown>)?.name as string) || mcpTool.name
++              : mcpTool.name
++          setToolIdToNameMapping(toolCallId, mappingName)
++
+           // Send system notification for tool approval
+           sendToolApprovalNotification(mcpTool.name)
+ 
+           // 请求用户确认
+           logger.debug(`Requesting user confirmation for tool: ${mcpTool.name}`)
+           confirmed = await requestToolConfirmation(toolCallId)
++
++          if (confirmed) {
++            // Auto-confirm other pending tools with the same name
++            confirmSameNameTools(mappingName)
++          }
+         }
+ 
+         if (!confirmed) {
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 23a8295..2e9a764 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -13,6 +13,7 @@ import {
+   isOpenAIModel,
+   isOpenAIOpenWeightModel,
+   isQwenMTModel,
++  isReasoningModel,
+   isSupportFlexServiceTierModel,
+   isSupportVerbosityModel
+ } from '@renderer/config/models'
+@@ -40,6 +41,7 @@ import { type AiSdkParam, isAiSdkParam, type OpenAIVerbosity } from '@renderer/t
+ import { isSupportServiceTierProvider, isSupportVerbosityProvider } from '@renderer/utils/provider'
+ import type { JSONValue } from 'ai'
+ import { t } from 'i18next'
++import { merge } from 'lodash'
+ import type { OllamaProviderOptions } from 'ollama-ai-provider-v2'
+ 
+ import { addAnthropicHeaders } from '../prepareParams/header'
+@@ -381,7 +383,12 @@ function buildOpenAIProviderOptions(
+     const reasoningParams = getOpenAIReasoningParams(assistant, model)
+     providerOptions = {
+       ...providerOptions,
+-      ...reasoningParams
++      ...reasoningParams,
++      // TODO: Remove this workaround after migrating to @ai-sdk/open-responses (#13462)
++      // Bypass @ai-sdk/openai's model ID allowlist for reasoning detection.
++      // Third-party providers often use non-canonical model IDs (e.g., "openai/gpt-5.2")
++      // that fail the SDK's startsWith() checks, causing reasoning params to be silently dropped.
++      ...(isReasoningModel(model) && { forceReasoning: true })
+     }
+   }
+   const provider = getProviderById(model.provider)
+@@ -634,10 +641,7 @@ function buildGenericProviderOptions(
+ 
+   if (enableWebSearch) {
+     const webSearchParams = getWebSearchParams(model)
+-    providerOptions = {
+-      ...providerOptions,
+-      ...webSearchParams
+-    }
++    providerOptions = merge({}, providerOptions, webSearchParams)
+   }
+ 
+   // 特殊处理 Qwen MT
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 1d13d4d..e9a1d7c 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -551,6 +551,19 @@ export function getOpenAIReasoningParams(
+   return {}
+ }
+ 
++// Conservative fallback token limit for models not in THINKING_TOKEN_MAP.
++const FALLBACK_TOKEN_LIMIT = { min: 1024, max: 16384 }
++
++function computeBudgetTokens(
++  tokenLimit: { min: number; max: number },
++  effortRatio: number,
++  maxTokens?: number
++): number {
++  const budget = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
++  const capped = maxTokens !== undefined ? Math.min(budget, maxTokens) : budget
++  return Math.max(1024, capped)
++}
++
+ export function getThinkingBudget(
+   maxTokens: number | undefined,
+   reasoningEffort: string | undefined,
+@@ -559,21 +572,22 @@ export function getThinkingBudget(
+   if (reasoningEffort === undefined || reasoningEffort === 'none') {
+     return undefined
+   }
+-  const effortRatio = EFFORT_RATIO[reasoningEffort]
+ 
+   const tokenLimit = findTokenLimit(modelId)
+   if (!tokenLimit) {
+     return undefined
+   }
+ 
+-  const budget = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
+-
+-  let budgetTokens = budget
+-  if (maxTokens !== undefined) {
+-    budgetTokens = Math.min(budget, maxTokens)
+-  }
++  return computeBudgetTokens(tokenLimit, EFFORT_RATIO[reasoningEffort], maxTokens)
++}
+ 
+-  return Math.max(1024, budgetTokens)
++// Compute a fallback budgetTokens using a conservative token limit when
++// findTokenLimit() cannot determine the model's actual limit. This ensures
++// { type: 'enabled' } always carries a valid budget, which is required by
++// the Claude Agent SDK and the Anthropic Messages API.
++function getFallbackBudgetTokens(reasoningEffort: string | undefined): number {
++  const effortRatio = EFFORT_RATIO[reasoningEffort ?? 'high'] ?? EFFORT_RATIO.high
++  return computeBudgetTokens(FALLBACK_TOKEN_LIMIT, effortRatio)
+ }
+ 
+ /**
+@@ -639,14 +653,17 @@ export function getAnthropicReasoningParams(
+     return {
+       thinking: {
+         type: 'enabled',
+-        budgetTokens: budgetTokens
++        budgetTokens: budgetTokens ?? getFallbackBudgetTokens(reasoningEffort)
+       }
+     }
+   } else {
+     // 其他使用claude端點的模型，比如Kimi,Minimax等等
+     const { maxTokens } = getAssistantSettings(assistant)
+     const budgetTokens = getThinkingBudget(maxTokens, reasoningEffort, model.id)
+-    return budgetTokens ? { thinking: { type: 'enabled', budgetTokens } } : { thinking: { type: 'enabled' } }
++    // Always include budgetTokens to prevent Claude Agent SDK from converting
++    // { type: 'enabled' } into '--thinking adaptive', which non-Anthropic
++    // upstream providers do not support (they only accept 'enabled'/'disabled').
++    return { thinking: { type: 'enabled', budgetTokens: budgetTokens ?? getFallbackBudgetTokens(reasoningEffort) } }
+   }
+ }
+ 
+diff --git a/src/aiCore/utils/websearch.ts b/src/aiCore/utils/websearch.ts
+index 60649b8..339d776 100644
+--- a/src/aiCore/utils/websearch.ts
++++ b/src/aiCore/utils/websearch.ts
+@@ -25,6 +25,15 @@ export function getWebSearchParams(model: Model): Record<string, any> {
+     }
+   }
+ 
++  // https://creator.poe.com/docs/external-applications/openai-compatible-api#using-custom-parameters-with-extra_body
++  if (model.provider === 'poe') {
++    return {
++      extra_body: {
++        web_search: true
++      }
++    }
++  }
++
+   if (isOpenAIWebSearchChatCompletionOnlyModel(model)) {
+     return {
+       web_search_options: {}
