@@ -1,0 +1,543 @@
+diff --git a/src/aiCore/chunk/AiSdkToChunkAdapter.ts b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+index e1993fe..0b43fcc 100644
+--- a/src/aiCore/chunk/AiSdkToChunkAdapter.ts
++++ b/src/aiCore/chunk/AiSdkToChunkAdapter.ts
+@@ -10,6 +10,7 @@ import type { Chunk, ProviderMetadata } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import { ProviderSpecificError } from '@renderer/types/provider-specific-error'
+ import { formatErrorMessage, isAbortError } from '@renderer/utils/error'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { convertLinks, flushLinkConverterBuffer } from '@renderer/utils/linkConverter'
+ import type { ClaudeCodeRawValue } from '@shared/agents/claudecode/types'
+ import { AISDKError, type TextStreamPart, type ToolSet } from 'ai'
+@@ -33,6 +34,7 @@ export class AiSdkToChunkAdapter {
+   private hasTextContent = false
+   private getSessionWasCleared?: () => boolean
+   private providerId?: string
++  private idleTimeout?: IdleTimeoutHandle
+ 
+   constructor(
+     private onChunk: (chunk: Chunk) => void,
+@@ -41,7 +43,8 @@ export class AiSdkToChunkAdapter {
+     enableWebSearch?: boolean,
+     onSessionUpdate?: (sessionId: string) => void,
+     getSessionWasCleared?: () => boolean,
+-    providerId?: string
++    providerId?: string,
++    idleTimeout?: IdleTimeoutHandle
+   ) {
+     this.toolCallHandler = new ToolCallChunkHandler(onChunk, mcpTools)
+     this.accumulate = accumulate
+@@ -49,6 +52,7 @@ export class AiSdkToChunkAdapter {
+     this.onSessionUpdate = onSessionUpdate
+     this.getSessionWasCleared = getSessionWasCleared
+     this.providerId = providerId
++    this.idleTimeout = idleTimeout
+   }
+ 
+   private markFirstTokenIfNeeded() {
+@@ -110,6 +114,9 @@ export class AiSdkToChunkAdapter {
+       while (true) {
+         const { done, value } = await reader.read()
+ 
++        // Reset idle timeout on every chunk received from the stream
++        this.idleTimeout?.reset()
++
+         if (done) {
+           // Flush any remaining content from link converter buffer if web search is enabled
+           if (this.enableWebSearch) {
+@@ -131,6 +138,8 @@ export class AiSdkToChunkAdapter {
+     } finally {
+       reader.releaseLock()
+       this.resetTimingState()
++      // Clean up the idle timeout timer when the stream ends
++      this.idleTimeout?.cleanup()
+     }
+   }
+ 
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index ac2e830..6590819 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -17,6 +17,7 @@ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+ import { type Assistant, type GenerateImageParams, type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { SUPPORTED_IMAGE_ENDPOINT_LIST } from '@renderer/utils'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+ import { gateway, type LanguageModel, type Provider as AiSdkProvider } from 'ai'
+ 
+@@ -42,6 +43,7 @@ export type ModernAiProviderConfig = AiSdkMiddlewareConfig & {
+   // topicId for tracing
+   topicId?: string
+   callType: string
++  idleTimeout?: IdleTimeoutHandle
+ }
+ 
+ export default class ModernAiProvider {
+@@ -335,7 +337,8 @@ export default class ModernAiProvider {
+         config.enableWebSearch,
+         undefined,
+         undefined,
+-        this.config!.providerId
++        this.config!.providerId,
++        config.idleTimeout
+       )
+ 
+       const streamResult = await executor.streamText({
+@@ -350,20 +353,45 @@ export default class ModernAiProvider {
+         getText: () => finalText
+       }
+     } else {
++      // Since no onChunk is provided, the external consumer would not handle error chunk.
++      // So we need to capture the actual stream error so we can throw it instead of the
++      // generic NoTextGeneratedError ("No output generated. Check the stream
++      // for errors.") that AI SDK raises when streamResult.text is accessed
++      // after a failed stream.
++      let streamError: unknown = undefined
++
+       const streamResult = await executor.streamText({
+         ...params,
+-        model
++        model,
++        onError({ error }) {
++          streamError = error
++        }
+       })
+ 
+       // 强制消费流,不然await streamResult.text会阻塞
+-      await streamResult?.consumeStream()
++      await streamResult?.consumeStream({
++        onError(error) {
++          if (!streamError) {
++            streamError = error
++          }
++        }
++      })
+ 
+-      const finalText = await streamResult.text
+-      const usage = await streamResult.totalUsage
++      try {
++        const finalText = await streamResult.text
++        const usage = await streamResult.totalUsage
+ 
+-      return {
+-        getText: () => finalText,
+-        usage
++        return {
++          getText: () => finalText,
++          usage
++        }
++      } catch (error) {
++        // If we captured the real stream error, throw that instead of the
++        // generic NoTextGeneratedError so callers get actionable diagnostics.
++        if (streamError) {
++          throw streamError
++        }
++        throw error
+       }
+     }
+   }
+diff --git a/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts b/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
+index 3c9e845..e7eacf4 100644
+--- a/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
++++ b/src/aiCore/legacy/clients/__tests__/ApiClientFactory.test.ts
+@@ -84,8 +84,7 @@ vi.mock('@renderer/config/models', () => ({
+     defaultModel: []
+   },
+   isOpenAIModel: vi.fn(() => false),
+-  qwen3Next80BModel: {},
+-  qwen38bModel: {}
++  qwenModel: {}
+ }))
+ 
+ describe('ApiClientFactory', () => {
+diff --git a/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts b/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
+index 9cc0a92..4fd9f93 100644
+--- a/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
++++ b/src/aiCore/legacy/clients/__tests__/index.clientCompatibilityTypes.test.ts
+@@ -35,8 +35,7 @@ vi.mock('@renderer/config/models', () => ({
+   findTokenLimit: vi.fn().mockReturnValue(4096),
+   isFunctionCallingModel: vi.fn().mockReturnValue(false),
+   DEFAULT_MAX_TOKENS: 4096,
+-  qwen38bModel: {},
+-  qwen3Next80BModel: {}
++  qwenModel: {}
+ }))
+ 
+ vi.mock('@renderer/services/AssistantService', () => ({
+diff --git a/src/aiCore/plugins/searchOrchestrationPlugin.ts b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+index 8d352da..d29ec86 100644
+--- a/src/aiCore/plugins/searchOrchestrationPlugin.ts
++++ b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+@@ -355,8 +355,8 @@ export const searchOrchestrationPlugin = (
+             params.tools['builtin_knowledge_search'] = knowledgeSearchTool(
+               assistant,
+               analysisResult.knowledge,
+-              getMessageContent(userMessage),
+-              topicId
++              topicId,
++              getMessageContent(userMessage)
+             )
+           }
+         }
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 4897770..c92cc93 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -35,6 +35,7 @@ import type { Model } from '@renderer/types'
+ import { type Assistant, getEffectiveMcpMode, type MCPTool, type Provider, SystemProviderIds } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { mapRegexToPatterns } from '@renderer/utils/blacklistMatchPattern'
++import { IdleTimeoutController, type IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ import { replacePromptVariables } from '@renderer/utils/prompt'
+ import { isAIGatewayProvider, isAwsBedrockProvider, isSupportUrlContextProvider } from '@renderer/utils/provider'
+ import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+@@ -111,12 +112,16 @@ export async function buildStreamTextParams(
+     enableUrlContext: boolean
+   }
+   webSearchPluginConfig?: WebSearchPluginConfig
++  idleTimeout: IdleTimeoutHandle
+ }> {
+   const { mcpTools, requestOptions = {} } = options
+   // No caller currently provides a custom timeout; defaultTimeout (10 min) is the fallback.
+   const { signal: externalSignal, timeout = DEFAULT_TIMEOUT, headers: inputHeaders = {} } = requestOptions
+-  const timeoutSignal = AbortSignal.timeout(timeout)
+-  const signals = [timeoutSignal]
++
++  // Use an idle timeout that resets every time a stream chunk is received,
++  // instead of a fixed total timeout that starts from the initial request.
++  const idleTimeout = new IdleTimeoutController(timeout)
++  const signals = [idleTimeout.signal]
+   if (externalSignal) {
+     signals.push(externalSignal)
+   }
+@@ -292,7 +297,8 @@ export async function buildStreamTextParams(
+     params,
+     modelId: model.id,
+     capabilities: { enableReasoning, enableWebSearch, enableGenerateImage, enableUrlContext },
+-    webSearchPluginConfig
++    webSearchPluginConfig,
++    idleTimeout
+   }
+ }
+ 
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index b1d8e34..fb0c576 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -540,6 +540,7 @@ describe('Azure OpenAI traditional API routing', () => {
+     const config = providerToAiSdkConfig(provider, createModel('gpt-4o', 'GPT-4o', provider.id))
+ 
+     expect(config.providerId).toBe('azure')
++    expect(config.options.mode).toBe('chat')
+     expect(config.options.apiVersion).toBe('2024-02-15-preview')
+     expect(config.options.useDeploymentBasedUrls).toBe(true)
+   })
+@@ -548,12 +549,14 @@ describe('Azure OpenAI traditional API routing', () => {
+     const v1Provider = createAzureProvider('v1')
+     const v1Config = providerToAiSdkConfig(v1Provider, createModel('gpt-4o', 'GPT-4o', v1Provider.id))
+     expect(v1Config.providerId).toBe('azure-responses')
++    expect(v1Config.options.mode).toBe('responses')
+     expect(v1Config.options.apiVersion).toBe('v1')
+     expect(v1Config.options.useDeploymentBasedUrls).toBeUndefined()
+ 
+     const previewProvider = createAzureProvider('preview')
+     const previewConfig = providerToAiSdkConfig(previewProvider, createModel('gpt-4o', 'GPT-4o', previewProvider.id))
+     expect(previewConfig.providerId).toBe('azure-responses')
++    expect(previewConfig.options.mode).toBe('responses')
+     expect(previewConfig.options.apiVersion).toBe('preview')
+     expect(previewConfig.options.useDeploymentBasedUrls).toBeUndefined()
+   })
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index a9b69f0..3b5c8b8 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -72,6 +72,7 @@ function handleSpecialProviders(model: Model, provider: Provider): Provider {
+  * @param provider - The provider whose API host is to be formatted.
+  * @returns A new provider instance with the formatted API host.
+  */
++// WARNING: if any changes are made here, please sync it to src/main/aiCore/provider/providerConfig.ts:formatProviderApiHost
+ export function formatProviderApiHost(provider: Provider): Provider {
+   const formatted = { ...provider }
+   const appendApiVersion = !isWithTrailingSharp(provider.apiHost)
+diff --git a/src/aiCore/utils/__tests__/mcp.test.ts b/src/aiCore/utils/__tests__/mcp.test.ts
+index 9cd08a9..3203dd2 100644
+--- a/src/aiCore/utils/__tests__/mcp.test.ts
++++ b/src/aiCore/utils/__tests__/mcp.test.ts
+@@ -32,7 +32,9 @@ vi.mock('@renderer/utils/mcp-tools', () => ({
+ 
+ vi.mock('@renderer/utils/userConfirmation', () => ({
+   requestToolConfirmation: vi.fn(async () => true),
+-  sendToolApprovalNotification: vi.fn()
++  sendToolApprovalNotification: vi.fn(),
++  setToolIdToNameMapping: vi.fn(),
++  confirmSameNameTools: vi.fn()
+ }))
+ 
+ describe('mcp utils', () => {
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 2b28878..cba3c05 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -704,6 +704,114 @@ describe('reasoning utils', () => {
+         }
+       })
+     })
++
++    it('should use fallback budgetTokens when findTokenLimit returns undefined for Claude model', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
++        '@renderer/config/models'
++      )
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'claude-unknown-model',
++        name: 'Claude Unknown',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'high',
++          maxTokens: 8192
++        }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: {
++          type: 'enabled',
++          budgetTokens: expect.any(Number)
++        }
++      })
++      // budgetTokens must be present and >= 1024 (the minimum enforced by computeBudgetTokens)
++      const thinking = result.thinking as { type: 'enabled'; budgetTokens?: number }
++      expect(thinking.budgetTokens).toBeGreaterThanOrEqual(1024)
++    })
++
++    it('should use fallback budgetTokens for non-Claude model on Anthropic endpoint when token limit is unknown', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
++        '@renderer/config/models'
++      )
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'kimi-reasoning-model',
++        name: 'Kimi Reasoning',
++        provider: 'custom-provider'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'medium',
++          maxTokens: 4096
++        }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      // Non-Claude models on Anthropic endpoint should also get fallback budgetTokens
++      expect(result).toEqual({
++        thinking: {
++          type: 'enabled',
++          budgetTokens: expect.any(Number)
++        }
++      })
++      const thinking = result.thinking as { type: 'enabled'; budgetTokens?: number }
++      expect(thinking.budgetTokens).toBeGreaterThanOrEqual(1024)
++    })
++
++    it('should produce different fallback budgetTokens for different effort levels', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
++        '@renderer/config/models'
++      )
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'claude-unknown-model',
++        name: 'Claude Unknown',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const lowAssistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'low', maxTokens: 4096 }
++      } as Assistant
++
++      const highAssistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high', maxTokens: 4096 }
++      } as Assistant
++
++      const lowResult = getAnthropicReasoningParams(lowAssistant, model)
++      const highResult = getAnthropicReasoningParams(highAssistant, model)
++
++      // Higher effort should produce higher or equal budgetTokens
++      const lowThinking = lowResult.thinking as { type: 'enabled'; budgetTokens?: number }
++      const highThinking = highResult.thinking as { type: 'enabled'; budgetTokens?: number }
++      expect(highThinking.budgetTokens).toBeGreaterThanOrEqual(lowThinking.budgetTokens!)
++    })
+   })
+ 
+   describe('getGeminiReasoningParams', () => {
+diff --git a/src/aiCore/utils/mcp.ts b/src/aiCore/utils/mcp.ts
+index 842be36..fddafc3 100644
+--- a/src/aiCore/utils/mcp.ts
++++ b/src/aiCore/utils/mcp.ts
+@@ -2,7 +2,12 @@ import { loggerService } from '@logger'
+ import store from '@renderer/store'
+ import type { MCPCallToolResponse, MCPTool, MCPToolResponse } from '@renderer/types'
+ import { callMCPTool, getMcpServerByTool, isToolAutoApproved } from '@renderer/utils/mcp-tools'
+-import { requestToolConfirmation, sendToolApprovalNotification } from '@renderer/utils/userConfirmation'
++import {
++  confirmSameNameTools,
++  requestToolConfirmation,
++  sendToolApprovalNotification,
++  setToolIdToNameMapping
++} from '@renderer/utils/userConfirmation'
+ import { type Tool, type ToolSet } from 'ai'
+ import { jsonSchema, tool } from 'ai'
+ import type { JSONSchema7 } from 'json-schema'
+@@ -119,12 +124,26 @@ export function convertMcpToolsToAiSdkTools(mcpTools: MCPTool[], allowedTools?:
+         let confirmed = true
+ 
+         if (!isAutoApproveEnabled) {
++          // Register mapping so confirmSameNameTools can batch-confirm pending tools.
++          // For hub invoke/exec, use the underlying tool name so tools targeting the
++          // same underlying server+tool are grouped together.
++          const mappingName =
++            mcpTool.serverId === 'hub' && (mcpTool.name === 'invoke' || mcpTool.name === 'exec')
++              ? ((params as Record<string, unknown>)?.name as string) || mcpTool.name
++              : mcpTool.name
++          setToolIdToNameMapping(toolCallId, mappingName)
++
+           // Send system notification for tool approval
+           sendToolApprovalNotification(mcpTool.name)
+ 
+           // 请求用户确认
+           logger.debug(`Requesting user confirmation for tool: ${mcpTool.name}`)
+           confirmed = await requestToolConfirmation(toolCallId)
++
++          if (confirmed) {
++            // Auto-confirm other pending tools with the same name
++            confirmSameNameTools(mappingName)
++          }
+         }
+ 
+         if (!confirmed) {
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 8e49dc3..2e9a764 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -13,6 +13,7 @@ import {
+   isOpenAIModel,
+   isOpenAIOpenWeightModel,
+   isQwenMTModel,
++  isReasoningModel,
+   isSupportFlexServiceTierModel,
+   isSupportVerbosityModel
+ } from '@renderer/config/models'
+@@ -382,7 +383,12 @@ function buildOpenAIProviderOptions(
+     const reasoningParams = getOpenAIReasoningParams(assistant, model)
+     providerOptions = {
+       ...providerOptions,
+-      ...reasoningParams
++      ...reasoningParams,
++      // TODO: Remove this workaround after migrating to @ai-sdk/open-responses (#13462)
++      // Bypass @ai-sdk/openai's model ID allowlist for reasoning detection.
++      // Third-party providers often use non-canonical model IDs (e.g., "openai/gpt-5.2")
++      // that fail the SDK's startsWith() checks, causing reasoning params to be silently dropped.
++      ...(isReasoningModel(model) && { forceReasoning: true })
+     }
+   }
+   const provider = getProviderById(model.provider)
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 1d13d4d..e9a1d7c 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -551,6 +551,19 @@ export function getOpenAIReasoningParams(
+   return {}
+ }
+ 
++// Conservative fallback token limit for models not in THINKING_TOKEN_MAP.
++const FALLBACK_TOKEN_LIMIT = { min: 1024, max: 16384 }
++
++function computeBudgetTokens(
++  tokenLimit: { min: number; max: number },
++  effortRatio: number,
++  maxTokens?: number
++): number {
++  const budget = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
++  const capped = maxTokens !== undefined ? Math.min(budget, maxTokens) : budget
++  return Math.max(1024, capped)
++}
++
+ export function getThinkingBudget(
+   maxTokens: number | undefined,
+   reasoningEffort: string | undefined,
+@@ -559,21 +572,22 @@ export function getThinkingBudget(
+   if (reasoningEffort === undefined || reasoningEffort === 'none') {
+     return undefined
+   }
+-  const effortRatio = EFFORT_RATIO[reasoningEffort]
+ 
+   const tokenLimit = findTokenLimit(modelId)
+   if (!tokenLimit) {
+     return undefined
+   }
+ 
+-  const budget = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
+-
+-  let budgetTokens = budget
+-  if (maxTokens !== undefined) {
+-    budgetTokens = Math.min(budget, maxTokens)
+-  }
++  return computeBudgetTokens(tokenLimit, EFFORT_RATIO[reasoningEffort], maxTokens)
++}
+ 
+-  return Math.max(1024, budgetTokens)
++// Compute a fallback budgetTokens using a conservative token limit when
++// findTokenLimit() cannot determine the model's actual limit. This ensures
++// { type: 'enabled' } always carries a valid budget, which is required by
++// the Claude Agent SDK and the Anthropic Messages API.
++function getFallbackBudgetTokens(reasoningEffort: string | undefined): number {
++  const effortRatio = EFFORT_RATIO[reasoningEffort ?? 'high'] ?? EFFORT_RATIO.high
++  return computeBudgetTokens(FALLBACK_TOKEN_LIMIT, effortRatio)
+ }
+ 
+ /**
+@@ -639,14 +653,17 @@ export function getAnthropicReasoningParams(
+     return {
+       thinking: {
+         type: 'enabled',
+-        budgetTokens: budgetTokens
++        budgetTokens: budgetTokens ?? getFallbackBudgetTokens(reasoningEffort)
+       }
+     }
+   } else {
+     // 其他使用claude端點的模型，比如Kimi,Minimax等等
+     const { maxTokens } = getAssistantSettings(assistant)
+     const budgetTokens = getThinkingBudget(maxTokens, reasoningEffort, model.id)
+-    return budgetTokens ? { thinking: { type: 'enabled', budgetTokens } } : { thinking: { type: 'enabled' } }
++    // Always include budgetTokens to prevent Claude Agent SDK from converting
++    // { type: 'enabled' } into '--thinking adaptive', which non-Anthropic
++    // upstream providers do not support (they only accept 'enabled'/'disabled').
++    return { thinking: { type: 'enabled', budgetTokens: budgetTokens ?? getFallbackBudgetTokens(reasoningEffort) } }
+   }
+ }
+ 
