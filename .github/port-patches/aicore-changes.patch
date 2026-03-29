@@ -1,0 +1,1130 @@
+diff --git a/src/aiCore/index_new.ts b/src/aiCore/index_new.ts
+index 6590819..ac403c7 100644
+--- a/src/aiCore/index_new.ts
++++ b/src/aiCore/index_new.ts
+@@ -131,7 +131,7 @@ export default class ModernAiProvider {
+     // Config is now set in constructor, ApiService handles key rotation before passing provider
+     if (!this.config) {
+       // If config wasn't set in constructor (when provider only), generate it now
+-      this.config = providerToAiSdkConfig(this.actualProvider, this.model!)
++      this.config = providerToAiSdkConfig(this.actualProvider, this.model)
+     }
+     logger.debug('Using provider config for completions', this.config)
+ 
+diff --git a/src/aiCore/legacy/clients/gemini/VertexAPIClient.ts b/src/aiCore/legacy/clients/gemini/VertexAPIClient.ts
+index fb371d9..ab5ede7 100644
+--- a/src/aiCore/legacy/clients/gemini/VertexAPIClient.ts
++++ b/src/aiCore/legacy/clients/gemini/VertexAPIClient.ts
+@@ -137,7 +137,7 @@ export class VertexAPIClient extends GeminiAPIClient {
+     const { googleCredentials, project } = this.vertexProvider
+ 
+     if (project && googleCredentials.clientEmail) {
+-      window.api.vertexAI.clearAuthCache(project, googleCredentials.clientEmail)
++      void window.api.vertexAI.clearAuthCache(project, googleCredentials.clientEmail)
+     }
+   }
+ }
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+index d8a835f..0d27276 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIBaseClient.ts
+@@ -10,7 +10,6 @@ import {
+ import { getStoreSetting } from '@renderer/hooks/useSettings'
+ import { getAssistantSettings } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+-import type { SettingsState } from '@renderer/store/settings'
+ import { type Assistant, type GenerateImageParams, type Model, type Provider } from '@renderer/types'
+ import type {
+   OpenAIResponseSdkMessageParam,
+@@ -287,7 +286,7 @@ export abstract class OpenAIBaseClient<
+       return {}
+     }
+ 
+-    const openAI = getStoreSetting('openAI') as SettingsState['openAI']
++    const openAI = getStoreSetting('openAI')
+     const summaryText = openAI?.summaryText || 'off'
+ 
+     let summary: string | undefined = undefined
+diff --git a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+index 681a662..07937a0 100644
+--- a/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
++++ b/src/aiCore/legacy/clients/openai/OpenAIResponseAPIClient.ts
+@@ -215,7 +215,7 @@ export class OpenAIResponseAPIClient extends OpenAIBaseClient<
+           parts.push({
+             detail: 'auto',
+             type: 'input_image',
+-            image_url: image.data as string
++            image_url: image.data
+           })
+         } else if (imageBlock.url && imageBlock.url.startsWith('data:')) {
+           parts.push({
+diff --git a/src/aiCore/legacy/middleware/core/McpToolChunkMiddleware.ts b/src/aiCore/legacy/middleware/core/McpToolChunkMiddleware.ts
+index 6affa5a..197990a 100644
+--- a/src/aiCore/legacy/middleware/core/McpToolChunkMiddleware.ts
++++ b/src/aiCore/legacy/middleware/core/McpToolChunkMiddleware.ts
+@@ -1,6 +1,5 @@
+ import { loggerService } from '@logger'
+ import type { MCPCallToolResponse, MCPTool, MCPToolResponse, Model } from '@renderer/types'
+-import type { MCPToolCreatedChunk } from '@renderer/types/chunk'
+ import { ChunkType } from '@renderer/types/chunk'
+ import type { SdkMessageParam, SdkRawOutput, SdkToolCall } from '@renderer/types/sdk'
+ import {
+@@ -111,7 +110,7 @@ function createToolHandlingTransform(
+         // 处理MCP工具进展chunk
+         logger.silly('chunk', chunk)
+         if (chunk.type === ChunkType.MCP_TOOL_CREATED) {
+-          const createdChunk = chunk as MCPToolCreatedChunk
++          const createdChunk = chunk
+ 
+           // 1. 处理Function Call方式的工具调用
+           if (createdChunk.tool_calls && createdChunk.tool_calls.length > 0) {
+diff --git a/src/aiCore/legacy/middleware/core/RawStreamListenerMiddleware.ts b/src/aiCore/legacy/middleware/core/RawStreamListenerMiddleware.ts
+index 04bfd75..37bebf6 100644
+--- a/src/aiCore/legacy/middleware/core/RawStreamListenerMiddleware.ts
++++ b/src/aiCore/legacy/middleware/core/RawStreamListenerMiddleware.ts
+@@ -28,7 +28,7 @@ export const RawStreamListenerMiddleware: CompletionsMiddleware =
+           // }
+         }
+ 
+-        const specificApiClient = ctx.apiClientInstance as AnthropicAPIClient
++        const specificApiClient = ctx.apiClientInstance
+ 
+         const monitoredOutput = specificApiClient.attachRawStreamListener(
+           result.rawOutput as AnthropicSdkRawOutput,
+diff --git a/src/aiCore/legacy/middleware/core/ThinkChunkMiddleware.ts b/src/aiCore/legacy/middleware/core/ThinkChunkMiddleware.ts
+index 5920cdc..6cef963 100644
+--- a/src/aiCore/legacy/middleware/core/ThinkChunkMiddleware.ts
++++ b/src/aiCore/legacy/middleware/core/ThinkChunkMiddleware.ts
+@@ -46,7 +46,7 @@ export const ThinkChunkMiddleware: CompletionsMiddleware =
+           new TransformStream<GenericChunk, GenericChunk>({
+             transform(chunk: GenericChunk, controller) {
+               if (chunk.type === ChunkType.THINKING_DELTA) {
+-                const thinkingChunk = chunk as ThinkingDeltaChunk
++                const thinkingChunk = chunk
+ 
+                 // 第一次接收到思考内容时记录开始时间
+                 if (!hasThinkingContent) {
+diff --git a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+index 8ac0741..b7b6b17 100644
+--- a/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
++++ b/src/aiCore/legacy/middleware/feat/ImageGenerationMiddleware.ts
+@@ -62,8 +62,16 @@ export const ImageGenerationMiddleware: CompletionsMiddleware =
+             const assistantImageBlocks = findImageBlocks(lastAssistantMessage)
+             const assistantImages = await Promise.all(
+               assistantImageBlocks.map(async (block) => {
++                // Prefer file reference (saved to disk) over inline base64 URL
++                if (block.file) {
++                  const binaryData: Uint8Array = await FileManager.readBinaryImage(block.file)
++                  const mimeType = `${block.file.type}/${block.file.ext.slice(1)}`
++                  return await toFile(new Blob([binaryData.slice()]), block.file.origin_name || 'image.png', {
++                    type: mimeType
++                  })
++                }
+                 const b64 = block.url?.replace(/^data:image\/\w+;base64,/, '')
+-                if (!b64) return null
++                if (!b64 || b64 === block.url) return null
+                 const binary = atob(b64)
+                 const bytes = new Uint8Array(binary.length)
+                 for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+diff --git a/src/aiCore/legacy/middleware/feat/ThinkingTagExtractionMiddleware.ts b/src/aiCore/legacy/middleware/feat/ThinkingTagExtractionMiddleware.ts
+index dea679e..73bf6ed 100644
+--- a/src/aiCore/legacy/middleware/feat/ThinkingTagExtractionMiddleware.ts
++++ b/src/aiCore/legacy/middleware/feat/ThinkingTagExtractionMiddleware.ts
+@@ -83,7 +83,7 @@ export const ThinkingTagExtractionMiddleware: CompletionsMiddleware =
+               logger.silly('chunk', chunk)
+ 
+               if (chunk.type === ChunkType.TEXT_DELTA) {
+-                const textChunk = chunk as TextDeltaChunk
++                const textChunk = chunk
+ 
+                 // 使用 TagExtractor 处理文本
+                 const extractionResults = tagExtractor.processText(textChunk.text)
+diff --git a/src/aiCore/legacy/middleware/feat/ToolUseExtractionMiddleware.ts b/src/aiCore/legacy/middleware/feat/ToolUseExtractionMiddleware.ts
+index 38d842e..faa58bc 100644
+--- a/src/aiCore/legacy/middleware/feat/ToolUseExtractionMiddleware.ts
++++ b/src/aiCore/legacy/middleware/feat/ToolUseExtractionMiddleware.ts
+@@ -73,7 +73,7 @@ function createToolUseExtractionTransform(
+         // 处理文本内容，检测工具使用标签
+         logger.silly('chunk', chunk)
+         if (chunk.type === ChunkType.TEXT_DELTA) {
+-          const textChunk = chunk as TextDeltaChunk
++          const textChunk = chunk
+ 
+           // 处理 tool_use 标签
+           const toolUseResults = toolUseExtractor.processText(textChunk.text)
+diff --git a/src/aiCore/plugins/PluginBuilder.ts b/src/aiCore/plugins/PluginBuilder.ts
+index 13caf8d..560e4b7 100644
+--- a/src/aiCore/plugins/PluginBuilder.ts
++++ b/src/aiCore/plugins/PluginBuilder.ts
+@@ -56,7 +56,7 @@ export function buildPlugins({ provider, model, config }: BuildPluginsContext):
+   // === PDF Compatibility ===
+   // Must run before other plugins (e.g., Anthropic cache token estimation)
+   // so that PDF FileParts are converted to TextParts for unsupported providers.
+-  plugins.push(createPdfCompatibilityPlugin(provider))
++  plugins.push(createPdfCompatibilityPlugin(provider, model))
+ 
+   // === AI SDK Middleware Plugins ===
+   // 注意：wrapLanguageModel 会 .reverse() middleware 数组，
+diff --git a/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts b/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
+index d653e30..f6d6c2e 100644
+--- a/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
++++ b/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
+@@ -1,11 +1,20 @@
+ import type { LanguageModelV3CallOptions } from '@ai-sdk/provider'
+-import type { Provider, ProviderType } from '@renderer/types'
++import type { Model, Provider, ProviderType } from '@renderer/types'
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ vi.mock('i18next', () => ({
+   default: { t: (key: string, opts?: Record<string, unknown>) => `${key}${opts ? JSON.stringify(opts) : ''}` }
+ }))
+ 
++vi.mock('@renderer/config/models', () => ({
++  isAnthropicModel: vi.fn(() => false),
++  isGeminiModel: vi.fn(() => false)
++}))
++
++vi.mock('@renderer/config/models/openai', () => ({
++  isOpenAILLMModel: vi.fn(() => false)
++}))
++
+ const mockExtractPdfText = vi.fn()
+ 
+ vi.mock('@shared/utils/pdf', () => ({
+@@ -25,12 +34,19 @@ vi.stubGlobal('window', {
+   }
+ })
+ 
++import { isAnthropicModel, isGeminiModel } from '@renderer/config/models'
++import { isOpenAILLMModel } from '@renderer/config/models/openai'
++
+ import { createPdfCompatibilityPlugin } from '../pdfCompatibilityPlugin'
+ 
+ function makeProvider(id: string, type: ProviderType): Provider {
+   return { id, name: id, type, apiKey: 'test', apiHost: 'https://test.com', isSystem: false, models: [] } as Provider
+ }
+ 
++function makeModel(): Model {
++  return { id: 'test-model', provider: 'test', name: 'Test', group: 'test' } as Model
++}
++
+ function makePdfFilePart(filename = 'test.pdf') {
+   return {
+     type: 'file' as const,
+@@ -53,12 +69,12 @@ function makeTextPart(text: string) {
+   return { type: 'text' as const, text }
+ }
+ 
+-async function runMiddleware(provider: Provider, params: LanguageModelV3CallOptions) {
+-  const plugin = createPdfCompatibilityPlugin(provider)
++async function runMiddleware(provider: Provider, params: LanguageModelV3CallOptions, model: Model = makeModel()) {
++  const plugin = createPdfCompatibilityPlugin(provider, model)
+   const context: {
+     middlewares: Array<{ transformParams: (opts: Record<string, unknown>) => Promise<LanguageModelV3CallOptions> }>
+   } = { middlewares: [] }
+-  plugin.configureContext!(context as never)
++  void plugin.configureContext!(context as never)
+   const middleware = context.middlewares[0]
+   return middleware.transformParams({ params, type: 'generate', model: {} })
+ }
+@@ -66,10 +82,14 @@ async function runMiddleware(provider: Provider, params: LanguageModelV3CallOpti
+ describe('pdfCompatibilityPlugin', () => {
+   beforeEach(() => {
+     vi.clearAllMocks()
++    vi.mocked(isOpenAILLMModel).mockReturnValue(false)
++    vi.mocked(isAnthropicModel).mockReturnValue(false)
++    vi.mocked(isGeminiModel).mockReturnValue(false)
+   })
+ 
+-  it('should pass through unchanged when provider type supports native PDF (openai)', async () => {
+-    const provider = makeProvider('openai', 'openai')
++  it('should pass through for OpenAI model on any provider type', async () => {
++    vi.mocked(isOpenAILLMModel).mockReturnValue(true)
++    const provider = makeProvider('moonshot', 'openai')
+ 
+     const params = {
+       prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
+@@ -80,8 +100,9 @@ describe('pdfCompatibilityPlugin', () => {
+     expect(mockExtractPdfText).not.toHaveBeenCalled()
+   })
+ 
+-  it('should pass through unchanged for aggregator providers with openai type (cherryin)', async () => {
+-    const provider = makeProvider('cherryin', 'openai')
++  it('should pass through for Claude model on any provider type', async () => {
++    vi.mocked(isAnthropicModel).mockReturnValue(true)
++    const provider = makeProvider('my-aggregator', 'new-api')
+ 
+     const params = {
+       prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
+@@ -92,7 +113,8 @@ describe('pdfCompatibilityPlugin', () => {
+     expect(mockExtractPdfText).not.toHaveBeenCalled()
+   })
+ 
+-  it('should pass through unchanged for new-api type providers', async () => {
++  it('should pass through for Gemini model on any provider type', async () => {
++    vi.mocked(isGeminiModel).mockReturnValue(true)
+     const provider = makeProvider('my-aggregator', 'new-api')
+ 
+     const params = {
+@@ -104,6 +126,37 @@ describe('pdfCompatibilityPlugin', () => {
+     expect(mockExtractPdfText).not.toHaveBeenCalled()
+   })
+ 
++  it('should pass through unchanged when provider type supports native PDF (openai-response)', async () => {
++    const provider = makeProvider('openai', 'openai-response')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params)
++    expect(result).toEqual(params)
++    expect(mockExtractPdfText).not.toHaveBeenCalled()
++  })
++
++  it('should convert PDF for non-native provider types (new-api, gateway, openai)', async () => {
++    const provider = makeProvider('moonshot', 'openai')
++    mockExtractPdfText.mockResolvedValue('Extracted PDF content')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart('report.pdf')] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params)
++    expect(mockExtractPdfText).toHaveBeenCalledWith('base64pdfdata')
++    expect(result.prompt[0]).toMatchObject({
++      role: 'user',
++      content: [
++        { type: 'text', text: 'Hello' },
++        { type: 'text', text: 'report.pdf\nExtracted PDF content' }
++      ]
++    })
++  })
++
+   it('should convert PDF FilePart to TextPart for ollama provider', async () => {
+     const provider = makeProvider('ollama', 'ollama')
+     mockExtractPdfText.mockResolvedValue('Extracted PDF content')
+diff --git a/src/aiCore/plugins/anthropicCachePlugin.ts b/src/aiCore/plugins/anthropicCachePlugin.ts
+index 7edcfba..5a22d91 100644
+--- a/src/aiCore/plugins/anthropicCachePlugin.ts
++++ b/src/aiCore/plugins/anthropicCachePlugin.ts
+@@ -17,7 +17,7 @@ function estimateContentTokens(content: LanguageModelV3Message['content']): numb
+   if (Array.isArray(content)) {
+     return content.reduce((acc, part) => {
+       if (part.type === 'text') {
+-        return acc + estimateTextTokens(part.text as string)
++        return acc + estimateTextTokens(part.text)
+       }
+       return acc
+     }, 0)
+@@ -41,7 +41,7 @@ function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
+       // Cache system message (providerOptions on message object)
+       if (cacheSystemMessage) {
+         for (let i = 0; i < messages.length; i++) {
+-          const msg = messages[i] as LanguageModelV3Message
++          const msg = messages[i]
+           if (msg.role === 'system' && estimateContentTokens(msg.content) >= tokenThreshold) {
+             messages[i] = { ...msg, providerOptions: cacheProviderOptions }
+             break
+@@ -54,13 +54,13 @@ function anthropicCacheMiddleware(provider: Provider): LanguageModelMiddleware {
+         const cumsumTokens = [] as Array<number>
+         let tokenSum = 0 as number
+         for (let i = 0; i < messages.length; i++) {
+-          const msg = messages[i] as LanguageModelV3Message
++          const msg = messages[i]
+           tokenSum += estimateContentTokens(msg.content)
+           cumsumTokens.push(tokenSum)
+         }
+ 
+         for (let i = messages.length - 1; i >= 0 && cachedCount < cacheLastNMessages; i--) {
+-          const msg = messages[i] as LanguageModelV3Message
++          const msg = messages[i]
+           if (msg.role === 'system' || cumsumTokens[i] < tokenThreshold || msg.content.length === 0) {
+             continue
+           }
+diff --git a/src/aiCore/plugins/pdfCompatibilityPlugin.ts b/src/aiCore/plugins/pdfCompatibilityPlugin.ts
+index e6a9717..427199f 100644
+--- a/src/aiCore/plugins/pdfCompatibilityPlugin.ts
++++ b/src/aiCore/plugins/pdfCompatibilityPlugin.ts
+@@ -7,7 +7,9 @@
+ import type { LanguageModelV3FilePart, LanguageModelV3Message } from '@ai-sdk/provider'
+ import { definePlugin } from '@cherrystudio/ai-core/core/plugins'
+ import { loggerService } from '@logger'
+-import type { Provider, ProviderType } from '@renderer/types'
++import { isAnthropicModel, isGeminiModel } from '@renderer/config/models'
++import { isOpenAILLMModel } from '@renderer/config/models/openai'
++import type { Model, Provider, ProviderType } from '@renderer/types'
+ import { extractPdfText } from '@shared/utils/pdf'
+ import type { LanguageModelMiddleware } from 'ai'
+ import i18n from 'i18next'
+@@ -17,33 +19,42 @@ const logger = loggerService.withContext('pdfCompatibilityPlugin')
+ type ContentPart = Exclude<LanguageModelV3Message['content'], string>[number]
+ 
+ /**
+- * Provider types whose API protocol supports native PDF file input.
+- * Uses provider.type (API protocol) instead of AI SDK provider ID,
+- * because aggregator providers (cherryin, new-api, gateway) resolve to
+- * non-standard AI SDK IDs but still speak a protocol that supports PDF.
++ * Provider types whose API natively supports PDF file input.
++ * Only first-party provider protocols (OpenAI, Anthropic, Google) are included.
++ * Aggregators (new-api, gateway) and generic 'openai' type are excluded
++ * because they may route to backends that don't support the 'file' part type.
+  */
+ const PDF_NATIVE_PROVIDER_TYPES = new Set<ProviderType>([
+-  'openai', // OpenAI-compatible API (includes aggregators like cherryin)
+   'openai-response', // OpenAI Responses API
+   'anthropic', // Anthropic API
+   'gemini', // Google Gemini API
+   'azure-openai', // Azure OpenAI
+   'vertexai', // Google Vertex AI
+   'aws-bedrock', // AWS Bedrock
+-  'vertex-anthropic', // Vertex AI with Anthropic models
+-  'new-api', // new-api aggregator (OpenAI-compatible)
+-  'gateway' // Gateway aggregator (OpenAI-compatible)
++  'vertex-anthropic' // Vertex AI with Anthropic models
+ ])
+ 
+ function isPdfFilePart(part: ContentPart): part is LanguageModelV3FilePart & { mediaType: 'application/pdf' } {
+   return part.type === 'file' && part.mediaType === 'application/pdf'
+ }
+ 
+-function pdfCompatibilityMiddleware(provider: Provider): LanguageModelMiddleware {
++function supportsNativePdf(provider: Provider, model: Model): boolean {
++  // OpenAI, Claude, and Gemini models always support native PDF regardless of provider
++  if (isOpenAILLMModel(model) || isAnthropicModel(model) || isGeminiModel(model)) {
++    return true
++  }
++  if (PDF_NATIVE_PROVIDER_TYPES.has(provider.type)) {
++    return true
++  }
++  // TODO: allow user to configure native pdf compatibility for provider/model
++  return false
++}
++
++function pdfCompatibilityMiddleware(provider: Provider, model: Model): LanguageModelMiddleware {
+   return {
+     specificationVersion: 'v3',
+     transformParams: async ({ params }) => {
+-      if (PDF_NATIVE_PROVIDER_TYPES.has(provider.type)) {
++      if (supportsNativePdf(provider, model)) {
+         return params
+       }
+ 
+@@ -92,12 +103,12 @@ function pdfCompatibilityMiddleware(provider: Provider): LanguageModelMiddleware
+   }
+ }
+ 
+-export const createPdfCompatibilityPlugin = (provider: Provider) =>
++export const createPdfCompatibilityPlugin = (provider: Provider, model: Model) =>
+   definePlugin({
+     name: 'pdfCompatibility',
+     enforce: 'pre',
+     configureContext: (context) => {
+       context.middlewares = context.middlewares || []
+-      context.middlewares.push(pdfCompatibilityMiddleware(provider))
++      context.middlewares.push(pdfCompatibilityMiddleware(provider, model))
+     }
+   })
+diff --git a/src/aiCore/plugins/searchOrchestrationPlugin.ts b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+index d29ec86..0dd01fb 100644
+--- a/src/aiCore/plugins/searchOrchestrationPlugin.ts
++++ b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+@@ -365,7 +365,7 @@ export const searchOrchestrationPlugin = (
+         const globalMemoryEnabled = selectGlobalMemoryEnabled(store.getState())
+         if (globalMemoryEnabled && assistant.enableMemory) {
+           // logger.info('🧠 Adding memory search tool')
+-          params.tools['builtin_memory_search'] = memorySearchTool()
++          params.tools['builtin_memory_search'] = memorySearchTool(assistant.id)
+         }
+ 
+         // logger.info('🔧 Tools configured:', Object.keys(params.tools))
+diff --git a/src/aiCore/plugins/telemetryPlugin.ts b/src/aiCore/plugins/telemetryPlugin.ts
+index ab986cc..4a1e141 100644
+--- a/src/aiCore/plugins/telemetryPlugin.ts
++++ b/src/aiCore/plugins/telemetryPlugin.ts
+@@ -137,7 +137,7 @@ class AdapterTracer {
+         })
+ 
+         // 保存转换后的数据
+-        window.api.trace.saveEntity(spanEntity)
++        void window.api.trace.saveEntity(spanEntity)
+ 
+         logger.debug('AI SDK span converted and saved successfully (from startSpan)', {
+           spanName: name,
+@@ -220,7 +220,7 @@ class AdapterTracer {
+             })
+ 
+             // 保存转换后的数据
+-            window.api.trace.saveEntity(spanEntity)
++            void window.api.trace.saveEntity(spanEntity)
+ 
+             logger.debug('AI SDK span converted and saved successfully (from startActiveSpan)', {
+               spanName: name,
+diff --git a/src/aiCore/prepareParams/__tests__/message-converter.test.ts b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+index c5cf73b..8ddd63d 100644
+--- a/src/aiCore/prepareParams/__tests__/message-converter.test.ts
++++ b/src/aiCore/prepareParams/__tests__/message-converter.test.ts
+@@ -47,7 +47,7 @@ vi.mock('@renderer/utils/messageUtils/find', () => ({
+   findMainTextBlocks: (message: Message) => (message as MockableMessage).__mockMainTextBlocks ?? []
+ }))
+ 
+-import { convertMessagesToSdkMessages, convertMessageToSdkParam } from '../messageConverter'
++import { convertMessagesToSdkMessages, convertMessageToSdkParam, stripMarkdownBase64Images } from '../messageConverter'
+ 
+ let messageCounter = 0
+ let blockCounter = 0
+@@ -664,6 +664,55 @@ describe('messageConverter', () => {
+       ])
+     })
+ 
++    it('strips inline base64 data URIs from assistant text to prevent HTTP 413 (#12602)', async () => {
++      const model = createModel({ id: 'gpt-4o-mini' })
++      const user1 = createMessage('user')
++      user1.__mockContent = 'Generate an image of a cat'
++
++      const assistant = createMessage('assistant')
++      assistant.__mockContent =
++        'Here is the image you requested:\n![cat](data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAA...VeryLongBase64String)\nHope you like it!'
++
++      const user2 = createMessage('user')
++      user2.__mockContent = 'Now describe what you see'
++
++      const result = await convertMessagesToSdkMessages([user1, assistant, user2], model)
++
++      const assistantMsg = result.find((m) => m.role === 'assistant')!
++      const textPart = (assistantMsg.content as Array<{ type: string; text: string }>).find((p) => p.type === 'text')!
++      // The base64 data URI should be replaced with a placeholder
++      expect(textPart.text).not.toContain('data:image/')
++      expect(textPart.text).toContain('![cat](image)')
++      expect(textPart.text).toContain('Hope you like it!')
++    })
++
++    it('strips multiple inline base64 images from assistant text', async () => {
++      const model = createModel({ id: 'gpt-4o-mini' })
++      const user = createMessage('user')
++      user.__mockContent = 'Generate two images'
++
++      const assistant = createMessage('assistant')
++      assistant.__mockContent = '![first](data:image/png;base64,AAABBB) and ![second](data:image/jpeg;base64,CCCDDD)'
++
++      const result = await convertMessageToSdkParam(assistant, false, model)
++      const textPart = ((result as any).content as Array<{ type: string; text: string }>).find(
++        (p) => p.type === 'text'
++      )!
++      expect(textPart.text).toBe('![first](image) and ![second](image)')
++    })
++
++    it('preserves regular markdown images (non-base64) in assistant text', async () => {
++      const model = createModel({ id: 'gpt-4o-mini' })
++      const assistant = createMessage('assistant')
++      assistant.__mockContent = 'Check this out: ![photo](https://example.com/photo.png)'
++
++      const result = await convertMessageToSdkParam(assistant, false, model)
++      const textPart = ((result as any).content as Array<{ type: string; text: string }>).find(
++        (p) => p.type === 'text'
++      )!
++      expect(textPart.text).toBe('Check this out: ![photo](https://example.com/photo.png)')
++    })
++
+     it('allows using LLM conversation context for image generation', async () => {
+       // This test verifies the key use case: switching from LLM to image enhancement model
+       // and using the previous conversation as context for image generation
+@@ -722,4 +771,68 @@ describe('messageConverter', () => {
+       ])
+     })
+   })
++
++  describe('stripMarkdownBase64Images', () => {
++    it('replaces a single base64 image with placeholder', () => {
++      const input = 'Here is the image:\n![cat](data:image/jpeg;base64,/9j/4AAQ)\nDone.'
++      expect(stripMarkdownBase64Images(input)).toBe('Here is the image:\n![cat](image)\nDone.')
++    })
++
++    it('replaces multiple base64 images', () => {
++      const input = '![a](data:image/png;base64,AAA) text ![b](data:image/jpeg;base64,BBB)'
++      expect(stripMarkdownBase64Images(input)).toBe('![a](image) text ![b](image)')
++    })
++
++    it('preserves regular markdown images with http URLs', () => {
++      const input = '![photo](https://example.com/photo.png)'
++      expect(stripMarkdownBase64Images(input)).toBe(input)
++    })
++
++    it('preserves file:// URLs in markdown images', () => {
++      const input = '![saved](file:///tmp/image.png)'
++      expect(stripMarkdownBase64Images(input)).toBe(input)
++    })
++
++    it('handles empty alt text', () => {
++      const input = '![](data:image/png;base64,AAABBB)'
++      expect(stripMarkdownBase64Images(input)).toBe('![](image)')
++    })
++
++    it('handles text with no markdown images', () => {
++      expect(stripMarkdownBase64Images('Just plain text.')).toBe('Just plain text.')
++    })
++
++    it('returns empty string for empty input', () => {
++      expect(stripMarkdownBase64Images('')).toBe('')
++    })
++
++    it('handles mixed base64 and regular images', () => {
++      const input =
++        '![a](https://example.com/a.png) then ![b](data:image/png;base64,XXX) then ![c](https://example.com/c.png)'
++      expect(stripMarkdownBase64Images(input)).toBe(
++        '![a](https://example.com/a.png) then ![b](image) then ![c](https://example.com/c.png)'
++      )
++    })
++
++    it('handles data URI without base64 encoding', () => {
++      const input = '![svg](data:image/svg+xml,%3Csvg%3E%3C/svg%3E)'
++      expect(stripMarkdownBase64Images(input)).toBe('![svg](image)')
++    })
++
++    it('does not treat bare ](data: without ![ as markdown image', () => {
++      const input = 'some text ](data:image/png;base64,AAA) more text'
++      expect(stripMarkdownBase64Images(input)).toBe(input)
++    })
++
++    it('handles large base64 payload without OOM', () => {
++      const largeBase64 = 'A'.repeat(5_000_000)
++      const input = `![big](data:image/png;base64,${largeBase64})`
++      expect(stripMarkdownBase64Images(input)).toBe('![big](image)')
++    })
++
++    it('handles unclosed parenthesis gracefully', () => {
++      const input = '![broken](data:image/png;base64,AAA'
++      expect(stripMarkdownBase64Images(input)).toBe(input)
++    })
++  })
+ })
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index 1c8cfd8..80b7d45 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -6,6 +6,24 @@ import { describe, expect, it, vi } from 'vitest'
+ import { getMaxTokens, getTemperature, getTimeout, getTopP } from '../modelParameters'
+ 
+ vi.mock('@renderer/services/AssistantService', () => ({
++  DEFAULT_ASSISTANT_SETTINGS: {
++    maxTokens: 4096,
++    enableMaxTokens: false,
++    temperature: 0.7,
++    enableTemperature: true,
++    topP: 1,
++    enableTopP: false,
++    contextCount: 4096,
++    streamOutput: true,
++    defaultModel: undefined,
++    customParameters: [],
++    reasoning_effort: 'default',
++    reasoning_effort_cache: undefined,
++    qwenThinkMode: undefined,
++    toolUseMode: 'function',
++    maxToolCalls: 20,
++    enableMaxToolCalls: true
++  },
+   getAssistantSettings: (assistant: Assistant): AssistantSettings => ({
+     contextCount: assistant.settings?.contextCount ?? 4096,
+     temperature: assistant.settings?.temperature ?? 0.7,
+@@ -22,8 +40,7 @@ vi.mock('@renderer/services/AssistantService', () => ({
+     reasoning_effort_cache: assistant.settings?.reasoning_effort_cache,
+     qwenThinkMode: assistant.settings?.qwenThinkMode
+   }),
+-  getProviderByModel: (model: Model) => ({ id: model.provider, type: model.provider, models: [] }),
+-  DEFAULT_ASSISTANT_SETTINGS: { enableTemperature: true, enableTopP: false, enableMaxTokens: false }
++  getProviderByModel: (model: Model) => ({ id: model.provider, type: model.provider, models: [] })
+ }))
+ 
+ vi.mock('@renderer/hooks/useSettings', () => ({
+@@ -77,12 +94,26 @@ const createModel = (overrides: Partial<Model> = {}): Model => ({
+ describe('modelParameters', () => {
+   describe('getTemperature', () => {
+     it('returns undefined when reasoning effort is enabled for Claude models', () => {
+-      const assistant = createAssistant({ reasoning_effort: 'medium' })
++      const assistant = createAssistant({ reasoning_effort: 'medium', enableTemperature: true })
+       const model = createModel({ id: 'claude-opus-4', name: 'Claude Opus 4', provider: 'anthropic', group: 'claude' })
+ 
+       expect(getTemperature(assistant, model)).toBeUndefined()
+     })
+ 
++    it('returns temperature when reasoning effort is default for Claude models', () => {
++      const assistant = createAssistant({ reasoning_effort: 'default', enableTemperature: true, temperature: 0.7 })
++      const model = createModel({ id: 'claude-sonnet-4.5', provider: 'anthropic', group: 'claude' })
++
++      expect(getTemperature(assistant, model)).toBe(0.7)
++    })
++
++    it('returns temperature when reasoning effort is none for Claude models', () => {
++      const assistant = createAssistant({ reasoning_effort: 'none', enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'claude-opus-4', provider: 'anthropic', group: 'claude' })
++
++      expect(getTemperature(assistant, model)).toBe(0.5)
++    })
++
+     it('returns undefined for models without temperature/topP support', () => {
+       const assistant = createAssistant({ enableTemperature: true })
+       const model = createModel({ id: 'qwen-mt-large', name: 'Qwen MT', provider: 'qwen', group: 'qwen' })
+@@ -202,6 +233,34 @@ describe('modelParameters', () => {
+ 
+       expect(getTopP(assistant, model)).toBeUndefined()
+     })
++
++    it('clamps topP to [0.95, 1] for Claude reasoning models with reasoning effort', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.5, reasoning_effort: 'high' })
++      const model = createModel({ id: 'claude-sonnet-4.5', provider: 'anthropic', group: 'claude' })
++
++      expect(getTopP(assistant, model)).toBe(0.95)
++    })
++
++    it('does not clamp topP when reasoning effort is default for Claude models', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.5, reasoning_effort: 'default' })
++      const model = createModel({ id: 'claude-opus-4', provider: 'anthropic', group: 'claude' })
++
++      expect(getTopP(assistant, model)).toBe(0.5)
++    })
++
++    it('does not clamp topP when reasoning effort is none for Claude models', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.5, reasoning_effort: 'none' })
++      const model = createModel({ id: 'claude-opus-4', provider: 'anthropic', group: 'claude' })
++
++      expect(getTopP(assistant, model)).toBe(0.5)
++    })
++
++    it('keeps topP unchanged when already in [0.95, 1] range for Claude reasoning models', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.97, reasoning_effort: 'medium' })
++      const model = createModel({ id: 'claude-sonnet-4', provider: 'anthropic', group: 'claude' })
++
++      expect(getTopP(assistant, model)).toBe(0.97)
++    })
+   })
+ 
+   describe('getTimeout', () => {
+diff --git a/src/aiCore/prepareParams/messageConverter.ts b/src/aiCore/prepareParams/messageConverter.ts
+index b68b8e8..5ca50a5 100644
+--- a/src/aiCore/prepareParams/messageConverter.ts
++++ b/src/aiCore/prepareParams/messageConverter.ts
+@@ -5,7 +5,7 @@
+ 
+ import type { ReasoningPart } from '@ai-sdk/provider-utils'
+ import { loggerService } from '@logger'
+-import { isImageEnhancementModel, isVisionModel } from '@renderer/config/models'
++import { isVisionModel } from '@renderer/config/models'
+ import type { Message, Model } from '@renderer/types'
+ import type {
+   FileMessageBlock,
+@@ -69,7 +69,8 @@ async function convertImageBlockToImagePart(imageBlocks: ImageMessageBlock[]): P
+   for (const imageBlock of imageBlocks) {
+     if (imageBlock.file) {
+       try {
+-        const image = await window.api.file.base64Image(imageBlock.file.id + imageBlock.file.ext)
++        const ext = imageBlock.file.ext.startsWith('.') ? imageBlock.file.ext : `.${imageBlock.file.ext}`
++        const image = await window.api.file.base64Image(imageBlock.file.id + ext)
+         parts.push({
+           type: 'image',
+           image: image.base64,
+@@ -169,6 +170,52 @@ async function convertMessageToUserModelMessage(
+   }
+ }
+ 
++/**
++ * Replaces markdown images with data URI sources (e.g. `![alt](data:image/...;base64,...)`)
++ * with a placeholder `![alt](image)` to avoid sending huge base64 payloads to the API.
++ *
++ * Uses string scanning (indexOf) instead of regex to avoid OOM on multi-MB base64 strings.
++ */
++export function stripMarkdownBase64Images(text: string): string {
++  const marker = '](data:'
++  let result = ''
++  let searchFrom = 0
++
++  while (searchFrom < text.length) {
++    const markerIdx = text.indexOf(marker, searchFrom)
++    if (markerIdx === -1) {
++      result += text.slice(searchFrom)
++      break
++    }
++
++    // Find the `![` that starts this markdown image — walk backwards from `](`
++    const bangIdx = text.lastIndexOf('![', markerIdx)
++    if (bangIdx === -1 || text.indexOf(']', bangIdx + 2) !== markerIdx) {
++      // Not a valid markdown image — skip past this marker
++      result += text.slice(searchFrom, markerIdx + marker.length)
++      searchFrom = markerIdx + marker.length
++      continue
++    }
++
++    // Find the closing `)` — the URL part starts after `](`
++    const urlStart = markerIdx + 2 // position right after `](`
++    const closeIdx = text.indexOf(')', urlStart)
++    if (closeIdx === -1) {
++      result += text.slice(searchFrom)
++      break
++    }
++
++    // Extract alt text between `![` and `]`
++    const altText = text.slice(bangIdx + 2, markerIdx)
++
++    // Append everything before `![` plus the replacement
++    result += text.slice(searchFrom, bangIdx) + `![${altText}](image)`
++    searchFrom = closeIdx + 1
++  }
++
++  return result
++}
++
+ /**
+  * 转换为助手模型消息
+  * 注意：当助手消息只包含图片（如图片生成模型的响应）而没有文本时，
+@@ -191,7 +238,9 @@ async function convertMessageToAssistantModelMessage(
+ 
+   // Add text content after reasoning blocks, only if non-empty after trimming
+   // Also add thoughtSignature from MainTextBlock metadata for Gemini thought signature persistence
+-  const trimmedContent = content?.trim()
++  // Strip inline base64 data URIs from markdown images to prevent HTTP 413 errors (#12602)
++  // Uses string scanning instead of regex to avoid OOM on large base64 payloads
++  const trimmedContent = stripMarkdownBase64Images(content?.trim() ?? '')
+   if (trimmedContent) {
+     // Find the first MainTextBlock with thoughtSignature
+     const thoughtSignature = mainTextBlocks.find((block) => block.metadata?.thoughtSignature)?.metadata
+@@ -274,7 +323,7 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+     const sdkMessage = await convertMessageToSdkParam(message, isVision, model)
+     sdkMessages.push(...(Array.isArray(sdkMessage) ? sdkMessage : [sdkMessage]))
+   }
+-  // Special handling for image enhancement models
++  // Special handling for vison models
+   // These models support multi-turn conversations but need images from previous assistant messages
+   // to be merged into the current user message for editing/enhancement operations.
+   //
+@@ -282,7 +331,7 @@ export async function convertMessagesToSdkMessages(messages: Message[], model: M
+   // 1. Preserve all conversation history for context
+   // 2. Find images from the previous assistant message and merge them into the last user message
+   // 3. This allows users to switch from LLM conversations and use that context for image generation
+-  if (isImageEnhancementModel(model)) {
++  if (isVision) {
+     // Find the last user SDK message index
+     const lastUserSdkIndex = (() => {
+       for (let i = sdkMessages.length - 1; i >= 0; i--) {
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 80781ed..79c2d04 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -3,6 +3,7 @@
+  * 处理温度、TopP、超时等基础参数的获取逻辑
+  */
+ 
++import { loggerService } from '@logger'
+ import {
+   isClaude46SeriesModel,
+   isClaudeReasoningModel,
+@@ -18,77 +19,101 @@ import {
+   getAssistantSettings,
+   getProviderByModel
+ } from '@renderer/services/AssistantService'
+-import type { Assistant, Model } from '@renderer/types'
++import { type Assistant, type Model } from '@renderer/types'
+ import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import { getThinkingBudget } from '../utils/reasoning'
+ 
++const logger = loggerService.withContext('modelParameters')
++
+ /**
+  * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
+- * - Disabled for Claude reasoning models when reasoning effort is set.
++ * - Disabled when enableTemperature is off.
++ * - Disabled for Claude reasoning models when reasoning effort is set (excluding 'default' and 'none').
+  * - Disabled for models that do not support temperature.
+- * - Disabled for Claude 4.5 reasoning models when TopP is enabled and temperature is disabled.
+- * Otherwise, returns the temperature value if the assistant has temperature enabled.
+-
++ * - Clamped to 1 for models with max temperature of 1.
++ * Otherwise, returns the temperature value.
+  */
+ export function getTemperature(assistant: Assistant, model: Model): number | undefined {
+-  if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
++  const enableTemperature = assistant.settings?.enableTemperature ?? DEFAULT_ASSISTANT_SETTINGS.enableTemperature
++  if (!enableTemperature) {
+     return undefined
+   }
+ 
+-  if (!isSupportTemperatureModel(model, assistant)) {
++  // Thinking isn't compatible with temperature or top_k modifications as well as forced tool use.
++  // See: https://platform.claude.com/docs/en/build-with-claude/extended-thinking#feature-compatibility
++  if (
++    isClaudeReasoningModel(model) &&
++    assistant.settings?.reasoning_effort &&
++    assistant.settings.reasoning_effort !== 'default' &&
++    assistant.settings.reasoning_effort !== 'none'
++  ) {
++    logger.info(`Model ${model.id} does not support reasoning with temperature, disabling temperature`)
+     return undefined
+   }
+ 
+-  if (
+-    isTemperatureTopPMutuallyExclusiveModel(model) &&
+-    assistant.settings?.enableTopP &&
+-    !assistant.settings?.enableTemperature
+-  ) {
++  if (!isSupportTemperatureModel(model, assistant)) {
++    logger.info(`Model ${model.id} does not support temperature, disabling temperature`)
+     return undefined
+   }
+ 
+-  return getTemperatureValue(assistant, model)
+-}
++  let temperature = assistant.settings?.temperature ?? DEFAULT_ASSISTANT_SETTINGS.temperature
+ 
+-function getTemperatureValue(assistant: Assistant, model: Model): number | undefined {
+-  const assistantSettings = getAssistantSettings(assistant)
+-  let temperature = assistantSettings?.temperature
+-  if (temperature && isMaxTemperatureOneModel(model)) {
+-    temperature = Math.min(1, temperature)
++  if (isMaxTemperatureOneModel(model) && temperature > 1) {
++    logger.info(`Model ${model.id} has max temperature of 1, clamping temperature from ${temperature} to 1`)
++    temperature = 1
+   }
+ 
+-  // FIXME: assistant.settings.enableTemperature should be always a boolean value.
+-  const enableTemperature = assistantSettings?.enableTemperature ?? DEFAULT_ASSISTANT_SETTINGS.enableTemperature
+-  return enableTemperature ? temperature : undefined
++  if (isTemperatureTopPMutuallyExclusiveModel(model) && assistant.settings?.enableTopP) {
++    logger.info(`Model ${model.id} only accepts one of temperature and topP, both enabled; keeping temperature`)
++  }
++
++  return temperature
+ }
+ 
+ /**
+  * Retrieves the TopP parameter, adapting it based on assistant.settings and model capabilities.
+- * - Disabled for Claude reasoning models when reasoning effort is set.
++ * - Disabled when enableTopP is off.
+  * - Disabled for models that do not support TopP.
+- * - Disabled for Claude 4.5 reasoning models when temperature is explicitly enabled.
+- * Otherwise, returns the TopP value if the assistant has TopP enabled.
++ * - Disabled for mutually exclusive models when temperature is enabled.
++ * - Clamped to [0.95, 1] for Claude reasoning models with reasoning effort set (excluding 'default' and 'none').
++ * Otherwise, returns the TopP value.
+  */
+ export function getTopP(assistant: Assistant, model: Model): number | undefined {
+-  if (assistant.settings?.reasoning_effort && isClaudeReasoningModel(model)) {
++  const enableTopP = assistant.settings?.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
++  if (!enableTopP) {
+     return undefined
+   }
++
+   if (!isSupportTopPModel(model, assistant)) {
++    logger.info(`Model ${model.id} does not support topP, disabling topP.`)
+     return undefined
+   }
++
+   if (isTemperatureTopPMutuallyExclusiveModel(model) && assistant.settings?.enableTemperature) {
++    logger.info(`Model ${model.id} only accepts one of temperature and topP, disabling topP.`)
+     return undefined
+   }
+ 
+-  return getTopPValue(assistant)
+-}
++  let topP = assistant.settings?.topP ?? DEFAULT_ASSISTANT_SETTINGS.topP
+ 
+-function getTopPValue(assistant: Assistant): number | undefined {
+-  const assistantSettings = getAssistantSettings(assistant)
+-  // FIXME: assistant.settings.enableTopP should be always a boolean value.
+-  const enableTopP = assistantSettings.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
+-  return enableTopP ? assistantSettings?.topP : undefined
++  // When thinking is enabled, the topP should be between 0.95 and 1
++  // See: https://platform.claude.com/docs/en/build-with-claude/extended-thinking#feature-compatibility
++  // NOTE: It depends on the behavior that extended thinking defaults to off, so we clamp the topP value also when reasoning is not 'default'
++  if (
++    isClaudeReasoningModel(model) &&
++    assistant.settings?.reasoning_effort &&
++    assistant.settings.reasoning_effort !== 'default' &&
++    assistant.settings.reasoning_effort !== 'none'
++  ) {
++    const clampedTopP = Math.max(0.95, Math.min(topP, 1))
++    if (clampedTopP !== topP) {
++      logger.info(`Claude Model ${model.id} has reasoning enabled, clamping topP from ${topP} to ${clampedTopP}`)
++    }
++    topP = clampedTopP
++  }
++
++  return topP
+ }
+ 
+ /**
+diff --git a/src/aiCore/provider/factory.ts b/src/aiCore/provider/factory.ts
+index d18aa02..0f30ec0 100644
+--- a/src/aiCore/provider/factory.ts
++++ b/src/aiCore/provider/factory.ts
+@@ -14,7 +14,7 @@ const logger = loggerService.withContext('ProviderFactory')
+  * 初始化动态Provider系统
+  * 在模块加载时自动注册新的providers
+  */
+-;(async () => {
++void (async () => {
+   try {
+     await initializeNewProviders()
+   } catch (error) {
+@@ -31,6 +31,7 @@ const STATIC_PROVIDER_MAPPING: Record<string, ProviderId> = {
+   'azure-openai': 'azure', // Azure OpenAI -> azure
+   'openai-response': 'openai', // OpenAI Responses -> openai
+   grok: 'xai', // Grok -> xai
++  groq: 'groq', // Groq -> dedicated @ai-sdk/groq provider
+   copilot: 'github-copilot-openai-compatible',
+   tokenflux: 'openrouter' // TokenFlux -> openrouter (fully compatible)
+ }
+@@ -48,7 +49,7 @@ function tryResolveProviderId(identifier: string): ProviderId | null {
+   // 2. 检查AiCore是否支持（包括别名支持）
+   if (hasProviderConfigByAlias(identifier)) {
+     // 解析为真实的Provider ID
+-    return resolveProviderConfigId(identifier) as ProviderId
++    return resolveProviderConfigId(identifier)
+   }
+ 
+   return null
+diff --git a/src/aiCore/provider/providerInitialization.ts b/src/aiCore/provider/providerInitialization.ts
+index 51176c1..f1023e4 100644
+--- a/src/aiCore/provider/providerInitialization.ts
++++ b/src/aiCore/provider/providerInitialization.ts
+@@ -102,6 +102,13 @@ export const NEW_PROVIDER_CONFIGS: ProviderConfig[] = [
+     import: () => import('ollama-ai-provider-v2'),
+     creatorFunctionName: 'createOllama',
+     supportsImageGeneration: false
++  },
++  {
++    id: 'groq',
++    name: 'Groq',
++    import: () => import('@ai-sdk/groq'),
++    creatorFunctionName: 'createGroq',
++    supportsImageGeneration: false
+   }
+ ] as const
+ 
+diff --git a/src/aiCore/tools/MemorySearchTool.ts b/src/aiCore/tools/MemorySearchTool.ts
+index e407dee..4303395 100644
+--- a/src/aiCore/tools/MemorySearchTool.ts
++++ b/src/aiCore/tools/MemorySearchTool.ts
+@@ -9,7 +9,7 @@ import { MemoryProcessor } from '../../services/MemoryProcessor'
+  * 🧠 基础记忆搜索工具
+  * AI 可以主动调用的简单记忆搜索
+  */
+-export const memorySearchTool = () => {
++export const memorySearchTool = (assistantId: string) => {
+   return tool({
+     description: 'Search through conversation memories and stored facts for relevant context',
+     inputSchema: z.object({
+@@ -29,7 +29,7 @@ export const memorySearchTool = () => {
+       }
+ 
+       const currentUserId = selectCurrentUserId(store.getState())
+-      const processorConfig = MemoryProcessor.getProcessorConfig(memoryConfig, 'default', currentUserId)
++      const processorConfig = MemoryProcessor.getProcessorConfig(memoryConfig, assistantId, currentUserId)
+ 
+       const memoryProcessor = new MemoryProcessor()
+       const relevantMemories = await memoryProcessor.searchRelevantMemories(query, processorConfig, limit)
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 2e9a764..9fa8705 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -634,6 +634,7 @@ function buildGenericProviderOptions(
+   let providerOptions: Record<string, any> = {}
+ 
+   const reasoningParams = getReasoningEffort(assistant, model)
++  logger.debug('reasoningParams', reasoningParams)
+   providerOptions = {
+     ...providerOptions,
+     ...reasoningParams
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index e9a1d7c..22b0979 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -52,6 +52,7 @@ const logger = loggerService.withContext('reasoning')
+ // The function is only for generic provider. May extract some logics to independent provider
+ export function getReasoningEffort(assistant: Assistant, model: Model): ReasoningEffortOptionalParams {
+   const provider = getProviderByModel(model)
++  const modelId = getLowerBaseModelName(model.id)
+   if (provider.id === 'groq') {
+     return {}
+   }
+@@ -84,6 +85,21 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { reasoning: { enabled: false, exclude: true } }
+     }
+ 
++    // nvidia: must use chat_template_kwargs
++    // Since limited documentation, it's hard to find what parameters should be set
++    // only part of mainstream oss model covered, all verified by nvidia api
++    if (model.provider === SystemProviderIds.nvidia) {
++      if (isSupportedThinkingTokenQwenModel(model)) {
++        return { chat_template_kwargs: { enable_thinking: false } }
++      } else if (isDeepSeekHybridInferenceModel(model)) {
++        return { chat_template_kwargs: { thinking: false } }
++      } else if (isSupportedThinkingTokenKimiModel(model)) {
++        return { chat_template_kwargs: { thinking: false } }
++      } else if (isSupportedThinkingTokenZhipuModel(model)) {
++        return { chat_template_kwargs: { enable_thinking: false } }
++      }
++    }
++
+     // providers that use enable_thinking
+     if (
+       (isSupportEnableThinkingProvider(provider) &&
+@@ -245,12 +261,33 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+   }
+ 
+   const effortRatio = EFFORT_RATIO[reasoningEffort]
+-  const tokenLimit = findTokenLimit(model.id)
++  const tokenLimit = findTokenLimit(modelId)
+   let budgetTokens: number | undefined
+   if (tokenLimit) {
+     budgetTokens = Math.floor((tokenLimit.max - tokenLimit.min) * effortRatio + tokenLimit.min)
+   }
+ 
++  // nvidia: must use chat_template_kwargs
++  // Since limited documentation, it's hard to find what parameters should be set
++  // only part of mainstream oss model covered, all verified by nvidia api
++  if (model.provider === SystemProviderIds.nvidia) {
++    if (isSupportedThinkingTokenQwenModel(model)) {
++      const enableThinkingConfig = isQwenAlwaysThinkModel(model) ? {} : { enable_thinking: true }
++      return {
++        chat_template_kwargs: {
++          ...enableThinkingConfig,
++          thinking_budget: budgetTokens
++        }
++      }
++    } else if (isDeepSeekHybridInferenceModel(model)) {
++      return { chat_template_kwargs: { thinking: true } }
++    } else if (isSupportedThinkingTokenKimiModel(model)) {
++      return { chat_template_kwargs: { thinking: true } }
++    } else if (isSupportedThinkingTokenZhipuModel(model)) {
++      return { chat_template_kwargs: { enable_thinking: true } }
++    }
++  }
++
+   // See https://docs.siliconflow.cn/cn/api-reference/chat-completions/chat-completions
+   if (model.provider === SystemProviderIds.silicon) {
+     if (
+@@ -309,12 +346,6 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+               enabled: true
+             }
+           }
+-        case 'nvidia':
+-          return {
+-            chat_template_kwargs: {
+-              thinking: true
+-            }
+-          }
+         default:
+           break
+       }
+@@ -392,9 +423,9 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       }
+     } else {
+       return {
+-        thinking_budget: budgetTokens,
+         chat_template_kwargs: {
+-          ...enableThinkingConfig
++          ...enableThinkingConfig,
++          thinking_budget: budgetTokens
+         }
+       }
+     }
