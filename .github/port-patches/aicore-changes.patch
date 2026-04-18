@@ -1,0 +1,812 @@
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index 197646c..351538d 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -296,6 +296,45 @@ describe('formatProviderApiHost', () => {
+     })
+   })
+ 
++  describe('NewAPI provider', () => {
++    // Regression: previously isNewApiProvider was matched in formatProviderApiHost and forced
++    it('appends /v1 when matched by type "new-api"', () => {
++      const provider = makeProvider({
++        id: 'some-newapi-instance',
++        type: 'new-api',
++        apiHost: 'https://api.example.com'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.example.com/v1')
++    })
++
++    it('does not double-append /v1', () => {
++      const provider = makeProvider({
++        id: 'new-api',
++        type: 'openai',
++        apiHost: 'https://api.newapi.com/v1'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.newapi.com/v1')
++    })
++
++    it('skips version append when trailing sharp is present', () => {
++      const provider = makeProvider({
++        id: 'new-api',
++        type: 'openai',
++        apiHost: 'https://api.newapi.com/custom#'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.newapi.com/custom')
++    })
++  })
++
+   describe('Ollama provider', () => {
+     it('strips trailing /v1 and appends /api', () => {
+       const provider = makeProvider({
+@@ -374,7 +413,7 @@ describe('formatProviderApiHost', () => {
+   })
+ 
+   describe('Azure OpenAI provider', () => {
+-    it('strips /v1 and appends /openai', () => {
++    it('normalizes apiHost without appending version (deferred to build phase)', () => {
+       const provider = makeProvider({
+         id: 'azure-openai',
+         type: 'azure-openai',
+@@ -383,9 +422,21 @@ describe('formatProviderApiHost', () => {
+ 
+       const result = formatProviderApiHost(provider)
+ 
+-      // formatAzureOpenAIApiHost strips /v1 and /openai then re-appends /openai
++      // Azure now defers /openai suffix to buildAzureConfig; formatProviderApiHost only normalizes
+       expect(result.apiHost).toBe('https://example.openai.azure.com/openai')
+     })
++
++    it('does not append /v1 to bare Azure host', () => {
++      const provider = makeProvider({
++        id: 'azure-openai',
++        type: 'azure-openai',
++        apiHost: 'https://example.openai.azure.com'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://example.openai.azure.com')
++    })
+   })
+ 
+   describe('Vertex provider', () => {
+@@ -793,7 +844,7 @@ describe('providerToAiSdkConfig', () => {
+       expect(config.providerId).toBe('cherryin')
+       const settings = config.providerSettings as CherryInProviderSettings
+       expect(settings.anthropicBaseURL).toBe('https://anthropic.cherryin.com/v1')
+-      expect(settings.geminiBaseURL).toBe('https://api.cherryin.com/v1beta/models')
++      expect(settings.geminiBaseURL).toBe('https://api.cherryin.com/v1beta')
+     })
+   })
+ 
+@@ -898,7 +949,7 @@ describe('providerToAiSdkConfig', () => {
+         makeModel('gpt-4', provider.id)
+       )) as ProviderConfig<'openai-compatible'>
+ 
+-      const settings = config.providerSettings as OpenAICompatibleProviderSettings
++      const settings = config.providerSettings
+       expect(settings.headers).toBeDefined()
+       expect(settings.headers!['HTTP-Referer']).toBe('https://cherry-ai.com')
+       expect(settings.headers!['X-Title']).toBe('Cherry Studio')
+@@ -917,7 +968,7 @@ describe('providerToAiSdkConfig', () => {
+         makeModel('gpt-4', provider.id)
+       )) as ProviderConfig<'openai-compatible'>
+ 
+-      const settings = config.providerSettings as OpenAICompatibleProviderSettings
++      const settings = config.providerSettings
+       expect(settings.headers).toBeDefined()
+       expect(settings.headers!['X-Custom']).toBe('custom-value')
+     })
+diff --git a/src/aiCore/provider/extensions/index.ts b/src/aiCore/provider/extensions/index.ts
+index 7ce2ee3..76de2c0 100644
+--- a/src/aiCore/provider/extensions/index.ts
++++ b/src/aiCore/provider/extensions/index.ts
+@@ -3,6 +3,7 @@
+  * 用于支持运行时动态导入的 AI Providers
+  */
+ 
++import type { AmazonBedrockProvider } from '@ai-sdk/amazon-bedrock'
+ import { type AmazonBedrockProviderSettings, createAmazonBedrock } from '@ai-sdk/amazon-bedrock'
+ import { type CerebrasProviderSettings, createCerebras } from '@ai-sdk/cerebras'
+ import { createGateway, type GatewayProviderSettings } from '@ai-sdk/gateway'
+@@ -93,8 +94,20 @@ export const BedrockExtension = ProviderExtension.create({
+   name: 'bedrock',
+   aliases: ['aws-bedrock'] as const,
+   supportsImageGeneration: true,
+-  create: createAmazonBedrock
+-} as const satisfies ProviderExtensionConfig<AmazonBedrockProviderSettings, ProviderV3, 'bedrock'>)
++  create: createAmazonBedrock,
++  toolFactories: {
++    webSearch:
++      (provider: AmazonBedrockProvider) =>
++      (config: NonNullable<Parameters<AmazonBedrockProvider['tools']['webSearch_20260209']>[0]>) => ({
++        tools: { webSearch: provider.tools.webSearch_20260209(config) }
++      }),
++    urlContext:
++      (provider: AmazonBedrockProvider) =>
++      (config: NonNullable<Parameters<AmazonBedrockProvider['tools']['webFetch_20260209']>[0]>) => ({
++        tools: { urlContext: provider.tools.webFetch_20260209(config) }
++      })
++  }
++} as const satisfies ProviderExtensionConfig<AmazonBedrockProviderSettings, AmazonBedrockProvider, 'bedrock'>)
+ 
+ /**
+  * Perplexity Extension
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 5b5f16e..7b2fc4a 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -14,7 +14,6 @@ import store from '@renderer/store'
+ import { type Model, type Provider, SystemProviderIds } from '@renderer/types'
+ import {
+   formatApiHost,
+-  formatAzureOpenAIApiHost,
+   formatOllamaApiHost,
+   formatVertexApiHost,
+   isWithTrailingSharp,
+@@ -87,7 +86,7 @@ export function formatProviderApiHost(provider: Provider): Provider {
+     { match: isPerplexityProvider, format: (p) => formatApiHost(p.apiHost, false) },
+     { match: isOllamaProvider, format: (p) => formatOllamaApiHost(p.apiHost) },
+     { match: isGeminiProvider, format: (p, av) => formatApiHost(p.apiHost, av, 'v1beta') },
+-    { match: isAzureOpenAIProvider, format: (p) => formatAzureOpenAIApiHost(p.apiHost) },
++    { match: isAzureOpenAIProvider, format: (p) => formatApiHost(p.apiHost, false) },
+     { match: isVertexProvider, format: (p) => formatVertexApiHost(p as Parameters<typeof formatVertexApiHost>[0]) }
+   ]
+ 
+@@ -258,7 +257,7 @@ function buildCherryinConfig(ctx: BuilderContext): ProviderConfig<'cherryin'> {
+       ...ctx.baseConfig,
+       endpointType: ctx.model.endpoint_type,
+       anthropicBaseURL: cherryinProvider ? cherryinProvider.anthropicApiHost + '/v1' : undefined,
+-      geminiBaseURL: cherryinProvider ? cherryinProvider.apiHost + '/v1beta/models' : undefined,
++      geminiBaseURL: cherryinProvider ? cherryinProvider.apiHost + '/v1beta' : undefined,
+       headers: { ...defaultAppHeaders(), ...ctx.actualProvider.extra_headers }
+     }
+   }
+@@ -285,6 +284,13 @@ async function buildCherryAIConfig(ctx: BuilderContext): Promise<ProviderConfig<
+   }
+ }
+ 
++function formatAzureBaseURL(baseURL: string, forAnthropic: boolean): string {
++  // Normalize: strip trailing /v1 and /openai that user may have included
++  const normalized = baseURL.replace(/\/v1$/, '').replace(/\/openai$/, '')
++  // Azure OpenAI endpoints need /openai suffix; Azure Anthropic does not
++  return forAnthropic ? normalized : normalized + '/openai'
++}
++
+ function buildAzureConfig(
+   ctx: BuilderContext
+ ): ProviderConfig<'azure'> | ProviderConfig<'azure-responses'> | ProviderConfig<'azure-anthropic'> {
+@@ -295,6 +301,7 @@ function buildAzureConfig(
+       endpoint: ctx.endpoint,
+       providerSettings: {
+         ...ctx.baseConfig,
++        baseURL: formatAzureBaseURL(ctx.baseConfig.baseURL, true),
+         headers: { ...defaultAppHeaders(), ...ctx.actualProvider.extra_headers }
+       }
+     }
+@@ -305,6 +312,7 @@ function buildAzureConfig(
+ 
+   const providerSettings: ProviderConfig<'azure'>['providerSettings'] = {
+     ...ctx.baseConfig,
++    baseURL: formatAzureBaseURL(ctx.baseConfig.baseURL, false),
+     headers: { ...defaultAppHeaders(), ...ctx.actualProvider.extra_headers }
+   }
+ 
+@@ -374,12 +382,26 @@ function buildAiHubMixConfig(ctx: BuilderContext): ProviderConfig<'aihubmix'> {
+   }
+ }
+ 
++function formatNewApiBaseURL(baseURL: string, endpointType?: string): string {
++  switch (endpointType) {
++    case 'gemini':
++      return formatApiHost(baseURL, true, 'v1beta')
++    case 'anthropic':
++      return formatApiHost(baseURL, false)
++    default:
++      return formatApiHost(baseURL, true)
++  }
++}
++
+ function buildNewApiConfig(ctx: BuilderContext): ProviderConfig<'newapi'> {
++  const baseURL = formatNewApiBaseURL(ctx.baseConfig.baseURL, ctx.model.endpoint_type)
++
+   return {
+     providerId: 'newapi',
+     endpoint: ctx.endpoint,
+     providerSettings: {
+       ...ctx.baseConfig,
++      baseURL,
+       endpointType: ctx.model.endpoint_type,
+       headers: { ...defaultAppHeaders(), ...ctx.actualProvider.extra_headers }
+     }
+diff --git a/src/aiCore/services/__tests__/__snapshots__/listModels.test.ts.snap b/src/aiCore/services/__tests__/__snapshots__/listModels.test.ts.snap
+index 3e3c848..7181b69 100644
+--- a/src/aiCore/services/__tests__/__snapshots__/listModels.test.ts.snap
++++ b/src/aiCore/services/__tests__/__snapshots__/listModels.test.ts.snap
+@@ -1,5 +1,38 @@
+ // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+ 
++exports[`listModels > AIHubMix > should convert real AIHubMix response with model_id and model_name 1`] = `
++[
++  {
++    "description": "Qwen 3.6, the native vision-language Plus series model.",
++    "group": "aihubmix",
++    "id": "qwen3.6-plus",
++    "name": "Qwen3.6 Plus",
++    "provider": "aihubmix",
++  },
++  {
++    "description": "Claude Sonnet 4.6 delivers frontier intelligence at scale.",
++    "group": "aihubmix",
++    "id": "claude-sonnet-4-6",
++    "name": "Claude Sonnet 4.6",
++    "provider": "aihubmix",
++  },
++  {
++    "description": "GPT-5.4 is our frontier model for complex professional work.",
++    "group": "aihubmix",
++    "id": "gpt-5.4",
++    "name": "GPT 5.4",
++    "provider": "aihubmix",
++  },
++  {
++    "description": "A new-generation professional-grade multimodal video-creation model.",
++    "group": "aihubmix",
++    "id": "doubao-seedance-2-0-260128",
++    "name": "Doubao Seedance 2.0 260128",
++    "provider": "aihubmix",
++  },
++]
++`;
++
+ exports[`listModels > Gemini > should strip models/ prefix and use displayName from real response 1`] = `
+ [
+   {
+diff --git a/src/aiCore/services/__tests__/listModels.test.ts b/src/aiCore/services/__tests__/listModels.test.ts
+index 6bae317..8b2a337 100644
+--- a/src/aiCore/services/__tests__/listModels.test.ts
++++ b/src/aiCore/services/__tests__/listModels.test.ts
+@@ -30,6 +30,7 @@ vi.mock('@shared/utils', () => ({
+ }))
+ 
+ const { listModels } = await import('../listModels')
++const { OllamaTagsResponseSchema } = await import('../schemas')
+ 
+ // === Real API response fixtures (captured 2026-03-19) ===
+ 
+@@ -144,6 +145,66 @@ const REAL_PPIO_CHAT = {
+   ]
+ }
+ 
++// From https://aihubmix.com/api/v1/models (custom schema with model_id/model_name)
++const REAL_AIHUBMIX = {
++  data: [
++    {
++      model_id: 'qwen3.6-plus',
++      model_name: 'Qwen3.6 Plus',
++      developer_id: 13,
++      desc: 'Qwen 3.6, the native vision-language Plus series model.',
++      pricing: { cache_read: 0.0282, cache_write: 0.3525, input: 0.282, output: 1.692 },
++      types: 'llm',
++      features: 'tools,function_calling,structured_outputs,web,long_context,thinking',
++      input_modalities: 'text,image,video',
++      endpoints: '',
++      max_output: 64000,
++      context_length: 991000
++    },
++    {
++      model_id: 'claude-sonnet-4-6',
++      model_name: 'Claude Sonnet 4.6',
++      developer_id: 2,
++      desc: 'Claude Sonnet 4.6 delivers frontier intelligence at scale.',
++      pricing: { cache_read: 0.3, cache_write: 3.75, input: 3, output: 15 },
++      types: 'llm',
++      features: 'thinking,tools,function_calling,structured_outputs',
++      input_modalities: 'text,image',
++      endpoints: 'chat_completions,gemini_api,claude_api',
++      max_output: 64000,
++      context_length: 1000000
++    },
++    {
++      model_id: 'gpt-5.4',
++      model_name: 'GPT 5.4',
++      developer_id: 12,
++      desc: 'GPT-5.4 is our frontier model for complex professional work.',
++      pricing: { cache_read: 0.25, input: 2.5, output: 15 },
++      types: 'llm',
++      features: 'thinking,function_calling,structured_outputs,web,tools',
++      input_modalities: 'text,image',
++      endpoints: '',
++      max_output: 128000,
++      context_length: 400000
++    },
++    {
++      model_id: 'doubao-seedance-2-0-260128',
++      model_name: 'Doubao Seedance 2.0 260128',
++      developer_id: 4,
++      desc: 'A new-generation professional-grade multimodal video-creation model.',
++      pricing: { input: 2, output: 0 },
++      types: 'video',
++      features: '',
++      input_modalities: 'image,text',
++      endpoints: '',
++      max_output: 0,
++      context_length: 0
++    }
++  ],
++  message: '',
++  success: true
++}
++
+ // === Helpers ===
+ 
+ function makeProvider(overrides: Partial<Provider> & { id: string }): Provider {
+@@ -299,6 +360,91 @@ describe('listModels', () => {
+     })
+   })
+ 
++  describe('AIHubMix', () => {
++    it('should convert real AIHubMix response with model_id and model_name', async () => {
++      mockGetFromApi.mockResolvedValue({ value: REAL_AIHUBMIX })
++      const models = await listModels(makeProvider({ id: 'aihubmix' }))
++      assertValidModels(models)
++      expect(models).toHaveLength(4)
++      // model_name should be used as name
++      expect(models[0].name).toBe('Qwen3.6 Plus')
++      expect(models[0].id).toBe('qwen3.6-plus')
++      expect(models[0].description).toBe('Qwen 3.6, the native vision-language Plus series model.')
++      // No slash in ID -> group falls back to provider id
++      expect(models[0].group).toBe('aihubmix')
++      expect(models[1].name).toBe('Claude Sonnet 4.6')
++      expect(models[2].name).toBe('GPT 5.4')
++      expect(models[3].name).toBe('Doubao Seedance 2.0 260128')
++      expect(models).toMatchSnapshot()
++    })
++
++    it('should deduplicate by model_id', async () => {
++      const duped = {
++        ...REAL_AIHUBMIX,
++        data: [REAL_AIHUBMIX.data[0], REAL_AIHUBMIX.data[0], REAL_AIHUBMIX.data[1]]
++      }
++      mockGetFromApi.mockResolvedValue({ value: duped })
++      const models = await listModels(makeProvider({ id: 'aihubmix' }))
++      expect(models).toHaveLength(2)
++    })
++  })
++
++  describe('Ollama', () => {
++    it('should accept null families in Ollama tags schema', () => {
++      const parsed = OllamaTagsResponseSchema.parse({
++        models: [
++          {
++            name: 'glm-5:cloud',
++            model: 'glm-5:cloud',
++            details: {
++              parent_model: '',
++              format: '',
++              family: '',
++              families: null,
++              parameter_size: '',
++              quantization_level: ''
++            }
++          }
++        ]
++      })
++
++      expect(parsed.models[0].details?.families).toBeUndefined()
++    })
++
++    it('should accept null families in real Ollama tag responses', async () => {
++      mockGetFromApi.mockResolvedValue({
++        value: {
++          models: [
++            {
++              name: 'glm-5:cloud',
++              model: 'glm-5:cloud',
++              details: {
++                parent_model: '',
++                format: '',
++                family: '',
++                families: null,
++                parameter_size: '',
++                quantization_level: ''
++              }
++            },
++            {
++              name: 'qwen3.5:9b',
++              model: 'qwen3.5:9b',
++              details: {
++                family: 'qwen35',
++                families: ['qwen35']
++              }
++            }
++          ]
++        }
++      })
++
++      const models = await listModels(makeProvider({ id: 'ollama', type: 'ollama', apiHost: 'http://localhost:11434' }))
++      assertValidModels(models)
++      expect(models.map((m) => m.id)).toEqual(['glm-5:cloud', 'qwen3.5:9b'])
++    })
++  })
++
+   describe('Unsupported providers', () => {
+     it.each([
+       ['gateway', { id: 'gateway' }],
+diff --git a/src/aiCore/services/listModels.ts b/src/aiCore/services/listModels.ts
+index ccce59b..fc5cffe 100644
+--- a/src/aiCore/services/listModels.ts
++++ b/src/aiCore/services/listModels.ts
+@@ -18,6 +18,7 @@ import { defaultAppHeaders } from '@shared/utils'
+ import * as z from 'zod'
+ 
+ import {
++  AIHubMixModelsResponseSchema,
+   GeminiModelsResponseSchema,
+   GitHubModelsResponseSchema,
+   NewApiModelsResponseSchema,
+@@ -248,7 +249,7 @@ const togetherFetcher: ModelFetcher = {
+ }
+ 
+ const newApiFetcher: ModelFetcher = {
+-  match: (p) => p.id === SystemProviderIds['new-api'] || p.type === 'new-api',
++  match: (p) => p.id === SystemProviderIds['new-api'] || p.type === 'new-api' || p.id === SystemProviderIds.cherryin,
+   fetch: async (provider, signal) => {
+     const baseUrl = formatApiHost(provider.apiHost)
+     const response = await getFromApi({
+@@ -317,6 +318,24 @@ const ppioFetcher: ModelFetcher = {
+   }
+ }
+ 
++const aiHubMixFetcher: ModelFetcher = {
++  match: (p) => p.id === SystemProviderIds.aihubmix,
++  fetch: async (provider, signal) => {
++    const response = await getFromApi({
++      url: `https://aihubmix.com/api/v1/models`,
++      headers: defaultHeaders(provider),
++      responseSchema: AIHubMixModelsResponseSchema,
++      abortSignal: signal
++    })
++    return dedup(response.data, (m) => m.model_id).map((m) =>
++      toModel(m.model_id, provider, {
++        name: m.model_name || m.model_id,
++        description: m.desc
++      })
++    )
++  }
++}
++
+ /** Default fallback: OpenAI-compatible /models endpoint */
+ const openAICompatibleFetcher: ModelFetcher = {
+   match: () => true,
+@@ -335,6 +354,7 @@ const openAICompatibleFetcher: ModelFetcher = {
+ // === Registry (order matters: first match wins) ===
+ 
+ const fetchers: ModelFetcher[] = [
++  aiHubMixFetcher,
+   ollamaFetcher,
+   geminiFetcher,
+   githubFetcher,
+diff --git a/src/aiCore/services/schemas.ts b/src/aiCore/services/schemas.ts
+index 1a82288..e216d91 100644
+--- a/src/aiCore/services/schemas.ts
++++ b/src/aiCore/services/schemas.ts
+@@ -1,6 +1,9 @@
+ /**
+  * API Response Schemas for model listing
+  * Used exclusively by listModels.ts
++ *
++ * All object schemas use z.looseObject() to tolerate unknown fields
++ * from providers — prevents parse failures when APIs add new fields.
+  */
+ import * as z from 'zod'
+ 
+@@ -8,32 +11,36 @@ import * as z from 'zod'
+ 
+ export const OpenAIModelsResponseSchema = z.object({
+   data: z.array(
+-    z.object({
++    z.looseObject({
+       id: z.string(),
+-      object: z.literal('model').optional().default('model'),
++      object: z.string().optional().default('model'),
+       created: z.number().optional(),
+       owned_by: z.string().optional()
+     })
+   ),
+-  object: z.literal('list').optional()
++  object: z.string().optional()
+ })
+ 
+ // === Ollama ===
+ 
+ export const OllamaTagsResponseSchema = z.object({
+   models: z.array(
+-    z.object({
++    z.looseObject({
+       name: z.string(),
+       model: z.string().optional(),
+       modified_at: z.string().optional(),
+       size: z.number().optional(),
+       digest: z.string().optional(),
+       details: z
+-        .object({
++        .looseObject({
+           parent_model: z.string().optional(),
+           format: z.string().optional(),
+           family: z.string().optional(),
+-          families: z.array(z.string()).optional(),
++          families: z
++            .array(z.string())
++            .nullable()
++            .optional()
++            .transform((v) => v ?? undefined),
+           parameter_size: z.string().optional(),
+           quantization_level: z.string().optional()
+         })
+@@ -46,7 +53,7 @@ export const OllamaTagsResponseSchema = z.object({
+ 
+ export const GeminiModelsResponseSchema = z.object({
+   models: z.array(
+-    z.object({
++    z.looseObject({
+       name: z.string(),
+       displayName: z.string().optional(),
+       description: z.string().optional(),
+@@ -63,7 +70,7 @@ export const GeminiModelsResponseSchema = z.object({
+ // === GitHub Models ===
+ 
+ export const GitHubModelsResponseSchema = z.array(
+-  z.object({
++  z.looseObject({
+     id: z.string(),
+     summary: z.string().optional(),
+     publisher: z.string().optional(),
+@@ -76,14 +83,14 @@ export const GitHubModelsResponseSchema = z.array(
+ // === Together ===
+ 
+ export const TogetherModelsResponseSchema = z.array(
+-  z.object({
++  z.looseObject({
+     id: z.string(),
+     display_name: z.string().optional(),
+     organization: z.string().optional(),
+     description: z.string().optional(),
+     context_length: z.number().optional(),
+     pricing: z
+-      .object({
++      .looseObject({
+         input: z.number().optional(),
+         output: z.number().optional()
+       })
+@@ -95,17 +102,19 @@ export const TogetherModelsResponseSchema = z.array(
+ 
+ export const NewApiModelsResponseSchema = z.object({
+   data: z.array(
+-    z.object({
++    z.looseObject({
+       id: z.string(),
+-      object: z.literal('model').optional().default('model'),
++      object: z.string().optional().default('model'),
+       created: z.number().optional(),
+       owned_by: z.string().optional(),
+       supported_endpoint_types: z
+-        .array(z.enum(['openai', 'anthropic', 'gemini', 'openai-response', 'image-generation']))
++        .array(z.string())
++        .nullable()
+         .optional()
++        .transform((v) => v ?? undefined)
+     })
+   ),
+-  object: z.literal('list').optional()
++  object: z.string().optional()
+ })
+ 
+ // === OVMS (OpenVINO Model Server) ===
+@@ -115,10 +124,10 @@ export const OVMSConfigResponseSchema = z.record(
+   z.object({
+     model_version_status: z
+       .array(
+-        z.object({
++        z.looseObject({
+           state: z.string(),
+           status: z
+-            .object({
++            .looseObject({
+               error_code: z.string().optional(),
+               error_message: z.string().optional()
+             })
+@@ -128,3 +137,32 @@ export const OVMSConfigResponseSchema = z.record(
+       .optional()
+   })
+ )
++
++// === AIHubMix ===
++
++export const AIHubMixModelsResponseSchema = z.object({
++  data: z.array(
++    z.looseObject({
++      model_id: z.string(),
++      model_name: z.string().optional(),
++      developer_id: z.number().optional(),
++      desc: z.string().optional(),
++      pricing: z
++        .looseObject({
++          cache_read: z.number().optional(),
++          cache_write: z.number().optional(),
++          input: z.number().optional(),
++          output: z.number().optional()
++        })
++        .optional(),
++      types: z.string().optional(),
++      features: z.string().optional(),
++      input_modalities: z.string().optional(),
++      endpoints: z.string().optional(),
++      max_output: z.number().optional(),
++      context_length: z.number().optional()
++    })
++  ),
++  message: z.string().optional(),
++  success: z.boolean().optional()
++})
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 616269a..d3622e8 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -1123,6 +1123,46 @@ describe('options utils', () => {
+         })
+       })
+ 
++      it.each([
++        { providerId: 'newapi', providerName: 'NewAPI' },
++        { providerId: 'aihubmix', providerName: 'AiHubMix' }
++      ])(
++        'should route Gemini models to google providerOptions through $providerName',
++        async ({ providerId, providerName }) => {
++          const { getCustomParameters } = await import('../reasoning')
++          vi.mocked(getCustomParameters).mockReturnValue({
++            generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
++            imageConfig: { aspectRatio: '3:4', imageSize: '4K' }
++          })
++
++          const provider: Provider = {
++            id: providerId,
++            name: providerName,
++            type: 'openai',
++            models: [] as Model[]
++          } as Provider
++
++          const geminiModel: Model = {
++            id: 'gemini-3.1-flash-image-preview',
++            name: 'Gemini 3.1 Flash Image Preview',
++            provider: providerId
++          } as Model
++
++          const result = buildProviderOptions(mockAssistant, geminiModel, provider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: true
++          })
++
++          expect(result.providerOptions).toHaveProperty('google')
++          expect(result.providerOptions).not.toHaveProperty(providerId)
++          expect(result.providerOptions.google).toMatchObject({
++            generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
++            imageConfig: { aspectRatio: '3:4', imageSize: '4K' }
++          })
++        }
++      )
++
+       // Note: For proxy providers like aihubmix/newapi, users should write AI SDK provider ID (google/anthropic)
+       // instead of the Cherry Studio provider ID for custom parameters to work correctly
+ 
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index cba3c05..7c2b851 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -78,6 +78,7 @@ vi.mock('@renderer/config/models', async (importOriginal) => {
+     isSupportedThinkingTokenGeminiModel: vi.fn(() => false),
+     isSupportedThinkingTokenDoubaoModel: vi.fn(() => false),
+     isSupportedThinkingTokenZhipuModel: vi.fn(() => false),
++    isSupportedThinkingTokenMiMoModel: vi.fn(() => false),
+     isSupportedReasoningEffortModel: vi.fn(() => false),
+     isDeepSeekHybridInferenceModel: vi.fn(() => false),
+     isSupportedReasoningEffortGrokModel: vi.fn(() => false),
+@@ -347,6 +348,62 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
++    it('should disable thinking for MiMo models when reasoning effort is none', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenMiMoModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenMiMoModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'mimo-v2-pro',
++        name: 'MiMo V2 Pro',
++        provider: SystemProviderIds.mimo
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getReasoningEffort(assistant, model)
++      expect(result).toEqual({
++        thinking: {
++          type: 'disabled'
++        }
++      })
++    })
++
++    it('should enable thinking for MiMo models when reasoning effort is auto', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenMiMoModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenMiMoModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'mimo-v2-pro',
++        name: 'MiMo V2 Pro',
++        provider: SystemProviderIds.mimo
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'auto'
++        }
++      } as Assistant
++
++      const result = getReasoningEffort(assistant, model)
++      expect(result).toEqual({
++        thinking: {
++          type: 'enabled'
++        }
++      })
++    })
++
+     it('should handle DeepSeek hybrid inference models', async () => {
+       const { isReasoningModel, isDeepSeekHybridInferenceModel } = await import('@renderer/config/models')
+ 
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 1f2ace6..0bee602 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -205,6 +205,8 @@ export function buildProviderOptions(
+     case SystemProviderIds.ollama:
+       providerSpecificOptions = buildOllamaProviderOptions(assistant, model, capabilities)
+       break
++    case 'newapi':
++    case 'aihubmix':
+     case SystemProviderIds.gateway:
+       providerSpecificOptions = buildAIGatewayOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+       break
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 39dd317..808a7a4 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -174,6 +174,7 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     if (
+       isSupportedThinkingTokenDoubaoModel(model) ||
+       isSupportedThinkingTokenZhipuModel(model) ||
++      isSupportedThinkingTokenMiMoModel(model) ||
+       isSupportedThinkingTokenKimiModel(model)
+     ) {
+       if (provider.id === SystemProviderIds.cerebras) {
