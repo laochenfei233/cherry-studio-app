@@ -1,0 +1,441 @@
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index 38c5213..351538d 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -296,6 +296,45 @@ describe('formatProviderApiHost', () => {
+     })
+   })
+ 
++  describe('NewAPI provider', () => {
++    // Regression: previously isNewApiProvider was matched in formatProviderApiHost and forced
++    it('appends /v1 when matched by type "new-api"', () => {
++      const provider = makeProvider({
++        id: 'some-newapi-instance',
++        type: 'new-api',
++        apiHost: 'https://api.example.com'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.example.com/v1')
++    })
++
++    it('does not double-append /v1', () => {
++      const provider = makeProvider({
++        id: 'new-api',
++        type: 'openai',
++        apiHost: 'https://api.newapi.com/v1'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.newapi.com/v1')
++    })
++
++    it('skips version append when trailing sharp is present', () => {
++      const provider = makeProvider({
++        id: 'new-api',
++        type: 'openai',
++        apiHost: 'https://api.newapi.com/custom#'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.newapi.com/custom')
++    })
++  })
++
+   describe('Ollama provider', () => {
+     it('strips trailing /v1 and appends /api', () => {
+       const provider = makeProvider({
+diff --git a/src/aiCore/provider/extensions/index.ts b/src/aiCore/provider/extensions/index.ts
+index 7ce2ee3..76de2c0 100644
+--- a/src/aiCore/provider/extensions/index.ts
++++ b/src/aiCore/provider/extensions/index.ts
+@@ -3,6 +3,7 @@
+  * 用于支持运行时动态导入的 AI Providers
+  */
+ 
++import type { AmazonBedrockProvider } from '@ai-sdk/amazon-bedrock'
+ import { type AmazonBedrockProviderSettings, createAmazonBedrock } from '@ai-sdk/amazon-bedrock'
+ import { type CerebrasProviderSettings, createCerebras } from '@ai-sdk/cerebras'
+ import { createGateway, type GatewayProviderSettings } from '@ai-sdk/gateway'
+@@ -93,8 +94,20 @@ export const BedrockExtension = ProviderExtension.create({
+   name: 'bedrock',
+   aliases: ['aws-bedrock'] as const,
+   supportsImageGeneration: true,
+-  create: createAmazonBedrock
+-} as const satisfies ProviderExtensionConfig<AmazonBedrockProviderSettings, ProviderV3, 'bedrock'>)
++  create: createAmazonBedrock,
++  toolFactories: {
++    webSearch:
++      (provider: AmazonBedrockProvider) =>
++      (config: NonNullable<Parameters<AmazonBedrockProvider['tools']['webSearch_20260209']>[0]>) => ({
++        tools: { webSearch: provider.tools.webSearch_20260209(config) }
++      }),
++    urlContext:
++      (provider: AmazonBedrockProvider) =>
++      (config: NonNullable<Parameters<AmazonBedrockProvider['tools']['webFetch_20260209']>[0]>) => ({
++        tools: { urlContext: provider.tools.webFetch_20260209(config) }
++      })
++  }
++} as const satisfies ProviderExtensionConfig<AmazonBedrockProviderSettings, AmazonBedrockProvider, 'bedrock'>)
+ 
+ /**
+  * Perplexity Extension
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index af8719a..7b2fc4a 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -24,7 +24,6 @@ import {
+   isAzureOpenAIProvider,
+   isCherryAIProvider,
+   isGeminiProvider,
+-  isNewApiProvider,
+   isOllamaProvider,
+   isPerplexityProvider,
+   isSupportStreamOptionsProvider,
+@@ -85,7 +84,6 @@ export function formatProviderApiHost(provider: Provider): Provider {
+     },
+     { match: isCherryAIProvider, format: (p) => formatApiHost(p.apiHost, false) },
+     { match: isPerplexityProvider, format: (p) => formatApiHost(p.apiHost, false) },
+-    { match: isNewApiProvider, format: (p) => formatApiHost(p.apiHost, false) },
+     { match: isOllamaProvider, format: (p) => formatOllamaApiHost(p.apiHost) },
+     { match: isGeminiProvider, format: (p, av) => formatApiHost(p.apiHost, av, 'v1beta') },
+     { match: isAzureOpenAIProvider, format: (p) => formatApiHost(p.apiHost, false) },
+diff --git a/src/aiCore/services/__tests__/listModels.test.ts b/src/aiCore/services/__tests__/listModels.test.ts
+index 8bdc575..8b2a337 100644
+--- a/src/aiCore/services/__tests__/listModels.test.ts
++++ b/src/aiCore/services/__tests__/listModels.test.ts
+@@ -30,6 +30,7 @@ vi.mock('@shared/utils', () => ({
+ }))
+ 
+ const { listModels } = await import('../listModels')
++const { OllamaTagsResponseSchema } = await import('../schemas')
+ 
+ // === Real API response fixtures (captured 2026-03-19) ===
+ 
+@@ -388,6 +389,62 @@ describe('listModels', () => {
+     })
+   })
+ 
++  describe('Ollama', () => {
++    it('should accept null families in Ollama tags schema', () => {
++      const parsed = OllamaTagsResponseSchema.parse({
++        models: [
++          {
++            name: 'glm-5:cloud',
++            model: 'glm-5:cloud',
++            details: {
++              parent_model: '',
++              format: '',
++              family: '',
++              families: null,
++              parameter_size: '',
++              quantization_level: ''
++            }
++          }
++        ]
++      })
++
++      expect(parsed.models[0].details?.families).toBeUndefined()
++    })
++
++    it('should accept null families in real Ollama tag responses', async () => {
++      mockGetFromApi.mockResolvedValue({
++        value: {
++          models: [
++            {
++              name: 'glm-5:cloud',
++              model: 'glm-5:cloud',
++              details: {
++                parent_model: '',
++                format: '',
++                family: '',
++                families: null,
++                parameter_size: '',
++                quantization_level: ''
++              }
++            },
++            {
++              name: 'qwen3.5:9b',
++              model: 'qwen3.5:9b',
++              details: {
++                family: 'qwen35',
++                families: ['qwen35']
++              }
++            }
++          ]
++        }
++      })
++
++      const models = await listModels(makeProvider({ id: 'ollama', type: 'ollama', apiHost: 'http://localhost:11434' }))
++      assertValidModels(models)
++      expect(models.map((m) => m.id)).toEqual(['glm-5:cloud', 'qwen3.5:9b'])
++    })
++  })
++
+   describe('Unsupported providers', () => {
+     it.each([
+       ['gateway', { id: 'gateway' }],
+diff --git a/src/aiCore/services/schemas.ts b/src/aiCore/services/schemas.ts
+index c29db1b..e216d91 100644
+--- a/src/aiCore/services/schemas.ts
++++ b/src/aiCore/services/schemas.ts
+@@ -36,7 +36,11 @@ export const OllamaTagsResponseSchema = z.object({
+           parent_model: z.string().optional(),
+           format: z.string().optional(),
+           family: z.string().optional(),
+-          families: z.array(z.string()).optional(),
++          families: z
++            .array(z.string())
++            .nullable()
++            .optional()
++            .transform((v) => v ?? undefined),
+           parameter_size: z.string().optional(),
+           quantization_level: z.string().optional()
+         })
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 616269a..77b4c18 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -1123,13 +1123,132 @@ describe('options utils', () => {
+         })
+       })
+ 
++      it.each([
++        { providerId: 'newapi', providerName: 'NewAPI' },
++        { providerId: 'aihubmix', providerName: 'AiHubMix' },
++        { providerId: 'cherryin', providerName: 'CherryIN' }
++      ])(
++        'should route Gemini models to google providerOptions through $providerName',
++        async ({ providerId, providerName }) => {
++          const { getCustomParameters } = await import('../reasoning')
++          vi.mocked(getCustomParameters).mockReturnValue({
++            generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
++            imageConfig: { aspectRatio: '3:4', imageSize: '4K' }
++          })
++
++          const provider: Provider = {
++            id: providerId,
++            name: providerName,
++            type: 'openai',
++            models: [] as Model[]
++          } as Provider
++
++          const geminiModel: Model = {
++            id: 'gemini-3.1-flash-image-preview',
++            name: 'Gemini 3.1 Flash Image Preview',
++            provider: providerId
++          } as Model
++
++          const result = buildProviderOptions(mockAssistant, geminiModel, provider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: true
++          })
++
++          expect(result.providerOptions).toHaveProperty('google')
++          expect(result.providerOptions).not.toHaveProperty(providerId)
++          expect(result.providerOptions.google).toMatchObject({
++            generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
++            imageConfig: { aspectRatio: '3:4', imageSize: '4K' }
++          })
++        }
++      )
++
+       // Note: For proxy providers like aihubmix/newapi, users should write AI SDK provider ID (google/anthropic)
+       // instead of the Cherry Studio provider ID for custom parameters to work correctly
+ 
++      // model.endpoint_type takes priority over the short-name heuristic so the providerOptions key
++      // stays aligned with the SDK language-model class each proxy builds. Covers CherryIN's
++      // mixed-routing models (e.g. `minimax/minimax-m2.7` using the Anthropic endpoint) and
++      // NewAPI's endpoint_type-driven routing.
++      it.each([
++        {
++          providerId: 'cherryin',
++          modelId: 'minimax/minimax-m2.7',
++          endpointType: 'anthropic' as const,
++          expectedKey: 'anthropic'
++        },
++        {
++          providerId: 'cherryin',
++          modelId: 'custom-id',
++          endpointType: 'gemini' as const,
++          expectedKey: 'google'
++        },
++        {
++          providerId: 'cherryin',
++          modelId: 'gpt-5',
++          endpointType: 'openai-response' as const,
++          expectedKey: 'openai'
++        },
++        {
++          providerId: 'cherryin',
++          modelId: 'qwen-max',
++          endpointType: 'openai' as const,
++          expectedKey: 'openai-compatible'
++        },
++        {
++          providerId: 'newapi',
++          modelId: 'proxy/model',
++          endpointType: 'anthropic' as const,
++          expectedKey: 'anthropic'
++        },
++        {
++          providerId: 'newapi',
++          modelId: 'proxy/model',
++          endpointType: 'openai' as const,
++          expectedKey: 'openai-compatible'
++        }
++      ])(
++        'should honor model.endpoint_type=$endpointType for $providerId and produce providerOptions.$expectedKey',
++        async ({ providerId, modelId, endpointType, expectedKey }) => {
++          const { getCustomParameters } = await import('../reasoning')
++          vi.mocked(getCustomParameters).mockReturnValue({
++            customEndpointParam: 'custom_value'
++          })
++
++          const provider: Provider = {
++            id: providerId,
++            name: providerId,
++            type: 'openai',
++            models: [] as Model[]
++          } as Provider
++
++          const model: Model = {
++            id: modelId,
++            name: modelId,
++            provider: providerId,
++            endpoint_type: endpointType
++          } as Model
++
++          const result = buildProviderOptions(mockAssistant, model, provider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: false
++          })
++
++          expect(result.providerOptions).toHaveProperty(expectedKey)
++          expect(result.providerOptions).not.toHaveProperty(providerId)
++          expect(result.providerOptions[expectedKey]).toMatchObject({
++            customEndpointParam: 'custom_value'
++          })
++        }
++      )
++
+       it('should handle cherryin fallback to openai-compatible with custom parameters', async () => {
+         const { getCustomParameters } = await import('../reasoning')
+ 
+-        // Mock cherryin provider that falls back to openai-compatible (default case)
++        // Mock cherryin provider with a non-Gemini/Claude/GPT/Grok model that falls back
++        // to openai-compatible via buildAIGatewayOptions
+         const cherryinProvider = {
+           id: 'cherryin',
+           name: 'Cherry In',
+@@ -1156,10 +1275,11 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        // When cherryin falls back to default case, it should use rawProviderId (cherryin)
+-        // User's cherryin params should merge with the provider options
+-        expect(result.providerOptions).toHaveProperty('cherryin')
+-        expect(result.providerOptions.cherryin).toMatchObject({
++        // Non-Gemini/Claude/GPT/Grok models fall back to openai-compatible via buildAIGatewayOptions.
++        // User's custom params (not matching any AI SDK provider ID) merge into the primary bucket.
++        expect(result.providerOptions).toHaveProperty('openai-compatible')
++        expect(result.providerOptions).not.toHaveProperty('cherryin')
++        expect(result.providerOptions['openai-compatible']).toMatchObject({
+           customCherryinOption: 'cherryin_value'
+         })
+       })
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 1f2ace6..ec1e488 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -192,19 +192,12 @@ export function buildProviderOptions(
+     case 'bedrock':
+       providerSpecificOptions = buildBedrockProviderOptions(assistant, model, capabilities)
+       break
+-    case 'cherryin':
+-      providerSpecificOptions = buildCherryInProviderOptions(
+-        assistant,
+-        model,
+-        capabilities,
+-        actualProvider,
+-        serviceTier,
+-        textVerbosity
+-      )
+-      break
+     case SystemProviderIds.ollama:
+       providerSpecificOptions = buildOllamaProviderOptions(assistant, model, capabilities)
+       break
++    case 'cherryin':
++    case 'newapi':
++    case 'aihubmix':
+     case SystemProviderIds.gateway:
+       providerSpecificOptions = buildAIGatewayOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+       break
+@@ -462,29 +455,6 @@ function buildXAIProviderOptions(
+   }
+ }
+ 
+-function buildCherryInProviderOptions(
+-  assistant: Assistant,
+-  model: Model,
+-  capabilities: Pick<ProviderCapabilities, 'enableReasoning' | 'enableWebSearch' | 'enableGenerateImage'>,
+-  actualProvider: Provider,
+-  serviceTier: OpenAIServiceTier,
+-  textVerbosity: OpenAIVerbosity
+-): Record<string, OpenAIResponsesProviderOptions | AnthropicProviderOptions | GoogleGenerativeAIProviderOptions> {
+-  switch (actualProvider.type) {
+-    case 'openai':
+-      return buildGenericProviderOptions('cherryin', assistant, model, capabilities)
+-    case 'openai-response':
+-      return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+-    case 'anthropic':
+-      return buildAnthropicProviderOptions(assistant, model, capabilities)
+-    case 'gemini':
+-      return buildGeminiProviderOptions(assistant, model, capabilities)
+-
+-    default:
+-      return buildGenericProviderOptions('cherryin', assistant, model, capabilities)
+-  }
+-}
+-
+ /**
+  * Build Bedrock providerOptions
+  */
+@@ -591,6 +561,32 @@ function buildAIGatewayOptions(
+   | GoogleGenerativeAIProviderOptions
+   | Record<string, unknown>
+ > {
++  // Proxy providers (CherryIN, NewAPI) may annotate model.endpoint_type to force a specific protocol.
++  // Keys here must stay aligned with the language-model class each SDK layer builds, otherwise
++  // AI SDK drops the custom provider options. See:
++  //   - packages/ai-sdk-provider/src/cherryin-provider.ts (createChatModel)
++  //   - src/aiCore/provider/custom/newapi-provider.ts (createChatModel)
++  //
++  //   endpoint_type      | SDK language-model class           | AI SDK providerOptions key
++  //   -------------------+------------------------------------+---------------------------
++  //   'anthropic'        | AnthropicMessagesLanguageModel     | anthropic
++  //   'gemini'           | GoogleGenerativeAILanguageModel    | google
++  //   'openai-response'  | OpenAIResponsesLanguageModel       | openai
++  //   'openai'           | OpenAICompatibleChatLanguageModel  | openai-compatible
++  //   'image-generation' | OpenAICompatibleChatLanguageModel  | openai-compatible
++  switch (model.endpoint_type) {
++    case 'anthropic':
++      return buildAnthropicProviderOptions(assistant, model, capabilities)
++    case 'gemini':
++      return buildGeminiProviderOptions(assistant, model, capabilities)
++    case 'openai-response':
++      return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
++    case 'openai':
++    case 'image-generation':
++      return buildGenericProviderOptions('openai-compatible', assistant, model, capabilities)
++  }
++
++  // Fallback: model-name heuristic (covers Vercel Gateway, AiHubMix, and untagged models)
+   if (isAnthropicModel(model)) {
+     return buildAnthropicProviderOptions(assistant, model, capabilities)
+   } else if (isOpenAIModel(model)) {
