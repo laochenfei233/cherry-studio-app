@@ -1,0 +1,829 @@
+diff --git a/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+index 9bf22e6..8cdadc5 100644
+--- a/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
++++ b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+@@ -1,225 +1,45 @@
+-/**
+- * Tests for parameterBuilder maxToolCalls functionality
+- * These tests verify the maxToolCalls calculation and validation logic in isolation
+- */
+ import { describe, expect, it } from 'vitest'
+ 
+-// Mirror the constants from parameterBuilder.ts
+-const MIN_TOOL_CALLS = 1
+-const MAX_TOOL_CALLS = 100
+-const DEFAULT_MAX_TOOL_CALLS = 20
+-const DEFAULT_ENABLE_MAX_TOOL_CALLS = true
++import { getEffectiveMaxToolCalls } from '../parameterBuilder'
+ 
+-/**
+- * Validates and clamps maxToolCalls to valid range
+- * Mirrors the logic in parameterBuilder.ts
+- */
+-function validateMaxToolCalls(value: number | undefined): number {
+-  if (value === undefined || value < MIN_TOOL_CALLS || value > MAX_TOOL_CALLS) {
+-    return DEFAULT_MAX_TOOL_CALLS
+-  }
+-  return value
+-}
+-
+-/**
+- * Calculate the effective max tool calls based on assistant settings
+- * Mirrors the logic in parameterBuilder.ts
+- */
+-function calculateEffectiveMaxToolCalls(settings?: { maxToolCalls?: number; enableMaxToolCalls?: boolean }): {
+-  stopWhen: number | null
+-  maxToolCalls: number
+-} {
+-  const enableMaxToolCalls = settings?.enableMaxToolCalls ?? DEFAULT_ENABLE_MAX_TOOL_CALLS
+-
+-  if (!enableMaxToolCalls) {
+-    // When disabled, don't pass stopWhen (return null to indicate no stopWhen)
+-    return { stopWhen: null, maxToolCalls: DEFAULT_MAX_TOOL_CALLS }
+-  }
+-
+-  // When enabled, validate and use user-defined value
+-  const maxToolCalls = validateMaxToolCalls(settings?.maxToolCalls)
+-  return { stopWhen: maxToolCalls, maxToolCalls }
+-}
+-
+-describe('validateMaxToolCalls', () => {
+-  it('returns valid values as-is', () => {
+-    expect(validateMaxToolCalls(1)).toBe(1)
+-    expect(validateMaxToolCalls(50)).toBe(50)
+-    expect(validateMaxToolCalls(100)).toBe(100)
+-  })
+-
+-  it('clamps values above 100 to default', () => {
+-    const result = validateMaxToolCalls(999)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
+-  })
+-
+-  it('clamps zero to default', () => {
+-    const result = validateMaxToolCalls(0)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
+-  })
+-
+-  it('clamps negative values to default', () => {
+-    const result = validateMaxToolCalls(-5)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++describe('getEffectiveMaxToolCalls', () => {
++  it('uses the default cap when settings are missing', () => {
++    expect(getEffectiveMaxToolCalls()).toBe(20)
+   })
+ 
+-  it('returns default when value is undefined', () => {
+-    const result = validateMaxToolCalls(undefined)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
+-  })
+-})
+-
+-describe('maxToolCalls calculation logic', () => {
+-  describe('default behavior', () => {
+-    it('uses default value 20 when settings are undefined', () => {
+-      const result = calculateEffectiveMaxToolCalls(undefined)
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-
+-    it('uses default value 20 when settings is empty object', () => {
+-      const result = calculateEffectiveMaxToolCalls({})
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-
+-    it('uses default value 20 when maxToolCalls is undefined', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true
+-        // maxToolCalls is undefined
+-      })
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-
+-    it('uses custom value when maxToolCalls is set and enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
++  it('uses the default cap when the switch is off', () => {
++    expect(
++      getEffectiveMaxToolCalls({
++        enableMaxToolCalls: false,
+         maxToolCalls: 50
+       })
+-      expect(result.maxToolCalls).toBe(50)
+-      expect(result.stopWhen).toBe(50)
+-    })
++    ).toBe(20)
+   })
+ 
+-  describe('custom values when enabled', () => {
+-    it('uses custom value when enableMaxToolCalls is true and maxToolCalls is set', () => {
+-      const result = calculateEffectiveMaxToolCalls({
++  it('uses a custom cap when enabled', () => {
++    expect(
++      getEffectiveMaxToolCalls({
+         enableMaxToolCalls: true,
+         maxToolCalls: 50
+       })
+-      expect(result.stopWhen).toBe(50)
+-    })
+-
+-    it('uses custom value at minimum boundary (1)', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 1
+-      })
+-      expect(result.stopWhen).toBe(1)
+-    })
+-
+-    it('uses custom value at maximum boundary (100)', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 100
+-      })
+-      expect(result.stopWhen).toBe(100)
+-    })
+-
+-    it('clamps values above 100 to default when enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 999
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('clamps zero to default when enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 0
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('clamps negative values to default when enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: -5
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
++    ).toBe(50)
+   })
+ 
+-  describe('disabled behavior', () => {
+-    it('does not pass stopWhen when enableMaxToolCalls is false', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: false,
+-        maxToolCalls: 50
+-      })
+-      // When disabled, stopWhen should be null (indicating no stopWhen passed)
+-      expect(result.stopWhen).toBeNull()
+-    })
+-
+-    it('does not pass stopWhen when both enableMaxToolCalls is false and maxToolCalls is undefined', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: false
+-      })
+-      expect(result.stopWhen).toBeNull()
+-    })
+-
+-    it('falls back to default when disabled with invalid maxToolCalls', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: false,
++  it('clamps invalid custom values back to the default cap', () => {
++    expect(
++      getEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
+         maxToolCalls: 999
+       })
+-      // When disabled, maxToolCalls should still be default (for reference)
+-      expect(result.maxToolCalls).toBe(DEFAULT_MAX_TOOL_CALLS)
+-      expect(result.stopWhen).toBeNull()
+-    })
++    ).toBe(20)
+   })
+ 
+-  describe('backward compatibility', () => {
+-    it('maintains backward compatibility - existing assistants without new fields use default', () => {
+-      // Simulate an old assistant without the new fields
+-      const oldSettings = {
+-        // Old assistants don't have enableMaxToolCalls or maxToolCalls
++  it('uses the default cap for old assistants without the new fields', () => {
++    expect(
++      getEffectiveMaxToolCalls({
+         temperature: 0.7,
+         contextCount: 10
+-      }
+-      const result = calculateEffectiveMaxToolCalls(
+-        oldSettings as { maxToolCalls?: number; enableMaxToolCalls?: boolean }
+-      )
+-      // Should default to enabled with 20 for backward compatibility
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-  })
+-
+-  describe('security - invalid values from imported/migrated settings', () => {
+-    it('validates extremely large values from imported settings', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 999999
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('validates negative values from imported settings', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: -100
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('validates zero from imported settings', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 0
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
++      } as { maxToolCalls?: number; enableMaxToolCalls?: boolean })
++    ).toBe(20)
+   })
+ })
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 4b7a2a8..77afcc1 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -59,6 +59,16 @@ function validateMaxToolCalls(value: number | undefined): number {
+   return value
+ }
+ 
++export function getEffectiveMaxToolCalls(settings?: { maxToolCalls?: number; enableMaxToolCalls?: boolean }): number {
++  const enableMaxToolCalls = settings?.enableMaxToolCalls ?? DEFAULT_ASSISTANT_SETTINGS.enableMaxToolCalls
++
++  if (!enableMaxToolCalls) {
++    return DEFAULT_ASSISTANT_SETTINGS.maxToolCalls
++  }
++
++  return validateMaxToolCalls(settings?.maxToolCalls)
++}
++
+ function mapVertexAIGatewayModelToProviderId(model: Model): AppProviderId | undefined {
+   if (isAnthropicModel(model)) {
+     return 'anthropic'
+@@ -192,10 +202,9 @@ export async function buildStreamTextParams(
+   // are extracted from custom parameters and passed directly to streamText()
+   // instead of being placed in providerOptions
+ 
+-  // Get max tool calls from assistant settings
+-  // When enabled, validate and use user-defined value (1-100)
+-  // When disabled, don't pass stopWhen - let AI SDK use its own default
+-  const enableMaxToolCalls = assistant.settings?.enableMaxToolCalls ?? DEFAULT_ASSISTANT_SETTINGS.enableMaxToolCalls
++  // AI SDK defaults to stepCountIs(1), which would stop after the first tool call.
++  // Always pass an explicit cap so native tool use can continue across steps.
++  const maxToolCalls = getEffectiveMaxToolCalls(assistant.settings)
+ 
+   const params: StreamTextParams = {
+     messages: sdkMessages,
+@@ -210,12 +219,7 @@ export async function buildStreamTextParams(
+     maxRetries: 0
+   }
+ 
+-  // Only add stopWhen when explicitly enabled and validated
+-  if (enableMaxToolCalls) {
+-    const maxToolCalls = validateMaxToolCalls(assistant.settings?.maxToolCalls)
+-    params.stopWhen = stepCountIs(maxToolCalls)
+-  }
+-  // When disabled, don't pass stopWhen - let AI SDK use its own default
++  params.stopWhen = stepCountIs(maxToolCalls)
+ 
+   if (tools) {
+     params.tools = tools
+diff --git a/src/aiCore/provider/__tests__/providerConfig.test.ts b/src/aiCore/provider/__tests__/providerConfig.test.ts
+index 38c5213..351538d 100644
+--- a/src/aiCore/provider/__tests__/providerConfig.test.ts
++++ b/src/aiCore/provider/__tests__/providerConfig.test.ts
+@@ -296,6 +296,45 @@ describe('formatProviderApiHost', () => {
+     })
+   })
+ 
++  describe('NewAPI provider', () => {
++    // Regression: previously isNewApiProvider was matched in formatProviderApiHost and forced
++    it('appends /v1 when matched by type "new-api"', () => {
++      const provider = makeProvider({
++        id: 'some-newapi-instance',
++        type: 'new-api',
++        apiHost: 'https://api.example.com'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.example.com/v1')
++    })
++
++    it('does not double-append /v1', () => {
++      const provider = makeProvider({
++        id: 'new-api',
++        type: 'openai',
++        apiHost: 'https://api.newapi.com/v1'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.newapi.com/v1')
++    })
++
++    it('skips version append when trailing sharp is present', () => {
++      const provider = makeProvider({
++        id: 'new-api',
++        type: 'openai',
++        apiHost: 'https://api.newapi.com/custom#'
++      })
++
++      const result = formatProviderApiHost(provider)
++
++      expect(result.apiHost).toBe('https://api.newapi.com/custom')
++    })
++  })
++
+   describe('Ollama provider', () => {
+     it('strips trailing /v1 and appends /api', () => {
+       const provider = makeProvider({
+diff --git a/src/aiCore/provider/custom/aihubmix-provider.ts b/src/aiCore/provider/custom/aihubmix-provider.ts
+index 67c08ee..a1de859 100644
+--- a/src/aiCore/provider/custom/aihubmix-provider.ts
++++ b/src/aiCore/provider/custom/aihubmix-provider.ts
+@@ -61,7 +61,13 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+       baseURL,
+       headers: () => ({ ...headers, 'x-api-key': resolveApiKey() }),
+       fetch: customFetch,
+-      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] })
++      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] }),
++      // AiHubMix may route Claude models to Vertex/Bedrock backends, which reject the
++      // `structured-outputs-2025-11-13` beta header added by @ai-sdk/anthropic for
++      // claude-opus-4-6 / claude-sonnet-4-6 / claude-*-4-5 / claude-opus-4-1. Falling
++      // back to function-tool-based structured outputs keeps tool use (incl. MCP) working
++      // across all downstream backends. See issue #14375.
++      supportsNativeStructuredOutput: false
+     })
+   }
+ 
+diff --git a/src/aiCore/provider/custom/newapi-provider.ts b/src/aiCore/provider/custom/newapi-provider.ts
+index 92e8845..6cef9e2 100644
+--- a/src/aiCore/provider/custom/newapi-provider.ts
++++ b/src/aiCore/provider/custom/newapi-provider.ts
+@@ -68,7 +68,13 @@ export function createNewApi(options: NewApiProviderSettings = {}): NewApiProvid
+       baseURL,
+       headers: () => ({ ...headers, 'x-api-key': resolveApiKey() }),
+       fetch: customFetch,
+-      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] })
++      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] }),
++      // NewAPI may route Claude models to Vertex/Bedrock backends, which reject the
++      // `structured-outputs-2025-11-13` beta header added by @ai-sdk/anthropic for
++      // claude-opus-4-6 / claude-sonnet-4-6 / claude-*-4-5 / claude-opus-4-1. Falling
++      // back to function-tool-based structured outputs keeps tool use (incl. MCP) working
++      // across all downstream backends. See issue #14375.
++      supportsNativeStructuredOutput: false
+     })
+   }
+ 
+diff --git a/src/aiCore/provider/extensions/index.ts b/src/aiCore/provider/extensions/index.ts
+index 7ce2ee3..76de2c0 100644
+--- a/src/aiCore/provider/extensions/index.ts
++++ b/src/aiCore/provider/extensions/index.ts
+@@ -3,6 +3,7 @@
+  * 用于支持运行时动态导入的 AI Providers
+  */
+ 
++import type { AmazonBedrockProvider } from '@ai-sdk/amazon-bedrock'
+ import { type AmazonBedrockProviderSettings, createAmazonBedrock } from '@ai-sdk/amazon-bedrock'
+ import { type CerebrasProviderSettings, createCerebras } from '@ai-sdk/cerebras'
+ import { createGateway, type GatewayProviderSettings } from '@ai-sdk/gateway'
+@@ -93,8 +94,20 @@ export const BedrockExtension = ProviderExtension.create({
+   name: 'bedrock',
+   aliases: ['aws-bedrock'] as const,
+   supportsImageGeneration: true,
+-  create: createAmazonBedrock
+-} as const satisfies ProviderExtensionConfig<AmazonBedrockProviderSettings, ProviderV3, 'bedrock'>)
++  create: createAmazonBedrock,
++  toolFactories: {
++    webSearch:
++      (provider: AmazonBedrockProvider) =>
++      (config: NonNullable<Parameters<AmazonBedrockProvider['tools']['webSearch_20260209']>[0]>) => ({
++        tools: { webSearch: provider.tools.webSearch_20260209(config) }
++      }),
++    urlContext:
++      (provider: AmazonBedrockProvider) =>
++      (config: NonNullable<Parameters<AmazonBedrockProvider['tools']['webFetch_20260209']>[0]>) => ({
++        tools: { urlContext: provider.tools.webFetch_20260209(config) }
++      })
++  }
++} as const satisfies ProviderExtensionConfig<AmazonBedrockProviderSettings, AmazonBedrockProvider, 'bedrock'>)
+ 
+ /**
+  * Perplexity Extension
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index af8719a..03f19a1 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -24,7 +24,6 @@ import {
+   isAzureOpenAIProvider,
+   isCherryAIProvider,
+   isGeminiProvider,
+-  isNewApiProvider,
+   isOllamaProvider,
+   isPerplexityProvider,
+   isSupportStreamOptionsProvider,
+@@ -85,7 +84,6 @@ export function formatProviderApiHost(provider: Provider): Provider {
+     },
+     { match: isCherryAIProvider, format: (p) => formatApiHost(p.apiHost, false) },
+     { match: isPerplexityProvider, format: (p) => formatApiHost(p.apiHost, false) },
+-    { match: isNewApiProvider, format: (p) => formatApiHost(p.apiHost, false) },
+     { match: isOllamaProvider, format: (p) => formatOllamaApiHost(p.apiHost) },
+     { match: isGeminiProvider, format: (p, av) => formatApiHost(p.apiHost, av, 'v1beta') },
+     { match: isAzureOpenAIProvider, format: (p) => formatApiHost(p.apiHost, false) },
+@@ -211,17 +209,20 @@ function buildOllamaConfig(ctx: BuilderContext): ProviderConfig<'ollama'> {
+ 
+ function buildBedrockConfig(ctx: BuilderContext): ProviderConfig<'bedrock'> {
+   const authType = getAwsBedrockAuthType()
+-  const region = getAwsBedrockRegion()
++  const region = getAwsBedrockRegion().trim() || undefined
+ 
+   const base = { providerId: 'bedrock' as const, endpoint: ctx.endpoint }
+ 
++  const baseURL = ctx.baseConfig.baseURL || undefined
++
+   if (authType === 'apiKey') {
+-    return { ...base, providerSettings: { ...ctx.baseConfig, region, apiKey: getAwsBedrockApiKey() } }
++    return { ...base, providerSettings: { ...ctx.baseConfig, baseURL, region, apiKey: getAwsBedrockApiKey() } }
+   }
+   return {
+     ...base,
+     providerSettings: {
+       ...ctx.baseConfig,
++      baseURL,
+       region,
+       accessKeyId: getAwsBedrockAccessKeyId(),
+       secretAccessKey: getAwsBedrockSecretAccessKey()
+diff --git a/src/aiCore/services/__tests__/listModels.test.ts b/src/aiCore/services/__tests__/listModels.test.ts
+index 8bdc575..8b2a337 100644
+--- a/src/aiCore/services/__tests__/listModels.test.ts
++++ b/src/aiCore/services/__tests__/listModels.test.ts
+@@ -30,6 +30,7 @@ vi.mock('@shared/utils', () => ({
+ }))
+ 
+ const { listModels } = await import('../listModels')
++const { OllamaTagsResponseSchema } = await import('../schemas')
+ 
+ // === Real API response fixtures (captured 2026-03-19) ===
+ 
+@@ -388,6 +389,62 @@ describe('listModels', () => {
+     })
+   })
+ 
++  describe('Ollama', () => {
++    it('should accept null families in Ollama tags schema', () => {
++      const parsed = OllamaTagsResponseSchema.parse({
++        models: [
++          {
++            name: 'glm-5:cloud',
++            model: 'glm-5:cloud',
++            details: {
++              parent_model: '',
++              format: '',
++              family: '',
++              families: null,
++              parameter_size: '',
++              quantization_level: ''
++            }
++          }
++        ]
++      })
++
++      expect(parsed.models[0].details?.families).toBeUndefined()
++    })
++
++    it('should accept null families in real Ollama tag responses', async () => {
++      mockGetFromApi.mockResolvedValue({
++        value: {
++          models: [
++            {
++              name: 'glm-5:cloud',
++              model: 'glm-5:cloud',
++              details: {
++                parent_model: '',
++                format: '',
++                family: '',
++                families: null,
++                parameter_size: '',
++                quantization_level: ''
++              }
++            },
++            {
++              name: 'qwen3.5:9b',
++              model: 'qwen3.5:9b',
++              details: {
++                family: 'qwen35',
++                families: ['qwen35']
++              }
++            }
++          ]
++        }
++      })
++
++      const models = await listModels(makeProvider({ id: 'ollama', type: 'ollama', apiHost: 'http://localhost:11434' }))
++      assertValidModels(models)
++      expect(models.map((m) => m.id)).toEqual(['glm-5:cloud', 'qwen3.5:9b'])
++    })
++  })
++
+   describe('Unsupported providers', () => {
+     it.each([
+       ['gateway', { id: 'gateway' }],
+diff --git a/src/aiCore/services/schemas.ts b/src/aiCore/services/schemas.ts
+index c29db1b..e216d91 100644
+--- a/src/aiCore/services/schemas.ts
++++ b/src/aiCore/services/schemas.ts
+@@ -36,7 +36,11 @@ export const OllamaTagsResponseSchema = z.object({
+           parent_model: z.string().optional(),
+           format: z.string().optional(),
+           family: z.string().optional(),
+-          families: z.array(z.string()).optional(),
++          families: z
++            .array(z.string())
++            .nullable()
++            .optional()
++            .transform((v) => v ?? undefined),
+           parameter_size: z.string().optional(),
+           quantization_level: z.string().optional()
+         })
+diff --git a/src/aiCore/types/merged.ts b/src/aiCore/types/merged.ts
+index 398476a..19b677c 100644
+--- a/src/aiCore/types/merged.ts
++++ b/src/aiCore/types/merged.ts
+@@ -75,6 +75,7 @@ function buildAppProviderIds(): ProviderIdsMap {
+     if (config.variants) {
+       config.variants.forEach((variant) => {
+         // 变体自反映射：'azure-responses' -> 'azure-responses'
++        // oxlint-disable-next-line typescript/no-unnecessary-type-assertion
+         const variantId = `${name}-${variant.suffix}` as KnownAppProviderId
+         ;(map as Record<string, KnownAppProviderId>)[variantId] = variantId
+       })
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 616269a..77b4c18 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -1123,13 +1123,132 @@ describe('options utils', () => {
+         })
+       })
+ 
++      it.each([
++        { providerId: 'newapi', providerName: 'NewAPI' },
++        { providerId: 'aihubmix', providerName: 'AiHubMix' },
++        { providerId: 'cherryin', providerName: 'CherryIN' }
++      ])(
++        'should route Gemini models to google providerOptions through $providerName',
++        async ({ providerId, providerName }) => {
++          const { getCustomParameters } = await import('../reasoning')
++          vi.mocked(getCustomParameters).mockReturnValue({
++            generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
++            imageConfig: { aspectRatio: '3:4', imageSize: '4K' }
++          })
++
++          const provider: Provider = {
++            id: providerId,
++            name: providerName,
++            type: 'openai',
++            models: [] as Model[]
++          } as Provider
++
++          const geminiModel: Model = {
++            id: 'gemini-3.1-flash-image-preview',
++            name: 'Gemini 3.1 Flash Image Preview',
++            provider: providerId
++          } as Model
++
++          const result = buildProviderOptions(mockAssistant, geminiModel, provider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: true
++          })
++
++          expect(result.providerOptions).toHaveProperty('google')
++          expect(result.providerOptions).not.toHaveProperty(providerId)
++          expect(result.providerOptions.google).toMatchObject({
++            generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
++            imageConfig: { aspectRatio: '3:4', imageSize: '4K' }
++          })
++        }
++      )
++
+       // Note: For proxy providers like aihubmix/newapi, users should write AI SDK provider ID (google/anthropic)
+       // instead of the Cherry Studio provider ID for custom parameters to work correctly
+ 
++      // model.endpoint_type takes priority over the short-name heuristic so the providerOptions key
++      // stays aligned with the SDK language-model class each proxy builds. Covers CherryIN's
++      // mixed-routing models (e.g. `minimax/minimax-m2.7` using the Anthropic endpoint) and
++      // NewAPI's endpoint_type-driven routing.
++      it.each([
++        {
++          providerId: 'cherryin',
++          modelId: 'minimax/minimax-m2.7',
++          endpointType: 'anthropic' as const,
++          expectedKey: 'anthropic'
++        },
++        {
++          providerId: 'cherryin',
++          modelId: 'custom-id',
++          endpointType: 'gemini' as const,
++          expectedKey: 'google'
++        },
++        {
++          providerId: 'cherryin',
++          modelId: 'gpt-5',
++          endpointType: 'openai-response' as const,
++          expectedKey: 'openai'
++        },
++        {
++          providerId: 'cherryin',
++          modelId: 'qwen-max',
++          endpointType: 'openai' as const,
++          expectedKey: 'openai-compatible'
++        },
++        {
++          providerId: 'newapi',
++          modelId: 'proxy/model',
++          endpointType: 'anthropic' as const,
++          expectedKey: 'anthropic'
++        },
++        {
++          providerId: 'newapi',
++          modelId: 'proxy/model',
++          endpointType: 'openai' as const,
++          expectedKey: 'openai-compatible'
++        }
++      ])(
++        'should honor model.endpoint_type=$endpointType for $providerId and produce providerOptions.$expectedKey',
++        async ({ providerId, modelId, endpointType, expectedKey }) => {
++          const { getCustomParameters } = await import('../reasoning')
++          vi.mocked(getCustomParameters).mockReturnValue({
++            customEndpointParam: 'custom_value'
++          })
++
++          const provider: Provider = {
++            id: providerId,
++            name: providerId,
++            type: 'openai',
++            models: [] as Model[]
++          } as Provider
++
++          const model: Model = {
++            id: modelId,
++            name: modelId,
++            provider: providerId,
++            endpoint_type: endpointType
++          } as Model
++
++          const result = buildProviderOptions(mockAssistant, model, provider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: false
++          })
++
++          expect(result.providerOptions).toHaveProperty(expectedKey)
++          expect(result.providerOptions).not.toHaveProperty(providerId)
++          expect(result.providerOptions[expectedKey]).toMatchObject({
++            customEndpointParam: 'custom_value'
++          })
++        }
++      )
++
+       it('should handle cherryin fallback to openai-compatible with custom parameters', async () => {
+         const { getCustomParameters } = await import('../reasoning')
+ 
+-        // Mock cherryin provider that falls back to openai-compatible (default case)
++        // Mock cherryin provider with a non-Gemini/Claude/GPT/Grok model that falls back
++        // to openai-compatible via buildAIGatewayOptions
+         const cherryinProvider = {
+           id: 'cherryin',
+           name: 'Cherry In',
+@@ -1156,10 +1275,11 @@ describe('options utils', () => {
+           enableGenerateImage: false
+         })
+ 
+-        // When cherryin falls back to default case, it should use rawProviderId (cherryin)
+-        // User's cherryin params should merge with the provider options
+-        expect(result.providerOptions).toHaveProperty('cherryin')
+-        expect(result.providerOptions.cherryin).toMatchObject({
++        // Non-Gemini/Claude/GPT/Grok models fall back to openai-compatible via buildAIGatewayOptions.
++        // User's custom params (not matching any AI SDK provider ID) merge into the primary bucket.
++        expect(result.providerOptions).toHaveProperty('openai-compatible')
++        expect(result.providerOptions).not.toHaveProperty('cherryin')
++        expect(result.providerOptions['openai-compatible']).toMatchObject({
+           customCherryinOption: 'cherryin_value'
+         })
+       })
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index 1f2ace6..ec1e488 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -192,19 +192,12 @@ export function buildProviderOptions(
+     case 'bedrock':
+       providerSpecificOptions = buildBedrockProviderOptions(assistant, model, capabilities)
+       break
+-    case 'cherryin':
+-      providerSpecificOptions = buildCherryInProviderOptions(
+-        assistant,
+-        model,
+-        capabilities,
+-        actualProvider,
+-        serviceTier,
+-        textVerbosity
+-      )
+-      break
+     case SystemProviderIds.ollama:
+       providerSpecificOptions = buildOllamaProviderOptions(assistant, model, capabilities)
+       break
++    case 'cherryin':
++    case 'newapi':
++    case 'aihubmix':
+     case SystemProviderIds.gateway:
+       providerSpecificOptions = buildAIGatewayOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+       break
+@@ -462,29 +455,6 @@ function buildXAIProviderOptions(
+   }
+ }
+ 
+-function buildCherryInProviderOptions(
+-  assistant: Assistant,
+-  model: Model,
+-  capabilities: Pick<ProviderCapabilities, 'enableReasoning' | 'enableWebSearch' | 'enableGenerateImage'>,
+-  actualProvider: Provider,
+-  serviceTier: OpenAIServiceTier,
+-  textVerbosity: OpenAIVerbosity
+-): Record<string, OpenAIResponsesProviderOptions | AnthropicProviderOptions | GoogleGenerativeAIProviderOptions> {
+-  switch (actualProvider.type) {
+-    case 'openai':
+-      return buildGenericProviderOptions('cherryin', assistant, model, capabilities)
+-    case 'openai-response':
+-      return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
+-    case 'anthropic':
+-      return buildAnthropicProviderOptions(assistant, model, capabilities)
+-    case 'gemini':
+-      return buildGeminiProviderOptions(assistant, model, capabilities)
+-
+-    default:
+-      return buildGenericProviderOptions('cherryin', assistant, model, capabilities)
+-  }
+-}
+-
+ /**
+  * Build Bedrock providerOptions
+  */
+@@ -591,6 +561,32 @@ function buildAIGatewayOptions(
+   | GoogleGenerativeAIProviderOptions
+   | Record<string, unknown>
+ > {
++  // Proxy providers (CherryIN, NewAPI) may annotate model.endpoint_type to force a specific protocol.
++  // Keys here must stay aligned with the language-model class each SDK layer builds, otherwise
++  // AI SDK drops the custom provider options. See:
++  //   - packages/ai-sdk-provider/src/cherryin-provider.ts (createChatModel)
++  //   - src/aiCore/provider/custom/newapi-provider.ts (createChatModel)
++  //
++  //   endpoint_type      | SDK language-model class           | AI SDK providerOptions key
++  //   -------------------+------------------------------------+---------------------------
++  //   'anthropic'        | AnthropicMessagesLanguageModel     | anthropic
++  //   'gemini'           | GoogleGenerativeAILanguageModel    | google
++  //   'openai-response'  | OpenAIResponsesLanguageModel       | openai
++  //   'openai'           | OpenAICompatibleChatLanguageModel  | openai-compatible
++  //   'image-generation' | OpenAICompatibleChatLanguageModel  | openai-compatible
++  switch (model.endpoint_type) {
++    case 'anthropic':
++      return buildAnthropicProviderOptions(assistant, model, capabilities)
++    case 'gemini':
++      return buildGeminiProviderOptions(assistant, model, capabilities)
++    case 'openai-response':
++      return buildOpenAIProviderOptions(assistant, model, capabilities, serviceTier, textVerbosity)
++    case 'openai':
++    case 'image-generation':
++      return buildGenericProviderOptions('openai-compatible', assistant, model, capabilities)
++  }
++
++  // Fallback: model-name heuristic (covers Vercel Gateway, AiHubMix, and untagged models)
+   if (isAnthropicModel(model)) {
+     return buildAnthropicProviderOptions(assistant, model, capabilities)
+   } else if (isOpenAIModel(model)) {
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 808a7a4..bc33c0a 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -670,7 +670,7 @@ function getFallbackBudgetTokens(reasoningEffort: string | undefined): number {
+ export function getAnthropicReasoningParams(
+   assistant: Assistant,
+   model: Model
+-): Pick<AnthropicProviderOptions, 'thinking' | 'effort'> {
++): { thinking?: AnthropicProviderOptions['thinking']; effort?: Exclude<AnthropicProviderOptions['effort'], 'xhigh'> } {
+   if (!isReasoningModel(model)) {
+     return {}
+   }
