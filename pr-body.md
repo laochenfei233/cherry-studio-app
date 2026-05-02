@@ -1,0 +1,91 @@
+## 🤖 Automated Port from CherryHQ/cherry-studio
+
+❌ **Status**: Patch failed to apply (manual porting required)
+
+This PR automatically ports upstream aiCore changes with path transformation:
+`src/renderer/src/aiCore` → `src/aiCore`
+
+### 📊 Changes Summary
+
+- **Files Changed**: 21
+- **Lines Added**: +2301
+- **Lines Removed**: -399
+- **Total Commits**: 18
+- **Source Commit**: [`1680243`](https://github.com/CherryHQ/cherry-studio/commit/1680243a537bfb70d9b81b805acaaffd49b1473f)
+- **Patch Status**: Patch failed to apply (manual porting required)
+
+### 📝 Upstream Commits
+
+- [`1680243`](https://github.com/CherryHQ/cherry-studio/commit/1680243a537bfb70d9b81b805acaaffd49b1473f) hotfix(gateway): bypass @ai-sdk/gateway schema for Vercel model listing (#14772) - *SuYao* (2026-05-02T20:35:53+08:00)
+- [`c2a4ac5`](https://github.com/CherryHQ/cherry-studio/commit/c2a4ac568bbf730f331de5e0574cf04b521ef933) fix(reasoning): use enable_thinking param for SiliconFlow DeepSeek/Zhipu models when reasoning_effort is none (#14782) - *Qin Lingguang* (2026-05-02T09:28:34+08:00)
+- [`000c899`](https://github.com/CherryHQ/cherry-studio/commit/000c8990a543e974a34997c0263e21352125e6e3) hotfix(vertex): vertex model list fetch and improve service account setup (#14611) - *Asurada* (2026-05-01T01:01:36+08:00)
+- [`d7490d9`](https://github.com/CherryHQ/cherry-studio/commit/d7490d96b3f40cd46c6527dcb24f6380bee7413d) fix(search): prevent empty activeTools when web search is the only tool (#14752) - *Zhe Chen* (2026-05-01T00:17:00+08:00)
+- [`d2b35f2`](https://github.com/CherryHQ/cherry-studio/commit/d2b35f2cd376eca8ce3122e48757d442fb73b1d4) fix: parse DeepSeek DSML tool-call markup into AI SDK tool calls (#14747) - *SuYao* (2026-04-30T19:12:12+08:00)
+- [`8512932`](https://github.com/CherryHQ/cherry-studio/commit/851293272c3a3416945ad2d4fea10031c168be0d) fix: suppress DeepSeek DSML tags in web search results (#14721) - *亢奋猫* (2026-04-30T15:29:43+08:00)
+- [`9a213ea`](https://github.com/CherryHQ/cherry-studio/commit/9a213eaa4ddcca0ab37ecd6611cd05387954c51f) fix(gateway): pass user apiKey to createGateway when fetching models (#14605) - *Qin Lingguang* (2026-04-26T23:12:23+08:00)
+- [`26d877e`](https://github.com/CherryHQ/cherry-studio/commit/26d877e0fadc38a08da5ae888f4c9661038556c5) hotfix(image-generation): fix gpt-image-2 / gpt-image-1.5 failures and stuck pending placeholder (#14578) - *SuYao* (2026-04-26T00:34:41+08:00)
+- [`63be624`](https://github.com/CherryHQ/cherry-studio/commit/63be624f7c0500e2cf8ab8af01f050df6d32c9f8) fix(models): add vision and reasoning_effort support for mistral-small-2603 (#14541) - *George·Dong* (2026-04-25T02:22:23+08:00)
+- [`4e1e454`](https://github.com/CherryHQ/cherry-studio/commit/4e1e4548bb86ccce752a8ca60a581b37b7bc9b1d) hotfix(deepseek): forward reasoning effort for DeepSeek V4+ via Claude endpoint (#14572) - *SuYao* (2026-04-25T02:12:47+08:00)
+- [`774aa67`](https://github.com/CherryHQ/cherry-studio/commit/774aa674d25005ba0cbc70cfa14b36c68d1ac2a9) hotfix(copilot): github copilot model fetch (#14566) - *Asurada* (2026-04-24T23:06:10+08:00)
+- [`e17d573`](https://github.com/CherryHQ/cherry-studio/commit/e17d5737555e1bb7d7d6145ea37232c732f79df3) hotfix(models): add DeepSeek V4+ model support with reasoning effort (#14551) - *Siin Xu* (2026-04-23T23:30:23-07:00)
+- [`0636b60`](https://github.com/CherryHQ/cherry-studio/commit/0636b601f72ecf41fd253b8c21d95f78cc99cde7) fix: limit builtin web search usage (#14466) - *亢奋猫* (2026-04-23T17:00:23+08:00)
+- [`c0b3c88`](https://github.com/CherryHQ/cherry-studio/commit/c0b3c880e3b3846cf457648f3ed826b5e0f4e508) hotfix(ai-sdk/openai): patch @ai-sdk/openai to support gpt-image-2 (#14488) - *SuYao* (2026-04-22T23:29:50+08:00)
+- [`5d98273`](https://github.com/CherryHQ/cherry-studio/commit/5d98273d86a9693158ad1a38402e1b0677882fad) fix(ai-core): keep native tool loops going (#14481) - *404-Page-Found* (2026-04-22T23:02:27+10:00)
+- [`c4b3a93`](https://github.com/CherryHQ/cherry-studio/commit/c4b3a93ab0499100a0696738803dc7d4d6785c78) fix: prevent empty baseURL/region string in Bedrock provider config (#14425) - *Tsudrat* (2026-04-22T19:08:15+08:00)
+- [`01caaf0`](https://github.com/CherryHQ/cherry-studio/commit/01caaf06f79a5cae507a69a6a6c82e3083161488) hotfix: disable native structured output for AiHubMix/NewAPI Anthropic models (#14376) - *SuYao* (2026-04-22T17:35:14+08:00)
+- [`c2b3302`](https://github.com/CherryHQ/cherry-studio/commit/c2b3302581aa143ffbfceaeea356aaa5a9f18f11) hotfix: Custom params dropped by CherryIN/NewAPI — respect model.endpoint_type (#14409) - *zhibisora* (2026-04-22T14:39:21+08:00)
+
+### 🔧 What Was Done
+
+1. ✅ Generated patch from upstream changes
+2. ✅ Transformed paths for mobile structure (`src/renderer/src/aiCore` → `src/aiCore`)
+3. ✅ Attempted automatic patch application
+4. ❌ Automatic application failed
+
+### 📦 Manual Application Required
+
+The patch is available at `.github/port-patches/aicore-changes.patch`
+
+To apply manually:
+```bash
+git apply .github/port-patches/aicore-changes.patch
+# Or with 3-way merge:
+git apply --3way .github/port-patches/aicore-changes.patch
+```
+
+### ✅ Manual Porting Checklist
+
+- [ ] Review all code changes for mobile compatibility
+- [ ] Check for Node.js/Electron-specific APIs (fs, path, etc.)
+- [ ] Verify imports work in React Native context
+- [ ] Replace desktop APIs with Expo equivalents if needed
+- [ ] Test provider functionality on iOS
+- [ ] Test provider functionality on Android
+- [ ] Verify streaming and SSE handling works on mobile
+- [ ] Check error handling in mobile environment
+- [ ] Run linting: `yarn lint`
+- [ ] Run type checking: `yarn typecheck`
+- [ ] Run tests: `yarn test`
+- [ ] Test on physical devices (not just emulators)
+
+### ⚠️ Key Differences to Watch
+
+| Desktop (Electron) | Mobile (React Native/Expo) |
+|-------------------|---------------------------|
+| `fs`, `path` modules | `expo-file-system` |
+| Electron IPC | React Native Bridge |
+| Synchronous file ops | Async-first with promises |
+| Full file system access | Sandboxed directories |
+| Node.js crypto | `expo-crypto` or `react-native-crypto` |
+
+### 🔗 Related Links
+
+- [Source Repository](https://github.com/CherryHQ/cherry-studio)
+- [Compare Changes](https://github.com/CherryHQ/cherry-studio/compare/cd6d84c847dc5ff4a98cf2464cece37786bf00a8...1680243a537bfb70d9b81b805acaaffd49b1473f)
+- [Source aiCore Directory](https://github.com/CherryHQ/cherry-studio/tree/main/src/renderer/src/aiCore)
+- [Expo FileSystem API](https://docs.expo.dev/versions/latest/sdk/filesystem/)
+
+---
+
+*🤖 This PR was automatically created by Port Bot*
+*📅 Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*
