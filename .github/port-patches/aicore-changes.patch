@@ -1,0 +1,3428 @@
+diff --git a/src/aiCore/AiProvider.ts b/src/aiCore/AiProvider.ts
+index b8245e2..21a074d 100644
+--- a/src/aiCore/AiProvider.ts
++++ b/src/aiCore/AiProvider.ts
+@@ -2,21 +2,12 @@ import { createExecutor } from '@cherrystudio/ai-core'
+ import type { generateImageResult } from '@cherrystudio/ai-core/core/runtime/types'
+ import { loggerService } from '@logger'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+-import { normalizeGatewayModels } from '@renderer/services/models/ModelAdapter'
+ import { addSpan, endSpan } from '@renderer/services/SpanManagerService'
+ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+-import {
+-  type Assistant,
+-  type EditImageParams,
+-  type GenerateImageParams,
+-  type Model,
+-  type Provider,
+-  SystemProviderIds
+-} from '@renderer/types'
++import type { Assistant, EditImageParams, GenerateImageParams, Model, Provider } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { getLowerBaseModelName } from '@renderer/utils'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+-import { gateway } from 'ai'
+ 
+ import AiSdkToChunkAdapter from './chunk/AiSdkToChunkAdapter'
+ import { buildPlugins } from './plugins/PluginBuilder'
+@@ -329,13 +320,6 @@ export default class AiProvider {
+    * 使用 ModelListService 统一处理各 Provider 的模型列表获取
+    */
+   public async models(): Promise<Model[]> {
+-    // Gateway provider 使用 AI SDK 的 gateway API
+-    if (this.actualProvider.id === SystemProviderIds.gateway) {
+-      const gatewayModels = (await gateway.getAvailableModels()).models
+-      return normalizeGatewayModels(this.actualProvider, gatewayModels)
+-    }
+-
+-    // 使用新的 ModelListService
+     return await listModels(this.actualProvider)
+   }
+ 
+diff --git a/src/aiCore/plugins/PluginBuilder.ts b/src/aiCore/plugins/PluginBuilder.ts
+index 8e5b7bf..f9c71ad 100644
+--- a/src/aiCore/plugins/PluginBuilder.ts
++++ b/src/aiCore/plugins/PluginBuilder.ts
+@@ -1,7 +1,12 @@
+ import type { AiPlugin } from '@cherrystudio/ai-core'
+ import { createPromptToolUsePlugin, providerToolPlugin } from '@cherrystudio/ai-core/built-in/plugins'
+ import { loggerService } from '@logger'
+-import { isGemini3Model, isQwen35to39Model, isSupportedThinkingTokenQwenModel } from '@renderer/config/models'
++import {
++  isDeepSeekModel,
++  isGemini3Model,
++  isQwen35to39Model,
++  isSupportedThinkingTokenQwenModel
++} from '@renderer/config/models'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+ import type { Assistant, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+@@ -10,6 +15,7 @@ import { isOllamaProvider, isSupportEnableThinkingProvider } from '@renderer/uti
+ import type { AiSdkMiddlewareConfig } from '../types/middlewareConfig'
+ import { getReasoningTagName } from '../utils/reasoning'
+ import { createAnthropicCachePlugin } from './anthropicCachePlugin'
++import { createDeepseekDsmlParserPlugin } from './deepseekDsmlParserPlugin'
+ import { createNoThinkPlugin } from './noThinkPlugin'
+ import { createOpenrouterReasoningPlugin } from './openrouterReasoningPlugin'
+ import { createPdfCompatibilityPlugin } from './pdfCompatibilityPlugin'
+@@ -84,6 +90,11 @@ export function buildPlugins({ provider, model, config }: BuildPluginsContext):
+     plugins.push(createOpenrouterReasoningPlugin())
+   }
+ 
++  // 0.3.1 DeepSeek DSML tool-call parser — converts leaked DSML tags into proper tool calls
++  if (isDeepSeekModel(model)) {
++    plugins.push(createDeepseekDsmlParserPlugin())
++  }
++
+   // 0.4 OVMS no-think for MCP tools
+   if (provider.id === 'ovms' && config.mcpTools && config.mcpTools.length > 0) {
+     plugins.push(createNoThinkPlugin())
+diff --git a/src/aiCore/plugins/__tests__/deepseekDsmlParserPlugin.test.ts b/src/aiCore/plugins/__tests__/deepseekDsmlParserPlugin.test.ts
+new file mode 100644
+index 0000000..da88664
+--- /dev/null
++++ b/src/aiCore/plugins/__tests__/deepseekDsmlParserPlugin.test.ts
+@@ -0,0 +1,462 @@
++import type { LanguageModelV3StreamPart } from '@ai-sdk/provider'
++import type { LanguageModelMiddleware } from 'ai'
++import { describe, expect, it, vi } from 'vitest'
++
++vi.mock('@logger', () => ({
++  loggerService: {
++    withContext: () => ({
++      debug: vi.fn(),
++      error: vi.fn(),
++      warn: vi.fn(),
++      info: vi.fn()
++    })
++  }
++}))
++
++import { createDeepseekDsmlParserPlugin } from '../deepseekDsmlParserPlugin'
++
++async function getMiddleware(): Promise<LanguageModelMiddleware> {
++  const plugin = createDeepseekDsmlParserPlugin()
++  const ctx = { middlewares: [] as LanguageModelMiddleware[] }
++  // configureContext mutates ctx.middlewares by pushing the parser middleware
++  await plugin.configureContext?.(ctx as any)
++  expect(ctx.middlewares).toHaveLength(1)
++  return ctx.middlewares[0]
++}
++
++function buildSourceStream(deltas: string[], finishReasonUnified: 'stop' | 'tool-calls' = 'stop') {
++  const parts: LanguageModelV3StreamPart[] = [
++    { type: 'stream-start', warnings: [] },
++    { type: 'text-start', id: 'text-1' },
++    ...deltas.map<LanguageModelV3StreamPart>((delta) => ({
++      type: 'text-delta',
++      id: 'text-1',
++      delta
++    })),
++    { type: 'text-end', id: 'text-1' },
++    {
++      type: 'finish',
++      finishReason: { unified: finishReasonUnified, raw: finishReasonUnified },
++
++      usage: {} as any
++    }
++  ]
++
++  return new ReadableStream<LanguageModelV3StreamPart>({
++    start(controller) {
++      for (const part of parts) controller.enqueue(part)
++      controller.close()
++    }
++  })
++}
++
++async function runStream(deltas: string[], finishReasonUnified: 'stop' | 'tool-calls' = 'stop') {
++  const middleware = await getMiddleware()
++  expect(middleware.wrapStream).toBeDefined()
++
++  const source = buildSourceStream(deltas, finishReasonUnified)
++  const wrapped = await middleware.wrapStream!({
++    doStream: async () => ({ stream: source, request: { body: {} }, response: { headers: {} } }),
++
++    doGenerate: (async () => ({})) as any,
++
++    params: {} as any,
++
++    model: {} as any
++  } as any)
++
++  const events: LanguageModelV3StreamPart[] = []
++  const reader = wrapped.stream.getReader()
++  while (true) {
++    const { done, value } = await reader.read()
++    if (done) break
++    events.push(value)
++  }
++  return events
++}
++
++// The actual chunk sequence captured from the user's DeepSeek SSE leak.
++// Concatenated this is two parallel builtin_web_search invokes inside one tool_calls block.
++const SSE_DELTAS: string[] = [
++  // <｜｜DSML｜｜tool_calls>
++  '<',
++  '｜｜DSML｜｜',
++  'tool',
++  '_c',
++  'alls',
++  '>\n',
++  // <｜｜DSML｜｜invoke name="builtin_web_search">
++  '<',
++  '｜｜DSML｜｜',
++  'inv',
++  'oke',
++  ' name',
++  '="',
++  'built',
++  'in',
++  '_',
++  'web',
++  '_search',
++  '">\n',
++  // <｜｜DSML｜｜parameter name="additionalContext" string="true">
++  '<',
++  '｜｜DSML｜｜',
++  'parameter',
++  ' name',
++  '="',
++  'additional',
++  'Context',
++  '"',
++  ' string',
++  '="',
++  'true',
++  '">',
++  // value (Chinese keywords)
++  '企',
++  '查',
++  '查',
++  ' ',
++  '融资',
++  '轮',
++  '次',
++  ' ',
++  '天使',
++  '轮',
++  ' A',
++  '轮',
++  ' B',
++  '轮',
++  ' ',
++  '投资',
++  ' ',
++  '金额',
++  ' ',
++  '时间',
++  // </｜｜DSML｜｜parameter>
++  '</',
++  '｜｜DSML｜｜',
++  'parameter',
++  '>\n',
++  // </｜｜DSML｜｜invoke>
++  '</',
++  '｜｜DSML｜｜',
++  'inv',
++  'oke',
++  '>\n',
++  // <｜｜DSML｜｜invoke name="builtin_web_search">
++  '<',
++  '｜｜DSML｜｜',
++  'inv',
++  'oke',
++  ' name',
++  '="',
++  'built',
++  'in',
++  '_',
++  'web',
++  '_search',
++  '">\n',
++  // <｜｜DSML｜｜parameter name="additionalContext" string="true">
++  '<',
++  '｜｜DSML｜｜',
++  'parameter',
++  ' name',
++  '="',
++  'additional',
++  'Context',
++  '"',
++  ' string',
++  '="',
++  'true',
++  '">',
++  // value (English keywords)
++  '企',
++  '查',
++  '查',
++  ' Q',
++  'ich',
++  'acha',
++  ' funding',
++  ' rounds',
++  ' series',
++  ' A',
++  ' B',
++  ' C',
++  ' investors',
++  ' amount',
++  // </｜｜DSML｜｜parameter>
++  '</',
++  '｜｜DSML｜｜',
++  'parameter',
++  '>\n',
++  // </｜｜DSML｜｜invoke>
++  '</',
++  '｜｜DSML｜｜',
++  'inv',
++  'oke',
++  '>\n',
++  // </｜｜DSML｜｜tool_calls>
++  '</',
++  '｜｜DSML｜｜',
++  'tool',
++  '_c',
++  'alls',
++  '>'
++]
++
++describe('deepseekDsmlParserPlugin', () => {
++  it('converts the captured SSE sample into two AI SDK tool-call events', async () => {
++    const events = await runStream(SSE_DELTAS, 'stop')
++
++    const toolCalls = events.filter((e) => e.type === 'tool-call')
++    expect(toolCalls).toHaveLength(2)
++
++    expect(toolCalls[0]).toMatchObject({
++      type: 'tool-call',
++      toolName: 'builtin_web_search'
++    })
++    expect(toolCalls[1]).toMatchObject({
++      type: 'tool-call',
++      toolName: 'builtin_web_search'
++    })
++
++    const args0 = JSON.parse(toolCalls[0].input)
++    const args1 = JSON.parse(toolCalls[1].input)
++    expect(args0).toEqual({
++      additionalContext: '企查查 融资轮次 天使轮 A轮 B轮 投资 金额 时间'
++    })
++    expect(args1).toEqual({
++      additionalContext: '企查查 Qichacha funding rounds series A B C investors amount'
++    })
++  })
++
++  it('emits the streaming tool-input lifecycle around each tool-call', async () => {
++    const events = await runStream(SSE_DELTAS, 'stop')
++
++    const lifecycle = events.filter((e) =>
++      ['tool-input-start', 'tool-input-delta', 'tool-input-end', 'tool-call'].includes(e.type)
++    )
++    // 4 events per tool-call * 2 invokes = 8 lifecycle events
++    expect(lifecycle).toHaveLength(8)
++    expect(lifecycle.map((e) => e.type)).toEqual([
++      'tool-input-start',
++      'tool-input-delta',
++      'tool-input-end',
++      'tool-call',
++      'tool-input-start',
++      'tool-input-delta',
++      'tool-input-end',
++      'tool-call'
++    ])
++
++    // tool-input-start id matches the corresponding tool-call's toolCallId
++    const start0 = lifecycle[0] as Extract<LanguageModelV3StreamPart, { type: 'tool-input-start' }>
++    const call0 = lifecycle[3] as Extract<LanguageModelV3StreamPart, { type: 'tool-call' }>
++    expect(start0.id).toBe(call0.toolCallId)
++  })
++
++  it('rewrites finishReason from stop to tool-calls when DSML produced tool calls', async () => {
++    const events = await runStream(SSE_DELTAS, 'stop')
++    const finish = events.find((e) => e.type === 'finish') as Extract<LanguageModelV3StreamPart, { type: 'finish' }>
++    expect(finish.finishReason.unified).toBe('tool-calls')
++  })
++
++  it('does not emit any text-delta with the DSML opening tag leaked', async () => {
++    const events = await runStream(SSE_DELTAS, 'stop')
++    const textDeltas = events.filter((e) => e.type === 'text-delta')
++    const concatenated = textDeltas.map((e) => e.delta).join('')
++    expect(concatenated).not.toContain('｜｜DSML｜｜')
++    expect(concatenated).not.toContain('<｜')
++    // No spurious text content in this fully-DSML fragment
++    expect(concatenated).toBe('')
++  })
++
++  it('preserves plain text before and after the DSML block', async () => {
++    const deltas = ['让我先搜索一下。', ...SSE_DELTAS, '\n搜索完成。']
++    const events = await runStream(deltas, 'stop')
++
++    const textDeltas = events
++      .filter((e) => e.type === 'text-delta')
++      .map((e) => e.delta)
++      .join('')
++    expect(textDeltas).toBe('让我先搜索一下。\n搜索完成。')
++
++    const toolCalls = events.filter((e) => e.type === 'tool-call')
++    expect(toolCalls).toHaveLength(2)
++  })
++
++  it('passes plain text streams through unchanged when no DSML appears', async () => {
++    const events = await runStream(['Hello, ', 'world!'], 'stop')
++    const textDeltas = events
++      .filter((e) => e.type === 'text-delta')
++      .map((e) => e.delta)
++      .join('')
++    expect(textDeltas).toBe('Hello, world!')
++    expect(events.filter((e) => e.type === 'tool-call')).toHaveLength(0)
++
++    const finish = events.find((e) => e.type === 'finish') as Extract<LanguageModelV3StreamPart, { type: 'finish' }>
++    expect(finish.finishReason.unified).toBe('stop')
++  })
++
++  it('flushes unclosed DSML block as plain text on text-end (fallback)', async () => {
++    const deltas = [
++      '<',
++      '｜｜DSML｜｜',
++      'tool',
++      '_calls',
++      '>\n',
++      '<',
++      '｜｜DSML｜｜',
++      'invoke name="x">'
++      // no close tag
++    ]
++    const events = await runStream(deltas, 'stop')
++
++    expect(events.filter((e) => e.type === 'tool-call')).toHaveLength(0)
++    const textDeltas = events
++      .filter((e) => e.type === 'text-delta')
++      .map((e) => e.delta)
++      .join('')
++    expect(textDeltas).toContain('<｜｜DSML｜｜tool_calls>')
++  })
++
++  it('emits the original DSML markup as text when a closed block has no parseable invoke', async () => {
++    // Closed tool_calls block, but the inner content does not match an invoke pattern
++    // (e.g. malformed or unexpected payload). The parser should not silently swallow it.
++    const deltas = [
++      'before ',
++      '<｜｜DSML｜｜tool_calls>',
++      'oops not a valid invoke',
++      '</｜｜DSML｜｜tool_calls>',
++      ' after'
++    ]
++    const events = await runStream(deltas, 'stop')
++
++    expect(events.filter((e) => e.type === 'tool-call')).toHaveLength(0)
++
++    const text = events
++      .filter((e) => e.type === 'text-delta')
++      .map((e) => e.delta)
++      .join('')
++    expect(text).toBe('before <｜｜DSML｜｜tool_calls>oops not a valid invoke</｜｜DSML｜｜tool_calls> after')
++
++    const finish = events.find((e) => e.type === 'finish') as Extract<LanguageModelV3StreamPart, { type: 'finish' }>
++    expect(finish.finishReason.unified).toBe('stop')
++  })
++
++  it('handles a partial DSML opening tag that arrives across chunk boundaries with surrounding text', async () => {
++    // First emit some plain text, then split the open tag character-by-character
++    const deltas = [
++      'prefix ',
++      '<',
++      '｜',
++      '｜',
++      'D',
++      'S',
++      'M',
++      'L',
++      '｜',
++      '｜',
++      'tool_calls',
++      '>',
++      '<｜｜DSML｜｜invoke name="t">',
++      '<｜｜DSML｜｜parameter name="p" string="true">v</｜｜DSML｜｜parameter>',
++      '</｜｜DSML｜｜invoke>',
++      '</｜｜DSML｜｜tool_calls>',
++      ' suffix'
++    ]
++    const events = await runStream(deltas, 'stop')
++
++    const toolCalls = events.filter((e) => e.type === 'tool-call')
++    expect(toolCalls).toHaveLength(1)
++    expect(toolCalls[0].toolName).toBe('t')
++    expect(JSON.parse(toolCalls[0].input)).toEqual({ p: 'v' })
++
++    const text = events
++      .filter((e) => e.type === 'text-delta')
++      .map((e) => e.delta)
++      .join('')
++    expect(text).toBe('prefix  suffix')
++  })
++
++  describe('wrapGenerate (non-streaming)', () => {
++    async function runGenerate(text: string, finishReasonUnified: 'stop' | 'tool-calls' = 'stop') {
++      const middleware = await getMiddleware()
++      expect(middleware.wrapGenerate).toBeDefined()
++
++      const result = await middleware.wrapGenerate!({
++        doGenerate: async () =>
++          ({
++            content: [{ type: 'text', text }],
++            finishReason: { unified: finishReasonUnified, raw: finishReasonUnified },
++            usage: {} as any,
++            warnings: [],
++            request: { body: {} },
++            response: { headers: {} }
++          }) as any,
++
++        doStream: (async () => ({})) as any,
++
++        params: {} as any,
++
++        model: {} as any
++      } as any)
++
++      return result as any
++    }
++
++    it('extracts multiple DSML blocks within a single text part', async () => {
++      const text =
++        'lead-in ' +
++        '<｜｜DSML｜｜tool_calls>' +
++        '<｜｜DSML｜｜invoke name="search_a">' +
++        '<｜｜DSML｜｜parameter name="q" string="true">first</｜｜DSML｜｜parameter>' +
++        '</｜｜DSML｜｜invoke>' +
++        '</｜｜DSML｜｜tool_calls>' +
++        ' middle ' +
++        '<｜｜DSML｜｜tool_calls>' +
++        '<｜｜DSML｜｜invoke name="search_b">' +
++        '<｜｜DSML｜｜parameter name="q" string="true">second</｜｜DSML｜｜parameter>' +
++        '</｜｜DSML｜｜invoke>' +
++        '</｜｜DSML｜｜tool_calls>' +
++        ' tail'
++
++      const result = await runGenerate(text, 'stop')
++
++      const toolCalls = result.content.filter((p: any) => p.type === 'tool-call')
++      expect(toolCalls).toHaveLength(2)
++      expect(toolCalls[0].toolName).toBe('search_a')
++      expect(JSON.parse(toolCalls[0].input)).toEqual({ q: 'first' })
++      expect(toolCalls[1].toolName).toBe('search_b')
++      expect(JSON.parse(toolCalls[1].input)).toEqual({ q: 'second' })
++
++      const reconstructed = result.content
++        .filter((p: any) => p.type === 'text')
++        .map((p: any) => p.text)
++        .join('')
++      expect(reconstructed).toBe('lead-in  middle  tail')
++      expect(reconstructed).not.toContain('｜｜DSML｜｜')
++
++      expect(result.finishReason.unified).toBe('tool-calls')
++    })
++
++    it('preserves a closed DSML block that contains no parseable invoke as text', async () => {
++      const text = 'before <｜｜DSML｜｜tool_calls>garbage</｜｜DSML｜｜tool_calls> after'
++      const result = await runGenerate(text, 'stop')
++
++      expect(result.content.filter((p: any) => p.type === 'tool-call')).toHaveLength(0)
++      // Single text part returned unchanged
++      expect(result.content).toHaveLength(1)
++      expect(result.content[0]).toMatchObject({ type: 'text', text })
++      expect(result.finishReason.unified).toBe('stop')
++    })
++
++    it('returns input unchanged when no DSML markup is present', async () => {
++      const text = 'plain response'
++      const result = await runGenerate(text, 'stop')
++      expect(result.content).toHaveLength(1)
++      expect(result.content[0]).toMatchObject({ type: 'text', text })
++      expect(result.finishReason.unified).toBe('stop')
++    })
++  })
++})
+diff --git a/src/aiCore/plugins/deepseekDsmlParserPlugin.ts b/src/aiCore/plugins/deepseekDsmlParserPlugin.ts
+new file mode 100644
+index 0000000..eb3f7c2
+--- /dev/null
++++ b/src/aiCore/plugins/deepseekDsmlParserPlugin.ts
+@@ -0,0 +1,338 @@
++import type { LanguageModelV3StreamPart } from '@ai-sdk/provider'
++import { definePlugin } from '@cherrystudio/ai-core'
++import { loggerService } from '@logger'
++import type { LanguageModelMiddleware } from 'ai'
++
++const logger = loggerService.withContext('deepseekDsmlParser')
++
++const TOOL_CALLS_OPEN = '<｜｜DSML｜｜tool_calls>'
++const TOOL_CALLS_CLOSE = '</｜｜DSML｜｜tool_calls>'
++const SWALLOW_BUFFER_LIMIT = 64 * 1024
++
++const INVOKE_RE = /<｜｜DSML｜｜invoke\s+name="([^"]+)">([\s\S]*?)<\/｜｜DSML｜｜invoke>/g
++const PARAM_RE =
++  /<｜｜DSML｜｜parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?>([\s\S]*?)<\/｜｜DSML｜｜parameter>/g
++
++interface ParsedDsmlCall {
++  toolName: string
++  args: Record<string, unknown>
++}
++
++function parseInvokeBlocks(dsmlContent: string): ParsedDsmlCall[] {
++  const calls: ParsedDsmlCall[] = []
++  INVOKE_RE.lastIndex = 0
++  let invokeMatch: RegExpExecArray | null
++  while ((invokeMatch = INVOKE_RE.exec(dsmlContent)) !== null) {
++    const toolName = invokeMatch[1]
++    const inner = invokeMatch[2]
++    const args: Record<string, unknown> = {}
++
++    PARAM_RE.lastIndex = 0
++    let paramMatch: RegExpExecArray | null
++    while ((paramMatch = PARAM_RE.exec(inner)) !== null) {
++      const paramName = paramMatch[1]
++      const isString = paramMatch[2] !== 'false'
++      const rawValue = paramMatch[3]
++      if (isString) {
++        args[paramName] = rawValue
++      } else {
++        try {
++          args[paramName] = JSON.parse(rawValue)
++        } catch {
++          args[paramName] = rawValue
++        }
++      }
++    }
++    calls.push({ toolName, args })
++  }
++  return calls
++}
++
++// Find longest suffix of `buffer` that is a non-empty prefix of `target`.
++// Used to keep partial DSML opening tag in buffer across chunk boundaries.
++function findPartialPrefix(buffer: string, target: string): number {
++  const maxLen = Math.min(buffer.length, target.length - 1)
++  for (let len = maxLen; len > 0; len--) {
++    if (target.startsWith(buffer.slice(buffer.length - len))) {
++      return buffer.length - len
++    }
++  }
++  return -1
++}
++
++function generateToolCallId(): string {
++  return `dsml_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
++}
++
++function createDeepseekDsmlParserMiddleware(): LanguageModelMiddleware {
++  return {
++    specificationVersion: 'v3',
++
++    wrapStream: async ({ doStream }) => {
++      const { stream, ...rest } = await doStream()
++
++      let textBuffer = ''
++      let dsmlBuffer = ''
++      let inDsml = false
++      let activeTextId: string | null = null
++      let extractedToolCalls = false
++
++      // eslint-disable-next-line prefer-const
++      let drainDsmlBuffer: (
++        controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
++        textId: string
++      ) => void
++
++      const enqueueRemainderText = (
++        controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
++        textId: string
++      ) => {
++        const startIdx = textBuffer.indexOf(TOOL_CALLS_OPEN)
++        if (startIdx === -1) {
++          const partialIdx = findPartialPrefix(textBuffer, TOOL_CALLS_OPEN)
++          if (partialIdx >= 0) {
++            const safe = textBuffer.slice(0, partialIdx)
++            if (safe) controller.enqueue({ type: 'text-delta', id: textId, delta: safe })
++            textBuffer = textBuffer.slice(partialIdx)
++          } else {
++            if (textBuffer) controller.enqueue({ type: 'text-delta', id: textId, delta: textBuffer })
++            textBuffer = ''
++          }
++          return
++        }
++        if (startIdx > 0) {
++          controller.enqueue({ type: 'text-delta', id: textId, delta: textBuffer.slice(0, startIdx) })
++        }
++        dsmlBuffer = textBuffer.slice(startIdx + TOOL_CALLS_OPEN.length)
++        textBuffer = ''
++        inDsml = true
++        drainDsmlBuffer(controller, textId)
++      }
++
++      drainDsmlBuffer = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>, textId: string) => {
++        const closeIdx = dsmlBuffer.indexOf(TOOL_CALLS_CLOSE)
++        if (closeIdx === -1) {
++          if (dsmlBuffer.length > SWALLOW_BUFFER_LIMIT) {
++            logger.warn('DSML buffer exceeded limit without close tag, falling back to text')
++            controller.enqueue({
++              type: 'text-delta',
++              id: textId,
++              delta: TOOL_CALLS_OPEN + dsmlBuffer
++            })
++            dsmlBuffer = ''
++            inDsml = false
++          }
++          return
++        }
++
++        const blockContent = dsmlBuffer.slice(0, closeIdx)
++        const remainder = dsmlBuffer.slice(closeIdx + TOOL_CALLS_CLOSE.length)
++        const calls = parseInvokeBlocks(blockContent)
++
++        if (calls.length === 0) {
++          logger.warn('DSML block closed but no invoke blocks parsed, emitting as text')
++          controller.enqueue({
++            type: 'text-delta',
++            id: textId,
++            delta: TOOL_CALLS_OPEN + blockContent + TOOL_CALLS_CLOSE
++          })
++        } else {
++          for (const call of calls) {
++            const id = generateToolCallId()
++            const inputJson = JSON.stringify(call.args)
++            controller.enqueue({ type: 'tool-input-start', id, toolName: call.toolName })
++            controller.enqueue({ type: 'tool-input-delta', id, delta: inputJson })
++            controller.enqueue({ type: 'tool-input-end', id })
++            controller.enqueue({
++              type: 'tool-call',
++              toolCallId: id,
++              toolName: call.toolName,
++              input: inputJson
++            })
++          }
++          extractedToolCalls = true
++          logger.info(`Parsed ${calls.length} DSML tool call(s)`, {
++            tools: calls.map((c) => c.toolName)
++          })
++        }
++
++        dsmlBuffer = ''
++        inDsml = false
++        textBuffer = remainder
++        if (textBuffer) enqueueRemainderText(controller, textId)
++      }
++
++      return {
++        stream: stream.pipeThrough(
++          new TransformStream<LanguageModelV3StreamPart, LanguageModelV3StreamPart>({
++            transform(
++              chunk: LanguageModelV3StreamPart,
++              controller: TransformStreamDefaultController<LanguageModelV3StreamPart>
++            ) {
++              if (chunk.type === 'text-start') {
++                activeTextId = chunk.id
++                controller.enqueue(chunk)
++                return
++              }
++
++              if (chunk.type === 'text-end') {
++                const textId = chunk.id
++                if (inDsml) {
++                  logger.warn('text-end with unclosed DSML block, flushing as text')
++                  controller.enqueue({
++                    type: 'text-delta',
++                    id: textId,
++                    delta: TOOL_CALLS_OPEN + dsmlBuffer
++                  })
++                  dsmlBuffer = ''
++                  inDsml = false
++                } else if (textBuffer) {
++                  controller.enqueue({ type: 'text-delta', id: textId, delta: textBuffer })
++                  textBuffer = ''
++                }
++                controller.enqueue(chunk)
++                activeTextId = null
++                return
++              }
++
++              if (chunk.type === 'finish') {
++                if (extractedToolCalls && chunk.finishReason.unified === 'stop') {
++                  controller.enqueue({
++                    ...chunk,
++                    finishReason: { ...chunk.finishReason, unified: 'tool-calls' }
++                  })
++                } else {
++                  controller.enqueue(chunk)
++                }
++                return
++              }
++
++              if (chunk.type !== 'text-delta') {
++                controller.enqueue(chunk)
++                return
++              }
++
++              const textId = chunk.id
++              if (!activeTextId) activeTextId = textId
++
++              if (inDsml) {
++                dsmlBuffer += chunk.delta
++                drainDsmlBuffer(controller, textId)
++                return
++              }
++
++              textBuffer += chunk.delta
++              enqueueRemainderText(controller, textId)
++            },
++            flush(controller: TransformStreamDefaultController<LanguageModelV3StreamPart>) {
++              const textId = activeTextId ?? 'dsml-fallback'
++              if (inDsml) {
++                logger.warn('Stream flushed with unclosed DSML block')
++                controller.enqueue({
++                  type: 'text-delta',
++                  id: textId,
++                  delta: TOOL_CALLS_OPEN + dsmlBuffer
++                })
++              } else if (textBuffer) {
++                controller.enqueue({ type: 'text-delta', id: textId, delta: textBuffer })
++              }
++              textBuffer = ''
++              dsmlBuffer = ''
++              inDsml = false
++            }
++          })
++        ),
++        ...rest
++      }
++    },
++
++    wrapGenerate: async ({ doGenerate }) => {
++      const result = await doGenerate()
++      const newContent: typeof result.content = []
++      let extracted = false
++
++      for (const part of result.content) {
++        if (part.type !== 'text') {
++          newContent.push(part)
++          continue
++        }
++        const text = part.text
++        const partsForText: typeof newContent = []
++        let textAccum = ''
++        let cursor = 0
++        let foundCallInPart = false
++
++        while (cursor < text.length) {
++          const startIdx = text.indexOf(TOOL_CALLS_OPEN, cursor)
++          if (startIdx === -1) {
++            textAccum += text.slice(cursor)
++            break
++          }
++          const closeIdx = text.indexOf(TOOL_CALLS_CLOSE, startIdx + TOOL_CALLS_OPEN.length)
++          if (closeIdx === -1) {
++            textAccum += text.slice(cursor)
++            break
++          }
++
++          const blockEnd = closeIdx + TOOL_CALLS_CLOSE.length
++          const blockContent = text.slice(startIdx + TOOL_CALLS_OPEN.length, closeIdx)
++          const calls = parseInvokeBlocks(blockContent)
++
++          if (calls.length === 0) {
++            // Unparseable block — preserve original markup as text instead of dropping it.
++            textAccum += text.slice(cursor, blockEnd)
++            cursor = blockEnd
++            continue
++          }
++
++          textAccum += text.slice(cursor, startIdx)
++          if (textAccum) {
++            partsForText.push({ ...part, text: textAccum })
++            textAccum = ''
++          }
++          for (const call of calls) {
++            partsForText.push({
++              type: 'tool-call',
++              toolCallId: generateToolCallId(),
++              toolName: call.toolName,
++              input: JSON.stringify(call.args)
++            })
++          }
++          foundCallInPart = true
++          cursor = blockEnd
++        }
++
++        if (!foundCallInPart) {
++          newContent.push(part)
++          continue
++        }
++
++        newContent.push(...partsForText)
++        if (textAccum) newContent.push({ ...part, text: textAccum })
++        extracted = true
++      }
++
++      if (!extracted) return result
++
++      logger.info('Parsed DSML tool calls in non-streaming response')
++      return {
++        ...result,
++        content: newContent,
++        finishReason:
++          result.finishReason.unified === 'stop'
++            ? { ...result.finishReason, unified: 'tool-calls' }
++            : result.finishReason
++      }
++    }
++  }
++}
++
++export const createDeepseekDsmlParserPlugin = () =>
++  definePlugin({
++    name: 'deepseekDsmlParser',
++    enforce: 'pre',
++    configureContext: (context) => {
++      context.middlewares = context.middlewares || []
++      context.middlewares.push(createDeepseekDsmlParserMiddleware())
++    }
++  })
+diff --git a/src/aiCore/plugins/searchOrchestrationPlugin.ts b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+index 0dd01fb..d38835c 100644
+--- a/src/aiCore/plugins/searchOrchestrationPlugin.ts
++++ b/src/aiCore/plugins/searchOrchestrationPlugin.ts
+@@ -20,20 +20,20 @@ import {
+   SEARCH_SUMMARY_PROMPT_KNOWLEDGE_ONLY,
+   SEARCH_SUMMARY_PROMPT_WEB_ONLY
+ } from '@renderer/config/prompts'
++import { fetchGenerate } from '@renderer/services/ApiService'
+ import { getDefaultModel, getProviderByModel } from '@renderer/services/AssistantService'
+ import store from '@renderer/store'
+ import { selectCurrentUserId, selectGlobalMemoryEnabled, selectMemoryConfig } from '@renderer/store/memory'
+ import type { Assistant } from '@renderer/types'
+ import type { ExtractResults } from '@renderer/utils/extract'
+ import { extractInfoFromXML } from '@renderer/utils/extract'
+-import type { LanguageModel, ModelMessage } from 'ai'
+-import { generateText } from 'ai'
++import type { ModelMessage } from 'ai'
+ import { isEmpty } from 'lodash'
+ 
+ import { MemoryProcessor } from '../../services/MemoryProcessor'
+ import { knowledgeSearchTool } from '../tools/KnowledgeSearchTool'
+ import { memorySearchTool } from '../tools/MemorySearchTool'
+-import { webSearchToolWithPreExtractedKeywords } from '../tools/WebSearchTool'
++import { BUILTIN_WEB_SEARCH_TOOL_NAME, webSearchToolWithPreExtractedKeywords } from '../tools/WebSearchTool'
+ 
+ const logger = loggerService.withContext('SearchOrchestrationPlugin')
+ 
+@@ -137,9 +137,10 @@ async function analyzeSearchIntent(
+       hasKnowledgeSearch: needKnowledgeExtract
+     })
+ 
+-    const { text: result } = await generateText({
+-      model: context.model as LanguageModel,
+-      prompt: formattedPrompt
++    const result = await fetchGenerate({
++      model,
++      prompt: formattedPrompt,
++      content: ''
+     }).finally(() => {
+       logger.info('Intent analysis generateText call completed', {
+         modelId: model.id,
+@@ -147,6 +148,14 @@ async function analyzeSearchIntent(
+         requestId: context.requestId
+       })
+     })
++
++    // fetchGenerate swallows errors and returns '' — treat that as a failure so
++    // search still runs against the original user question via the fallback.
++    if (!result.trim()) {
++      logger.warn('Intent analysis returned empty result, using fallback')
++      return getFallbackResult()
++    }
++
+     const parsedResult = extractInfoFromXML(result)
+     logger.debug('Intent analysis result', { parsedResult })
+ 
+@@ -328,11 +337,29 @@ export const searchOrchestrationPlugin = (
+           if (needsSearch) {
+             // onChunk({ type: ChunkType.EXTERNEL_TOOL_IN_PROGRESS })
+             // logger.info('🌐 Adding web search tool with pre-extracted keywords')
+-            params.tools['builtin_web_search'] = webSearchToolWithPreExtractedKeywords(
++            params.tools[BUILTIN_WEB_SEARCH_TOOL_NAME] = webSearchToolWithPreExtractedKeywords(
+               assistant.webSearchProviderId,
+               analysisResult.websearch,
+               context.requestId
+             )
++
++            const prepareStep = params.prepareStep
++            params.prepareStep = async (options) => {
++              const stepConfig = await prepareStep?.(options)
++              const hasWebSearchCall = options.steps.some((step) =>
++                step.toolCalls.some((toolCall) => toolCall.toolName === BUILTIN_WEB_SEARCH_TOOL_NAME)
++              )
++
++              if (!hasWebSearchCall) return stepConfig
++              const filteredTools = (stepConfig?.activeTools ?? Object.keys(params.tools!)).filter(
++                (toolName) => toolName !== BUILTIN_WEB_SEARCH_TOOL_NAME
++              )
++              // When web search is the only tool, don't set activeTools to [] — Anthropic
++              // rejects empty tools arrays. The tool's internal cache (cachedSearchResultsPromise)
++              // already prevents actual re-searching.
++              if (filteredTools.length === 0) return stepConfig
++              return { ...stepConfig, activeTools: filteredTools }
++            }
+           }
+         }
+ 
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index 80b7d45..6c2e27d 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -3,7 +3,7 @@ import { TopicType } from '@renderer/types'
+ import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import { describe, expect, it, vi } from 'vitest'
+ 
+-import { getMaxTokens, getTemperature, getTimeout, getTopP } from '../modelParameters'
++import { filterStandardParams, getMaxTokens, getTemperature, getTimeout, getTopP } from '../modelParameters'
+ 
+ vi.mock('@renderer/services/AssistantService', () => ({
+   DEFAULT_ASSISTANT_SETTINGS: {
+@@ -191,6 +191,18 @@ describe('modelParameters', () => {
+ 
+       expect(getTemperature(assistant, model)).toBe(0.8)
+     })
++
++    it('always returns undefined for Claude Opus 4.7 (rejects sampling parameters)', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: 'anthropic',
++        group: 'Claude 4.7'
++      })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
+   })
+ 
+   describe('getTopP', () => {
+@@ -234,6 +246,18 @@ describe('modelParameters', () => {
+       expect(getTopP(assistant, model)).toBeUndefined()
+     })
+ 
++    it('always returns undefined for Claude Opus 4.7 (rejects sampling parameters)', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.95 })
++      const model = createModel({
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: 'anthropic',
++        group: 'Claude 4.7'
++      })
++
++      expect(getTopP(assistant, model)).toBeUndefined()
++    })
++
+     it('clamps topP to [0.95, 1] for Claude reasoning models with reasoning effort', () => {
+       const assistant = createAssistant({ enableTopP: true, topP: 0.5, reasoning_effort: 'high' })
+       const model = createModel({ id: 'claude-sonnet-4.5', provider: 'anthropic', group: 'claude' })
+@@ -263,6 +287,40 @@ describe('modelParameters', () => {
+     })
+   })
+ 
++  describe('filterStandardParams', () => {
++    const opus47 = createModel({
++      id: 'claude-opus-4-7',
++      name: 'Claude Opus 4.7',
++      provider: 'anthropic',
++      group: 'Claude 4.7'
++    })
++    const sonnet = createModel({
++      id: 'claude-sonnet-4.5',
++      name: 'Claude Sonnet 4.5',
++      provider: 'anthropic',
++      group: 'claude'
++    })
++
++    it('drops topK for Claude Opus 4.7', () => {
++      expect(filterStandardParams({ topK: 40, frequencyPenalty: 0.1 }, opus47)).toEqual({ frequencyPenalty: 0.1 })
++    })
++
++    it('returns the same object when topK is absent for Opus 4.7', () => {
++      const input = { frequencyPenalty: 0.1, seed: 42 }
++      expect(filterStandardParams(input, opus47)).toBe(input)
++    })
++
++    it('keeps topK for non-Opus-4.7 models', () => {
++      const input = { topK: 40 }
++      expect(filterStandardParams(input, sonnet)).toBe(input)
++    })
++
++    it('returns the same object when standardParams is empty', () => {
++      const input = {}
++      expect(filterStandardParams(input, opus47)).toBe(input)
++    })
++  })
++
+   describe('getTimeout', () => {
+     it('uses an extended timeout for flex service tier models', () => {
+       const model = createModel({ id: 'o3-pro', provider: 'openai', group: 'openai' })
+diff --git a/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+index 9bf22e6..8cdadc5 100644
+--- a/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
++++ b/src/aiCore/prepareParams/__tests__/parameterBuilder.test.ts
+@@ -1,225 +1,45 @@
+-/**
+- * Tests for parameterBuilder maxToolCalls functionality
+- * These tests verify the maxToolCalls calculation and validation logic in isolation
+- */
+ import { describe, expect, it } from 'vitest'
+ 
+-// Mirror the constants from parameterBuilder.ts
+-const MIN_TOOL_CALLS = 1
+-const MAX_TOOL_CALLS = 100
+-const DEFAULT_MAX_TOOL_CALLS = 20
+-const DEFAULT_ENABLE_MAX_TOOL_CALLS = true
++import { getEffectiveMaxToolCalls } from '../parameterBuilder'
+ 
+-/**
+- * Validates and clamps maxToolCalls to valid range
+- * Mirrors the logic in parameterBuilder.ts
+- */
+-function validateMaxToolCalls(value: number | undefined): number {
+-  if (value === undefined || value < MIN_TOOL_CALLS || value > MAX_TOOL_CALLS) {
+-    return DEFAULT_MAX_TOOL_CALLS
+-  }
+-  return value
+-}
+-
+-/**
+- * Calculate the effective max tool calls based on assistant settings
+- * Mirrors the logic in parameterBuilder.ts
+- */
+-function calculateEffectiveMaxToolCalls(settings?: { maxToolCalls?: number; enableMaxToolCalls?: boolean }): {
+-  stopWhen: number | null
+-  maxToolCalls: number
+-} {
+-  const enableMaxToolCalls = settings?.enableMaxToolCalls ?? DEFAULT_ENABLE_MAX_TOOL_CALLS
+-
+-  if (!enableMaxToolCalls) {
+-    // When disabled, don't pass stopWhen (return null to indicate no stopWhen)
+-    return { stopWhen: null, maxToolCalls: DEFAULT_MAX_TOOL_CALLS }
+-  }
+-
+-  // When enabled, validate and use user-defined value
+-  const maxToolCalls = validateMaxToolCalls(settings?.maxToolCalls)
+-  return { stopWhen: maxToolCalls, maxToolCalls }
+-}
+-
+-describe('validateMaxToolCalls', () => {
+-  it('returns valid values as-is', () => {
+-    expect(validateMaxToolCalls(1)).toBe(1)
+-    expect(validateMaxToolCalls(50)).toBe(50)
+-    expect(validateMaxToolCalls(100)).toBe(100)
+-  })
+-
+-  it('clamps values above 100 to default', () => {
+-    const result = validateMaxToolCalls(999)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
+-  })
+-
+-  it('clamps zero to default', () => {
+-    const result = validateMaxToolCalls(0)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
+-  })
+-
+-  it('clamps negative values to default', () => {
+-    const result = validateMaxToolCalls(-5)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
++describe('getEffectiveMaxToolCalls', () => {
++  it('uses the default cap when settings are missing', () => {
++    expect(getEffectiveMaxToolCalls()).toBe(20)
+   })
+ 
+-  it('returns default when value is undefined', () => {
+-    const result = validateMaxToolCalls(undefined)
+-    expect(result).toBe(DEFAULT_MAX_TOOL_CALLS)
+-  })
+-})
+-
+-describe('maxToolCalls calculation logic', () => {
+-  describe('default behavior', () => {
+-    it('uses default value 20 when settings are undefined', () => {
+-      const result = calculateEffectiveMaxToolCalls(undefined)
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-
+-    it('uses default value 20 when settings is empty object', () => {
+-      const result = calculateEffectiveMaxToolCalls({})
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-
+-    it('uses default value 20 when maxToolCalls is undefined', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true
+-        // maxToolCalls is undefined
+-      })
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-
+-    it('uses custom value when maxToolCalls is set and enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
++  it('uses the default cap when the switch is off', () => {
++    expect(
++      getEffectiveMaxToolCalls({
++        enableMaxToolCalls: false,
+         maxToolCalls: 50
+       })
+-      expect(result.maxToolCalls).toBe(50)
+-      expect(result.stopWhen).toBe(50)
+-    })
++    ).toBe(20)
+   })
+ 
+-  describe('custom values when enabled', () => {
+-    it('uses custom value when enableMaxToolCalls is true and maxToolCalls is set', () => {
+-      const result = calculateEffectiveMaxToolCalls({
++  it('uses a custom cap when enabled', () => {
++    expect(
++      getEffectiveMaxToolCalls({
+         enableMaxToolCalls: true,
+         maxToolCalls: 50
+       })
+-      expect(result.stopWhen).toBe(50)
+-    })
+-
+-    it('uses custom value at minimum boundary (1)', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 1
+-      })
+-      expect(result.stopWhen).toBe(1)
+-    })
+-
+-    it('uses custom value at maximum boundary (100)', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 100
+-      })
+-      expect(result.stopWhen).toBe(100)
+-    })
+-
+-    it('clamps values above 100 to default when enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 999
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('clamps zero to default when enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 0
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('clamps negative values to default when enabled', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: -5
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
++    ).toBe(50)
+   })
+ 
+-  describe('disabled behavior', () => {
+-    it('does not pass stopWhen when enableMaxToolCalls is false', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: false,
+-        maxToolCalls: 50
+-      })
+-      // When disabled, stopWhen should be null (indicating no stopWhen passed)
+-      expect(result.stopWhen).toBeNull()
+-    })
+-
+-    it('does not pass stopWhen when both enableMaxToolCalls is false and maxToolCalls is undefined', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: false
+-      })
+-      expect(result.stopWhen).toBeNull()
+-    })
+-
+-    it('falls back to default when disabled with invalid maxToolCalls', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: false,
++  it('clamps invalid custom values back to the default cap', () => {
++    expect(
++      getEffectiveMaxToolCalls({
++        enableMaxToolCalls: true,
+         maxToolCalls: 999
+       })
+-      // When disabled, maxToolCalls should still be default (for reference)
+-      expect(result.maxToolCalls).toBe(DEFAULT_MAX_TOOL_CALLS)
+-      expect(result.stopWhen).toBeNull()
+-    })
++    ).toBe(20)
+   })
+ 
+-  describe('backward compatibility', () => {
+-    it('maintains backward compatibility - existing assistants without new fields use default', () => {
+-      // Simulate an old assistant without the new fields
+-      const oldSettings = {
+-        // Old assistants don't have enableMaxToolCalls or maxToolCalls
++  it('uses the default cap for old assistants without the new fields', () => {
++    expect(
++      getEffectiveMaxToolCalls({
+         temperature: 0.7,
+         contextCount: 10
+-      }
+-      const result = calculateEffectiveMaxToolCalls(
+-        oldSettings as { maxToolCalls?: number; enableMaxToolCalls?: boolean }
+-      )
+-      // Should default to enabled with 20 for backward compatibility
+-      expect(result.maxToolCalls).toBe(20)
+-      expect(result.stopWhen).toBe(20)
+-    })
+-  })
+-
+-  describe('security - invalid values from imported/migrated settings', () => {
+-    it('validates extremely large values from imported settings', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 999999
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('validates negative values from imported settings', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: -100
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
+-
+-    it('validates zero from imported settings', () => {
+-      const result = calculateEffectiveMaxToolCalls({
+-        enableMaxToolCalls: true,
+-        maxToolCalls: 0
+-      })
+-      expect(result.stopWhen).toBe(DEFAULT_MAX_TOOL_CALLS)
+-    })
++      } as { maxToolCalls?: number; enableMaxToolCalls?: boolean })
++    ).toBe(20)
+   })
+ })
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 79c2d04..1833c51 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -6,6 +6,7 @@
+ import { loggerService } from '@logger'
+ import {
+   isClaude46SeriesModel,
++  isClaude47SeriesModel,
+   isClaudeReasoningModel,
+   isMaxTemperatureOneModel,
+   isSupportedFlexServiceTier,
+@@ -20,6 +21,7 @@ import {
+   getProviderByModel
+ } from '@renderer/services/AssistantService'
+ import { type Assistant, type Model } from '@renderer/types'
++import type { AiSdkParam } from '@renderer/types/aiCoreTypes'
+ import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import { getThinkingBudget } from '../utils/reasoning'
+@@ -29,6 +31,7 @@ const logger = loggerService.withContext('modelParameters')
+ /**
+  * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
+  * - Disabled when enableTemperature is off.
++ * - Disabled unconditionally for Claude Opus 4.7 (rejects sampling params with HTTP 400).
+  * - Disabled for Claude reasoning models when reasoning effort is set (excluding 'default' and 'none').
+  * - Disabled for models that do not support temperature.
+  * - Clamped to 1 for models with max temperature of 1.
+@@ -40,6 +43,13 @@ export function getTemperature(assistant: Assistant, model: Model): number | und
+     return undefined
+   }
+ 
++  // Claude Opus 4.7 rejects sampling params (temperature/top_p/top_k) with HTTP 400
++  // regardless of reasoning settings. See Vercel AI SDK PR #14529.
++  if (isClaude47SeriesModel(model)) {
++    logger.info(`Model ${model.id} rejects sampling parameters, disabling temperature`)
++    return undefined
++  }
++
+   // Thinking isn't compatible with temperature or top_k modifications as well as forced tool use.
+   // See: https://platform.claude.com/docs/en/build-with-claude/extended-thinking#feature-compatibility
+   if (
+@@ -74,6 +84,7 @@ export function getTemperature(assistant: Assistant, model: Model): number | und
+ /**
+  * Retrieves the TopP parameter, adapting it based on assistant.settings and model capabilities.
+  * - Disabled when enableTopP is off.
++ * - Disabled unconditionally for Claude Opus 4.7 (rejects sampling params with HTTP 400).
+  * - Disabled for models that do not support TopP.
+  * - Disabled for mutually exclusive models when temperature is enabled.
+  * - Clamped to [0.95, 1] for Claude reasoning models with reasoning effort set (excluding 'default' and 'none').
+@@ -85,6 +96,12 @@ export function getTopP(assistant: Assistant, model: Model): number | undefined
+     return undefined
+   }
+ 
++  // Claude Opus 4.7 rejects sampling params unconditionally (see getTemperature).
++  if (isClaude47SeriesModel(model)) {
++    logger.info(`Model ${model.id} rejects sampling parameters, disabling topP`)
++    return undefined
++  }
++
+   if (!isSupportTopPModel(model, assistant)) {
+     logger.info(`Model ${model.id} does not support topP, disabling topP.`)
+     return undefined
+@@ -116,6 +133,23 @@ export function getTopP(assistant: Assistant, model: Model): number | undefined
+   return topP
+ }
+ 
++/**
++ * Filters AI SDK standard parameters extracted from custom parameters, removing any
++ * the model rejects. Currently strips `topK` for Claude Opus 4.7 since it rejects
++ * sampling params (temperature/top_p/top_k) with HTTP 400. See `getTemperature`.
++ */
++export function filterStandardParams(
++  standardParams: Partial<Record<AiSdkParam, any>>,
++  model: Model
++): Partial<Record<AiSdkParam, any>> {
++  if (isClaude47SeriesModel(model) && 'topK' in standardParams) {
++    const { topK, ...rest } = standardParams
++    logger.info(`Model ${model.id} rejects sampling parameters, dropping topK=${topK} from custom params`)
++    return rest
++  }
++  return standardParams
++}
++
+ /**
+  * 获取超时设置
+  */
+@@ -139,11 +173,13 @@ export function getMaxTokens(assistant: Assistant, model: Model): number | undef
+   }
+ 
+   const provider = getProviderByModel(model)
+-  // Claude 4.6 uses adaptive thinking (no budgetTokens), so the AI SDK does not add budget back
+-  // to maxOutputTokens. Skip the subtraction to avoid incorrectly reducing max_tokens.
++  // Claude 4.6 / 4.7 use adaptive thinking and do not send budgetTokens, so the
++  // AI SDK does not add budget back to maxOutputTokens. Skip the subtraction to avoid
++  // incorrectly reducing max_tokens.
+   if (
+     isSupportedThinkingTokenClaudeModel(model) &&
+     !isClaude46SeriesModel(model) &&
++    !isClaude47SeriesModel(model) &&
+     ['anthropic', 'aws-bedrock'].includes(provider.type)
+   ) {
+     const { reasoning_effort: reasoningEffort } = assistantSettings
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 4b7a2a8..c87f89d 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -42,7 +42,7 @@ import { setupToolsConfig } from '../utils/mcp'
+ import { buildProviderOptions } from '../utils/options'
+ import { buildProviderBuiltinWebSearchConfig } from '../utils/websearch'
+ import { addAnthropicHeaders } from './header'
+-import { getMaxTokens, getTemperature, getTopP } from './modelParameters'
++import { filterStandardParams, getMaxTokens, getTemperature, getTopP } from './modelParameters'
+ 
+ const logger = loggerService.withContext('parameterBuilder')
+ 
+@@ -59,6 +59,16 @@ function validateMaxToolCalls(value: number | undefined): number {
+   return value
+ }
+ 
++export function getEffectiveMaxToolCalls(settings?: { maxToolCalls?: number; enableMaxToolCalls?: boolean }): number {
++  const enableMaxToolCalls = settings?.enableMaxToolCalls ?? DEFAULT_ASSISTANT_SETTINGS.enableMaxToolCalls
++
++  if (!enableMaxToolCalls) {
++    return DEFAULT_ASSISTANT_SETTINGS.maxToolCalls
++  }
++
++  return validateMaxToolCalls(settings?.maxToolCalls)
++}
++
+ function mapVertexAIGatewayModelToProviderId(model: Model): AppProviderId | undefined {
+   if (isAnthropicModel(model)) {
+     return 'anthropic'
+@@ -192,10 +202,9 @@ export async function buildStreamTextParams(
+   // are extracted from custom parameters and passed directly to streamText()
+   // instead of being placed in providerOptions
+ 
+-  // Get max tool calls from assistant settings
+-  // When enabled, validate and use user-defined value (1-100)
+-  // When disabled, don't pass stopWhen - let AI SDK use its own default
+-  const enableMaxToolCalls = assistant.settings?.enableMaxToolCalls ?? DEFAULT_ASSISTANT_SETTINGS.enableMaxToolCalls
++  // AI SDK defaults to stepCountIs(1), which would stop after the first tool call.
++  // Always pass an explicit cap so native tool use can continue across steps.
++  const maxToolCalls = getEffectiveMaxToolCalls(assistant.settings)
+ 
+   const params: StreamTextParams = {
+     messages: sdkMessages,
+@@ -203,19 +212,15 @@ export async function buildStreamTextParams(
+     temperature: getTemperature(assistant, model),
+     topP: getTopP(assistant, model),
+     // Include AI SDK standard params extracted from custom parameters
+-    ...standardParams,
++    // (filtered to drop ones the model rejects, e.g. topK on Claude Opus 4.7)
++    ...filterStandardParams(standardParams, model),
+     abortSignal: finalSignal,
+     headers,
+     providerOptions,
+     maxRetries: 0
+   }
+ 
+-  // Only add stopWhen when explicitly enabled and validated
+-  if (enableMaxToolCalls) {
+-    const maxToolCalls = validateMaxToolCalls(assistant.settings?.maxToolCalls)
+-    params.stopWhen = stepCountIs(maxToolCalls)
+-  }
+-  // When disabled, don't pass stopWhen - let AI SDK use its own default
++  params.stopWhen = stepCountIs(maxToolCalls)
+ 
+   if (tools) {
+     params.tools = tools
+diff --git a/src/aiCore/provider/custom/aihubmix-provider.ts b/src/aiCore/provider/custom/aihubmix-provider.ts
+index 67c08ee..8333256 100644
+--- a/src/aiCore/provider/custom/aihubmix-provider.ts
++++ b/src/aiCore/provider/custom/aihubmix-provider.ts
+@@ -45,9 +45,13 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+   const resolveApiKey = () =>
+     loadApiKey({ apiKey: options.apiKey, environmentVariableName: 'AIHUBMIX_API_KEY', description: 'AiHubMix' })
+ 
++  // Note: Do not hard-code `Content-Type: application/json` here. `postJsonToApi`
++  // already defaults it for JSON endpoints, while `postFormDataToApi` (used by
++  // `OpenAICompatibleImageModel` for `/images/edits`) relies on fetch to set
++  // `multipart/form-data; boundary=...` automatically — forcing JSON here breaks
++  // image edits with "invalid character '-' in numeric literal" on the server.
+   const authHeaders = (): Record<string, string> => ({
+     Authorization: `Bearer ${resolveApiKey()}`,
+-    'Content-Type': 'application/json',
+     ...APP_CODE_HEADER,
+     ...options.headers
+   })
+@@ -61,7 +65,13 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+       baseURL,
+       headers: () => ({ ...headers, 'x-api-key': resolveApiKey() }),
+       fetch: customFetch,
+-      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] })
++      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] }),
++      // AiHubMix may route Claude models to Vertex/Bedrock backends, which reject the
++      // `structured-outputs-2025-11-13` beta header added by @ai-sdk/anthropic for
++      // claude-opus-4-6 / claude-sonnet-4-6 / claude-*-4-5 / claude-opus-4-1. Falling
++      // back to function-tool-based structured outputs keeps tool use (incl. MCP) working
++      // across all downstream backends. See issue #14375.
++      supportsNativeStructuredOutput: false
+     })
+   }
+ 
+diff --git a/src/aiCore/provider/custom/newapi-provider.ts b/src/aiCore/provider/custom/newapi-provider.ts
+index 92e8845..21b5e9c 100644
+--- a/src/aiCore/provider/custom/newapi-provider.ts
++++ b/src/aiCore/provider/custom/newapi-provider.ts
+@@ -53,9 +53,13 @@ export function createNewApi(options: NewApiProviderSettings = {}): NewApiProvid
+   const resolveApiKey = () =>
+     loadApiKey({ apiKey: options.apiKey, environmentVariableName: 'NEWAPI_API_KEY', description: 'NewAPI' })
+ 
++  // Note: Do not hard-code `Content-Type: application/json` here. `postJsonToApi`
++  // already defaults it for JSON endpoints, while `postFormDataToApi` (used by
++  // `OpenAICompatibleImageModel` for `/images/edits`) relies on fetch to set
++  // `multipart/form-data; boundary=...` automatically — forcing JSON here breaks
++  // image edits with "invalid character '-' in numeric literal" on the server.
+   const authHeaders = (): Record<string, string> => ({
+     Authorization: `Bearer ${resolveApiKey()}`,
+-    'Content-Type': 'application/json',
+     ...options.headers
+   })
+ 
+@@ -68,7 +72,13 @@ export function createNewApi(options: NewApiProviderSettings = {}): NewApiProvid
+       baseURL,
+       headers: () => ({ ...headers, 'x-api-key': resolveApiKey() }),
+       fetch: customFetch,
+-      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] })
++      supportedUrls: () => ({ 'image/*': [/^https?:\/\/.*$/] }),
++      // NewAPI may route Claude models to Vertex/Bedrock backends, which reject the
++      // `structured-outputs-2025-11-13` beta header added by @ai-sdk/anthropic for
++      // claude-opus-4-6 / claude-sonnet-4-6 / claude-*-4-5 / claude-opus-4-1. Falling
++      // back to function-tool-based structured outputs keeps tool use (incl. MCP) working
++      // across all downstream backends. See issue #14375.
++      supportsNativeStructuredOutput: false
+     })
+   }
+ 
+diff --git a/src/aiCore/provider/providerConfig.ts b/src/aiCore/provider/providerConfig.ts
+index 7b2fc4a..03f19a1 100644
+--- a/src/aiCore/provider/providerConfig.ts
++++ b/src/aiCore/provider/providerConfig.ts
+@@ -209,17 +209,20 @@ function buildOllamaConfig(ctx: BuilderContext): ProviderConfig<'ollama'> {
+ 
+ function buildBedrockConfig(ctx: BuilderContext): ProviderConfig<'bedrock'> {
+   const authType = getAwsBedrockAuthType()
+-  const region = getAwsBedrockRegion()
++  const region = getAwsBedrockRegion().trim() || undefined
+ 
+   const base = { providerId: 'bedrock' as const, endpoint: ctx.endpoint }
+ 
++  const baseURL = ctx.baseConfig.baseURL || undefined
++
+   if (authType === 'apiKey') {
+-    return { ...base, providerSettings: { ...ctx.baseConfig, region, apiKey: getAwsBedrockApiKey() } }
++    return { ...base, providerSettings: { ...ctx.baseConfig, baseURL, region, apiKey: getAwsBedrockApiKey() } }
+   }
+   return {
+     ...base,
+     providerSettings: {
+       ...ctx.baseConfig,
++      baseURL,
+       region,
+       accessKeyId: getAwsBedrockAccessKeyId(),
+       secretAccessKey: getAwsBedrockSecretAccessKey()
+diff --git a/src/aiCore/services/__tests__/listModels.test.ts b/src/aiCore/services/__tests__/listModels.test.ts
+index 8b2a337..10b2b01 100644
+--- a/src/aiCore/services/__tests__/listModels.test.ts
++++ b/src/aiCore/services/__tests__/listModels.test.ts
+@@ -6,6 +6,27 @@ import type { Provider } from '@renderer/types'
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ const mockGetFromApi = vi.fn()
++const mockCopilotGetToken = vi.fn()
++const mockVertexGetAuthHeaders = vi.fn()
++const mockToastError = vi.fn()
++const createMockStoreState = () => ({
++  copilot: {
++    defaultHeaders: {}
++  },
++  llm: {
++    settings: {
++      vertexai: {
++        projectId: 'test-project',
++        location: 'us-central1',
++        serviceAccount: {
++          privateKey: '-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----',
++          clientEmail: 'vertex@test-project.iam.gserviceaccount.com'
++        }
++      }
++    }
++  }
++})
++let mockStoreState = createMockStoreState()
+ vi.mock('@ai-sdk/provider-utils', () => ({
+   createJsonResponseHandler: vi.fn(() => 'json-handler'),
+   createJsonErrorResponseHandler: vi.fn(() => 'error-handler'),
+@@ -13,6 +34,12 @@ vi.mock('@ai-sdk/provider-utils', () => ({
+   zodSchema: vi.fn((s: unknown) => s)
+ }))
+ 
++vi.mock('@renderer/i18n', () => ({
++  default: {
++    t: (key: string) => key
++  }
++}))
++
+ vi.mock('@renderer/utils', () => ({
+   formatApiHost: (host: string) => host?.replace(/\/$/, ''),
+   withoutTrailingSlash: (s: string) => s?.replace(/\/$/, ''),
+@@ -20,15 +47,21 @@ vi.mock('@renderer/utils', () => ({
+ }))
+ 
+ vi.mock('@renderer/utils/provider', () => ({
+-  isAIGatewayProvider: (p: Provider) => p.id === 'gateway',
+   isGeminiProvider: (p: Provider) => p.id === 'gemini' || p.type === 'gemini',
+-  isOllamaProvider: (p: Provider) => p.id === 'ollama' || p.type === 'ollama'
++  isOllamaProvider: (p: Provider) => p.id === 'ollama' || p.type === 'ollama',
++  isVertexProvider: (p: Provider) => p.id === 'vertexai' || p.type === 'vertexai'
+ }))
+ 
+ vi.mock('@shared/utils', () => ({
+   defaultAppHeaders: () => ({ 'X-App': 'CherryStudio' })
+ }))
+ 
++vi.mock('@renderer/store', () => ({
++  default: {
++    getState: () => mockStoreState
++  }
++}))
++
+ const { listModels } = await import('../listModels')
+ const { OllamaTagsResponseSchema } = await import('../schemas')
+ 
+@@ -145,6 +178,45 @@ const REAL_PPIO_CHAT = {
+   ]
+ }
+ 
++// From https://ai-gateway.vercel.sh/v3/ai/config (Vercel AI Gateway model registry)
++const REAL_VERCEL_GATEWAY = {
++  models: [
++    {
++      id: 'alibaba/qwen3-max',
++      name: 'Qwen3 Max',
++      description: 'The Qwen 3 series Max model.',
++      modelType: 'language',
++      tags: ['tool-use', 'implicit-caching'],
++      specification: {
++        specificationVersion: 'v3',
++        provider: 'alibaba',
++        modelId: 'alibaba/qwen3-max',
++        type: 'language'
++      },
++      pricing: { input: '0.0000012', output: '0.000006' }
++    },
++    {
++      id: 'openai/gpt-4o',
++      name: 'GPT-4o',
++      modelType: 'language',
++      specification: {
++        specificationVersion: 'v3',
++        provider: 'openai',
++        modelId: 'openai/gpt-4o'
++      }
++    },
++    {
++      id: 'openai/text-embedding-3-large',
++      modelType: 'embedding',
++      specification: {
++        specificationVersion: 'v3',
++        provider: 'openai',
++        modelId: 'openai/text-embedding-3-large'
++      }
++    }
++  ]
++}
++
+ // From https://aihubmix.com/api/v1/models (custom schema with model_id/model_name)
+ const REAL_AIHUBMIX = {
+   data: [
+@@ -232,14 +304,118 @@ function assertValidModels(models: { id: string; name: string; provider: string;
+   }
+ }
+ 
++type VertexPublisherModelFixture = {
++  name: string
++  displayName?: string
++  description?: string
++}
++
++type VertexPublisherFixtureResponse = {
++  publisherModels?: VertexPublisherModelFixture[]
++  nextPageToken?: string
++}
++
++function mockVertexPublisherResponses(
++  responsesByPublisher: Record<string, VertexPublisherFixtureResponse | VertexPublisherFixtureResponse[] | Error>
++) {
++  const pageIndexByPublisher = new Map<string, number>()
++
++  mockGetFromApi.mockImplementation(({ url }: { url: string }) => {
++    const match = url.match(/\/publishers\/([^/]+)\/models/)
++    const publisher = match?.[1]
++
++    if (!publisher) {
++      return Promise.resolve({
++        value: { publisherModels: [] }
++      })
++    }
++
++    const response = responsesByPublisher[publisher]
++
++    if (response instanceof Error) {
++      return Promise.reject(response)
++    }
++
++    if (Array.isArray(response)) {
++      const pageIndex = pageIndexByPublisher.get(publisher) ?? 0
++      pageIndexByPublisher.set(publisher, pageIndex + 1)
++
++      return Promise.resolve({
++        value: response[pageIndex] ?? { publisherModels: [] }
++      })
++    }
++
++    return Promise.resolve({
++      value: response ?? { publisherModels: [] }
++    })
++  })
++}
++
++const COPILOT_PROVIDER = makeProvider({
++  id: 'copilot',
++  apiHost: 'https://api.githubcopilot.com/'
++})
++
++const COPILOT_MODELS_RESPONSE = {
++  value: {
++    data: [
++      { id: 'accounts/msft/routers/f185i3v4' },
++      { id: 'tts-1', object: 'model' },
++      { id: 'gpt-4o-mini', owned_by: 'github' },
++      { id: 'claude-sonnet-4.5', policy: { state: 'disabled' } },
++      { id: 'gpt-4o-mini', owned_by: 'github' }
++    ]
++  }
++}
++
+ // === Tests ===
+ 
+ beforeEach(() => {
+   mockGetFromApi.mockReset()
+-  vi.stubGlobal('window', { ...globalThis.window, keyv: { get: vi.fn(), set: vi.fn() } })
++  mockCopilotGetToken.mockReset()
++  mockVertexGetAuthHeaders.mockReset()
++  mockToastError.mockReset()
++  mockStoreState = createMockStoreState()
++  mockCopilotGetToken.mockResolvedValue({ token: 'copilot-dynamic-token' })
++  mockVertexGetAuthHeaders.mockResolvedValue({ Authorization: 'Bearer vertex-token' })
++  vi.stubGlobal('window', {
++    ...globalThis.window,
++    keyv: { get: vi.fn(), set: vi.fn() },
++    toast: {
++      error: mockToastError
++    },
++    api: {
++      copilot: {
++        getToken: mockCopilotGetToken
++      },
++      vertexAI: {
++        getAuthHeaders: mockVertexGetAuthHeaders
++      }
++    }
++  })
+ })
+ 
+ describe('listModels', () => {
++  describe('Copilot', () => {
++    it('should use Copilot-specific token and filter unsupported Copilot entries', async () => {
++      mockGetFromApi.mockResolvedValue(COPILOT_MODELS_RESPONSE)
++
++      const models = await listModels(COPILOT_PROVIDER)
++      expect(mockGetFromApi).toHaveBeenCalledTimes(1)
++      const [request] = mockGetFromApi.mock.calls[0]
++
++      expect(mockCopilotGetToken).toHaveBeenCalledTimes(1)
++      expect(request).toMatchObject({
++        url: 'https://api.githubcopilot.com/models',
++        headers: {
++          Authorization: 'Bearer copilot-dynamic-token',
++          'Copilot-Integration-Id': 'vscode-chat'
++        }
++      })
++      expect(models.map((model) => model.id)).toEqual(['gpt-4o-mini'])
++    })
++  })
++
+   describe('OpenAI-compatible (DeepSeek)', () => {
+     it('should convert real DeepSeek response', async () => {
+       mockGetFromApi.mockResolvedValue({ value: REAL_DEEPSEEK })
+@@ -290,6 +466,165 @@ describe('listModels', () => {
+     })
+   })
+ 
++  describe('Vertex AI', () => {
++    it('should authenticate, paginate, and normalize Google Vertex publisher models', async () => {
++      mockVertexPublisherResponses({
++        google: [
++          {
++            publisherModels: [
++              {
++                name: 'publishers/google/models/gemini-2.5-pro',
++                displayName: 'Gemini 2.5 Pro',
++                description: 'Pro Gemini model'
++              },
++              {
++                name: 'publishers/google/models/gemini-2.5-pro',
++                displayName: 'Gemini 2.5 Pro duplicate'
++              },
++              {
++                name: 'publishers/google/models/imageclassification-efficientnet'
++              }
++            ],
++            nextPageToken: 'next-page'
++          },
++          {
++            publisherModels: [
++              {
++                name: 'publishers/google/models/gemini-2.5-flash',
++                displayName: 'Gemini 2.5 Flash',
++                description: 'Fast Gemini model'
++              },
++              {
++                name: 'publishers/google/models/text-embedding-005'
++              }
++            ]
++          }
++        ]
++      })
++
++      const models = await listModels(
++        makeProvider({
++          id: 'vertexai',
++          type: 'vertexai',
++          apiHost: 'https://us-central1-aiplatform.googleapis.com/v1/projects/test-project/locations/us-central1'
++        })
++      )
++
++      expect(mockVertexGetAuthHeaders).toHaveBeenCalledWith({
++        projectId: 'test-project',
++        serviceAccount: {
++          privateKey: '-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----',
++          clientEmail: 'vertex@test-project.iam.gserviceaccount.com'
++        }
++      })
++      const requests = mockGetFromApi.mock.calls.map(([request]) => request)
++      const requestedUrls = requests.map((request) => request.url)
++      const googleUrls = requestedUrls.filter((url) => url.includes('/publishers/google/models'))
++
++      expect(googleUrls).toEqual([
++        'https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=100&listAllVersions=true',
++        'https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=100&listAllVersions=true&pageToken=next-page'
++      ])
++      expect(requestedUrls).toContain(
++        'https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/openai/models?pageSize=100&listAllVersions=true'
++      )
++      expect(requestedUrls.some((url) => url.includes('/publishers/anthropic/models'))).toBe(false)
++      expect(requests[0].headers).toMatchObject({
++        Authorization: 'Bearer vertex-token',
++        'X-App': 'CherryStudio'
++      })
++      expect(models.map((m) => m.id)).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash', 'text-embedding-005'])
++      expect(models[0]).toMatchObject({
++        name: 'Gemini 2.5 Pro',
++        description: 'Pro Gemini model',
++        owned_by: 'google',
++        provider: 'vertexai'
++      })
++    })
++
++    it('should keep supported partner families, filter audio and tts models, and ignore failed publishers', async () => {
++      mockVertexPublisherResponses({
++        google: new Error('publisher unavailable'),
++        openai: {
++          publisherModels: [
++            { name: 'publishers/openai/models/gpt-5-mini', displayName: 'GPT 5 Mini' },
++            { name: 'publishers/openai/models/gpt-4o-audio-preview' },
++            { name: 'publishers/openai/models/gpt-4o-mini-tts' }
++          ]
++        },
++        meta: {
++          publisherModels: [{ name: 'publishers/meta/models/llama-4-scout-17b-16e-instruct-maas' }]
++        },
++        qwen: {
++          publisherModels: [{ name: 'publishers/qwen/models/qwen3.5-27b-instruct-maas' }]
++        },
++        'deepseek-ai': {
++          publisherModels: [{ name: 'publishers/deepseek-ai/models/deepseek-v3.2-maas' }]
++        },
++        moonshotai: {
++          publisherModels: [{ name: 'publishers/moonshotai/models/kimi-k2-thinking-maas' }]
++        },
++        'zai-org': {
++          publisherModels: [{ name: 'publishers/zai-org/models/glm-5-maas' }]
++        }
++      })
++
++      const models = await listModels(makeProvider({ id: 'vertexai', type: 'vertexai' }))
++
++      expect(models.map((m) => m.id)).toEqual([
++        'gpt-5-mini',
++        'llama-4-scout-17b-16e-instruct-maas',
++        'qwen3.5-27b-instruct-maas',
++        'deepseek-v3.2-maas',
++        'kimi-k2-thinking-maas',
++        'glm-5-maas'
++      ])
++      expect(models.map((m) => m.owned_by)).toEqual(['openai', 'meta', 'qwen', 'deepseek-ai', 'moonshotai', 'zai-org'])
++      expect(mockGetFromApi.mock.calls.some(([request]) => request.url.includes('/publishers/google/models'))).toBe(
++        true
++      )
++    })
++
++    it('should warn and skip listing when required Vertex settings are incomplete', async () => {
++      mockStoreState = {
++        ...createMockStoreState(),
++        llm: {
++          settings: {
++            vertexai: {
++              projectId: 'test-project',
++              location: '',
++              serviceAccount: {
++                privateKey: '-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----',
++                clientEmail: 'vertex@test-project.iam.gserviceaccount.com'
++              }
++            }
++          }
++        }
++      }
++
++      const models = await listModels(makeProvider({ id: 'vertexai', type: 'vertexai' }))
++
++      expect(models).toEqual([])
++      expect(mockVertexGetAuthHeaders).not.toHaveBeenCalled()
++      expect(mockGetFromApi).not.toHaveBeenCalled()
++      expect(mockToastError).toHaveBeenCalledWith(
++        expect.stringContaining('settings.provider.vertex_ai.service_account.incomplete_config')
++      )
++      expect(mockToastError).toHaveBeenCalledWith(expect.stringContaining('settings.provider.vertex_ai.location'))
++      expect(mockToastError).toHaveBeenCalledWith(expect.stringContaining('settings.provider.vertex_ai.location_help'))
++    })
++
++    it('should warn and skip listing when Vertex auth header generation fails', async () => {
++      mockVertexGetAuthHeaders.mockRejectedValueOnce(new Error('auth failed'))
++
++      const models = await listModels(makeProvider({ id: 'vertexai', type: 'vertexai' }))
++
++      expect(models).toEqual([])
++      expect(mockGetFromApi).not.toHaveBeenCalled()
++      expect(mockToastError).toHaveBeenCalledWith('auth failed')
++    })
++  })
++
+   describe('Together', () => {
+     it('should use display_name and organization from real response', async () => {
+       mockGetFromApi.mockResolvedValue({ value: REAL_TOGETHER })
+@@ -445,9 +780,59 @@ describe('listModels', () => {
+     })
+   })
+ 
++  describe('Vercel AI Gateway', () => {
++    it('should hit /v3/ai/config and normalize entries', async () => {
++      mockGetFromApi.mockResolvedValue({ value: REAL_VERCEL_GATEWAY })
++      const models = await listModels(
++        makeProvider({
++          id: 'gateway',
++          type: 'gateway' as any,
++          apiHost: 'https://ai-gateway.vercel.sh/v1/ai',
++          apiKey: 'sk-gw'
++        })
++      )
++
++      expect(mockGetFromApi).toHaveBeenCalledTimes(1)
++      const [request] = mockGetFromApi.mock.calls[0]
++      expect(request).toMatchObject({
++        url: 'https://ai-gateway.vercel.sh/v3/ai/config',
++        headers: expect.objectContaining({
++          Authorization: 'Bearer sk-gw',
++          'ai-gateway-protocol-version': '0.0.1'
++        })
++      })
++      assertValidModels(models)
++      expect(models).toHaveLength(3)
++      expect(models[0]).toMatchObject({
++        id: 'alibaba/qwen3-max',
++        name: 'Qwen3 Max',
++        provider: 'gateway',
++        group: 'alibaba',
++        owned_by: 'alibaba',
++        description: 'The Qwen 3 series Max model.'
++      })
++      expect(models[2].name).toBe('openai/text-embedding-3-large')
++    })
++
++    it('should fall back to id when name is missing and deduplicate', async () => {
++      mockGetFromApi.mockResolvedValue({
++        value: {
++          models: [
++            { id: 'openai/gpt-4o', specification: { provider: 'openai' } },
++            { id: 'openai/gpt-4o', specification: { provider: 'openai' } }
++          ]
++        }
++      })
++      const models = await listModels(
++        makeProvider({ id: 'gateway', type: 'gateway' as any, apiHost: 'https://ai-gateway.vercel.sh/v1/ai' })
++      )
++      expect(models).toHaveLength(1)
++      expect(models[0].name).toBe('openai/gpt-4o')
++    })
++  })
++
+   describe('Unsupported providers', () => {
+     it.each([
+-      ['gateway', { id: 'gateway' }],
+       ['aws-bedrock', { id: 'aws-bedrock' }],
+       ['anthropic', { id: 'anthropic' }],
+       ['vertex-anthropic', { id: 'vertex-anthro', type: 'vertex-anthropic' as any }]
+diff --git a/src/aiCore/services/listModels.ts b/src/aiCore/services/listModels.ts
+index fc5cffe..4603b0a 100644
+--- a/src/aiCore/services/listModels.ts
++++ b/src/aiCore/services/listModels.ts
+@@ -10,13 +10,22 @@ import {
+   zodSchema
+ } from '@ai-sdk/provider-utils'
+ import { loggerService } from '@logger'
++import { COPILOT_DEFAULT_HEADERS } from '@renderer/aiCore/provider/constants'
++import store from '@renderer/store'
+ import type { EndpointType, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+ import { formatApiHost, withoutTrailingSlash } from '@renderer/utils'
+-import { isAIGatewayProvider, isGeminiProvider, isOllamaProvider } from '@renderer/utils/provider'
++import { isGeminiProvider, isOllamaProvider, isVertexProvider } from '@renderer/utils/provider'
+ import { defaultAppHeaders } from '@shared/utils'
+ import * as z from 'zod'
+ 
++import {
++  createVertexModelListRequest,
++  DEFAULT_VERTEX_MODEL_PUBLISHERS,
++  getVertexModelId,
++  getVertexModelPublisher,
++  isSupportedVertexPublisherModel
++} from './listModels/vertex'
+ import {
+   AIHubMixModelsResponseSchema,
+   GeminiModelsResponseSchema,
+@@ -25,7 +34,9 @@ import {
+   OllamaTagsResponseSchema,
+   OpenAIModelsResponseSchema,
+   OVMSConfigResponseSchema,
+-  TogetherModelsResponseSchema
++  TogetherModelsResponseSchema,
++  VercelGatewayModelsResponseSchema,
++  VertexPublisherModelsResponseSchema
+ } from './schemas'
+ 
+ const logger = loggerService.withContext('ModelListService')
+@@ -182,6 +193,81 @@ const geminiFetcher: ModelFetcher = {
+   }
+ }
+ 
++const vertexFetcher: ModelFetcher = {
++  match: (p) => isVertexProvider(p),
++  fetch: async (provider, signal) => {
++    const request = await createVertexModelListRequest(provider)
++
++    if (!request) {
++      return []
++    }
++
++    const publisherModelGroups = await Promise.all(
++      DEFAULT_VERTEX_MODEL_PUBLISHERS.map(async (publisher) => {
++        try {
++          const publisherModels: z.infer<typeof VertexPublisherModelsResponseSchema>['publisherModels'] = []
++          let pageToken: string | undefined
++
++          do {
++            const searchParams = new URLSearchParams({
++              pageSize: '100',
++              listAllVersions: 'true'
++            })
++
++            if (pageToken) {
++              searchParams.set('pageToken', pageToken)
++            }
++
++            const response = await getFromApi({
++              url: `${request.baseUrl}/v1beta1/publishers/${publisher}/models?${searchParams.toString()}`,
++              headers: request.headers,
++              responseSchema: VertexPublisherModelsResponseSchema,
++              abortSignal: signal
++            })
++
++            publisherModels.push(...response.publisherModels)
++            pageToken = response.nextPageToken
++          } while (pageToken)
++
++          return publisherModels
++        } catch (error) {
++          logger.warn('Skipping Vertex publisher model listing after request failure', {
++            providerId: provider.id,
++            publisher,
++            error: error instanceof Error ? error.message : String(error)
++          })
++          return []
++        }
++      })
++    )
++
++    const publisherModels = publisherModelGroups.flat()
++
++    const listedModels = dedup(publisherModels, (model) => model.name).map((model) => {
++      const id = getVertexModelId(model.name)
++      const ownedBy = getVertexModelPublisher(model.name)
++
++      return toModel(id, provider, {
++        name: pickPreferredString([model.displayName, id]) || id,
++        description: model.description,
++        owned_by: ownedBy
++      })
++    })
++
++    const filteredModels = listedModels.filter((model) => isSupportedVertexPublisherModel(model.id))
++
++    if (filteredModels.length !== listedModels.length) {
++      logger.info('Filtered unsupported Vertex publisher models from model list', {
++        providerId: provider.id,
++        filteredCount: listedModels.length - filteredModels.length,
++        returnedCount: filteredModels.length
++      })
++    }
++
++    return filteredModels
++  }
++}
++
+ const githubFetcher: ModelFetcher = {
+   match: (p) => p.id === SystemProviderIds.github,
+   fetch: async (provider, signal) => {
+@@ -211,6 +297,39 @@ const githubFetcher: ModelFetcher = {
+   }
+ }
+ 
++const copilotFetcher: ModelFetcher = {
++  match: (p) => p.id === SystemProviderIds.copilot,
++  fetch: async (provider, signal) => {
++    const headers = {
++      ...COPILOT_DEFAULT_HEADERS,
++      ...store.getState().copilot.defaultHeaders,
++      ...provider.extra_headers
++    }
++    const { token } = await window.api.copilot.getToken(headers)
++    const response = await getFromApi({
++      url: `${withoutTrailingSlash(provider.apiHost)}/models`,
++      headers: {
++        ...headers,
++        Authorization: `Bearer ${token}`
++      },
++      responseSchema: OpenAIModelsResponseSchema,
++      abortSignal: signal
++    })
++
++    const filtered = response.data.filter((m) => {
++      const modelId = m.id.toLowerCase()
++      const policyState = (m as { policy?: { state?: string } }).policy?.state
++      return (
++        policyState !== 'disabled' &&
++        !/^accounts\/[^/]+\/routers\//.test(modelId) &&
++        !/^(tts|whisper|speech)/.test(modelId.split('/').pop() || '')
++      )
++    })
++
++    return dedup(filtered, (m) => m.id).map((m) => toModel(m.id, provider, { owned_by: m.owned_by }))
++  }
++}
++
+ const ovmsFetcher: ModelFetcher = {
+   match: (p) => p.id === SystemProviderIds.ovms,
+   fetch: async (provider, signal) => {
+@@ -336,6 +455,28 @@ const aiHubMixFetcher: ModelFetcher = {
+   }
+ }
+ 
++const gatewayFetcher: ModelFetcher = {
++  match: (p) => p.id === SystemProviderIds.gateway,
++  fetch: async (provider, signal) => {
++    const response = await getFromApi({
++      url: `https://ai-gateway.vercel.sh/v3/ai/config`,
++      headers: {
++        ...defaultHeaders(provider),
++        'ai-gateway-protocol-version': '0.0.1'
++      },
++      responseSchema: VercelGatewayModelsResponseSchema,
++      abortSignal: signal
++    })
++    return dedup(response.models, (m) => m.id).map((m) =>
++      toModel(m.id, provider, {
++        name: m.name || m.id,
++        description: m.description,
++        owned_by: m.specification?.provider
++      })
++    )
++  }
++}
++
+ /** Default fallback: OpenAI-compatible /models endpoint */
+ const openAICompatibleFetcher: ModelFetcher = {
+   match: () => true,
+@@ -357,12 +498,15 @@ const fetchers: ModelFetcher[] = [
+   aiHubMixFetcher,
+   ollamaFetcher,
+   geminiFetcher,
++  vertexFetcher,
+   githubFetcher,
++  copilotFetcher,
+   ovmsFetcher,
+   togetherFetcher,
+   newApiFetcher,
+   openRouterFetcher,
+   ppioFetcher,
++  gatewayFetcher,
+   openAICompatibleFetcher // always-match fallback, must be last
+ ]
+ 
+@@ -371,7 +515,7 @@ const fetchers: ModelFetcher[] = [
+ const UNSUPPORTED_PROVIDERS = new Set<string>([SystemProviderIds['aws-bedrock'], SystemProviderIds.anthropic])
+ 
+ function isUnsupported(provider: Provider): boolean {
+-  return isAIGatewayProvider(provider) || UNSUPPORTED_PROVIDERS.has(provider.id) || provider.type === 'vertex-anthropic'
++  return UNSUPPORTED_PROVIDERS.has(provider.id) || provider.type === 'vertex-anthropic'
+ }
+ 
+ // === Public API ===
+diff --git a/src/aiCore/services/listModels/vertex.ts b/src/aiCore/services/listModels/vertex.ts
+new file mode 100644
+index 0000000..4718d42
+--- /dev/null
++++ b/src/aiCore/services/listModels/vertex.ts
+@@ -0,0 +1,163 @@
++import { loggerService } from '@logger'
++import i18n from '@renderer/i18n'
++import store from '@renderer/store'
++import type { Provider } from '@renderer/types'
++import { withoutTrailingSlash } from '@renderer/utils'
++import {
++  getMissingVertexAIConfigFields,
++  VERTEX_AI_CONFIG_FIELD_LABEL_KEYS,
++  type VertexAIConfigField
++} from '@renderer/utils/vertexAI'
++import { defaultAppHeaders } from '@shared/utils'
++
++const logger = loggerService.withContext('ModelListService')
++
++export const DEFAULT_VERTEX_MODEL_PUBLISHERS = [
++  'google',
++  'openai',
++  'meta',
++  'qwen',
++  'deepseek-ai',
++  'moonshotai',
++  'zai-org'
++] as const
++
++export type VertexModelListRequest = {
++  baseUrl: string
++  headers: Record<string, string>
++}
++
++function getVertexServiceEndpoint(provider: Provider): string {
++  const vertexSettings = store.getState().llm.settings.vertexai
++  const apiHost = withoutTrailingSlash(provider.apiHost)
++  const defaultHost =
++    vertexSettings.location === 'global'
++      ? 'https://aiplatform.googleapis.com'
++      : `https://${vertexSettings.location}-aiplatform.googleapis.com`
++
++  if (!apiHost || apiHost.endsWith('aiplatform.googleapis.com')) {
++    return defaultHost
++  }
++
++  const vertexResourcePath = /\/v1(?:beta1)?\/projects\/[^/]+\/locations\/[^/]+$/
++  if (vertexResourcePath.test(apiHost)) {
++    return apiHost.replace(vertexResourcePath, '')
++  }
++
++  return apiHost.replace(/\/v1(?:beta1)?$/, '')
++}
++
++const EXCLUDED_VERTEX_PUBLISHER_MODEL_KEYWORDS = ['tts', 'audio'] as const
++
++const SUPPORTED_VERTEX_PUBLISHER_MODEL_PATTERNS = [
++  /^gemini[\w.@-]*$/i,
++  /^learnlm[\w.@-]*$/i,
++  /^gemma[\w.@-]*$/i,
++  /^(?:text(?:-multilingual)?-embedding|gemini-embedding|multimodalembedding|textembedding-gecko(?:-multilingual)?|embedding-gecko(?:-multilingual)?)[\w.@-]*$/i,
++  /^deepseek[\w.@-]*$/i,
++  /^kimi[\w.@-]*$/i,
++  /^glm[\w.@-]*$/i,
++  /^gpt[\w.@-]*$/i,
++  /^llama[\w.@-]*$/i,
++  /^qwen[\w.@-]*$/i
++] as const
++
++function buildVertexAIIncompleteConfigMessage(missingFields: VertexAIConfigField[]): string {
++  const missingFieldLabels = missingFields.map((field) => i18n.t(VERTEX_AI_CONFIG_FIELD_LABEL_KEYS[field])).join(', ')
++  const locationHint = missingFields.includes('location')
++    ? ` ${i18n.t('settings.provider.vertex_ai.location_help')}`
++    : ''
++
++  return `${i18n.t('settings.provider.vertex_ai.service_account.incomplete_config')}: ${missingFieldLabels}.${locationHint}`
++}
++
++export async function createVertexModelListRequest(provider: Provider): Promise<VertexModelListRequest | undefined> {
++  const {
++    location,
++    projectId,
++    serviceAccount: { privateKey, clientEmail }
++  } = store.getState().llm.settings.vertexai
++
++  const missingFields = getMissingVertexAIConfigFields({
++    projectId,
++    location,
++    serviceAccount: {
++      privateKey,
++      clientEmail
++    }
++  })
++
++  if (missingFields.length > 0) {
++    const errorMessage = buildVertexAIIncompleteConfigMessage(missingFields)
++
++    window.toast?.error(errorMessage)
++    logger.warn('Vertex AI model listing skipped because service account settings are incomplete', {
++      providerId: provider.id,
++      missingFields
++    })
++    return undefined
++  }
++
++  let authHeaders: Record<string, string>
++
++  try {
++    authHeaders = await window.api.vertexAI.getAuthHeaders({
++      projectId,
++      serviceAccount: {
++        privateKey,
++        clientEmail
++      }
++    })
++  } catch (error) {
++    const errorMessage = error instanceof Error ? error.message : String(error)
++
++    window.toast?.error(errorMessage)
++    logger.warn('Vertex AI model listing skipped because authentication failed', {
++      providerId: provider.id,
++      error: errorMessage
++    })
++    return undefined
++  }
++
++  return {
++    baseUrl: getVertexServiceEndpoint(provider),
++    headers: {
++      ...defaultAppHeaders(),
++      ...authHeaders,
++      ...provider.extra_headers
++    }
++  }
++}
++
++export function getVertexModelId(name: string): string {
++  const marker = '/models/'
++  const markerIndex = name.lastIndexOf(marker)
++
++  if (markerIndex >= 0) {
++    return name.slice(markerIndex + marker.length)
++  }
++
++  return name.split('/').pop() || name
++}
++
++export function getVertexModelPublisher(name: string): string {
++  const marker = 'publishers/'
++  const markerIndex = name.indexOf(marker)
++
++  if (markerIndex < 0) {
++    return 'google'
++  }
++
++  const publisher = name.slice(markerIndex + marker.length).split('/')[0]
++  return publisher || 'google'
++}
++
++export function isSupportedVertexPublisherModel(modelId: string): boolean {
++  const normalizedModelId = modelId.trim().toLowerCase()
++
++  if (EXCLUDED_VERTEX_PUBLISHER_MODEL_KEYWORDS.some((keyword) => normalizedModelId.includes(keyword))) {
++    return false
++  }
++
++  return SUPPORTED_VERTEX_PUBLISHER_MODEL_PATTERNS.some((pattern) => pattern.test(normalizedModelId))
++}
+diff --git a/src/aiCore/services/schemas.ts b/src/aiCore/services/schemas.ts
+index e216d91..38cd8ad 100644
+--- a/src/aiCore/services/schemas.ts
++++ b/src/aiCore/services/schemas.ts
+@@ -67,6 +67,25 @@ export const GeminiModelsResponseSchema = z.object({
+   nextPageToken: z.string().optional()
+ })
+ 
++// === Vertex AI Model Garden ===
++
++export const VertexPublisherModelsResponseSchema = z.object({
++  publisherModels: z
++    .array(
++      z.looseObject({
++        name: z.string(),
++        displayName: z.string().optional(),
++        description: z.string().optional(),
++        versionId: z.string().optional(),
++        launchStage: z.string().optional(),
++        versionState: z.string().optional()
++      })
++    )
++    .optional()
++    .default([]),
++  nextPageToken: z.string().optional()
++})
++
+ // === GitHub Models ===
+ 
+ export const GitHubModelsResponseSchema = z.array(
+@@ -138,6 +157,27 @@ export const OVMSConfigResponseSchema = z.record(
+   })
+ )
+ 
++// === Vercel AI Gateway (/v3/ai/config) ===
++
++export const VercelGatewayModelsResponseSchema = z.object({
++  models: z.array(
++    z.looseObject({
++      id: z.string(),
++      name: z.string().optional(),
++      description: z.string().optional(),
++      modelType: z.string().optional(),
++      specification: z
++        .looseObject({
++          specificationVersion: z.string().optional(),
++          provider: z.string().optional(),
++          modelId: z.string().optional(),
++          type: z.string().optional()
++        })
++        .optional()
++    })
++  )
++})
++
+ // === AIHubMix ===
+ 
+ export const AIHubMixModelsResponseSchema = z.object({
+diff --git a/src/aiCore/tools/WebSearchTool.ts b/src/aiCore/tools/WebSearchTool.ts
+index d70b07c..22bebe3 100644
+--- a/src/aiCore/tools/WebSearchTool.ts
++++ b/src/aiCore/tools/WebSearchTool.ts
+@@ -2,9 +2,35 @@ import { REFERENCE_PROMPT } from '@renderer/config/prompts'
+ import WebSearchService from '@renderer/services/WebSearchService'
+ import type { WebSearchProvider, WebSearchProviderResponse } from '@renderer/types'
+ import type { ExtractResults } from '@renderer/utils/extract'
++import { getUrlOriginOrFallback } from '@renderer/utils/url'
+ import { type InferToolInput, type InferToolOutput, tool } from 'ai'
+ import * as z from 'zod'
+ 
++export const BUILTIN_WEB_SEARCH_TOOL_NAME = 'builtin_web_search'
++
++const MAX_BUILTIN_WEB_SEARCH_QUERIES = 3
++
++function normalizeWebSearchQueries(questions: string[]): string[] {
++  if (questions[0] === 'not_needed') {
++    return ['not_needed']
++  }
++
++  const seen = new Set<string>()
++
++  return questions
++    .map((question) => question.trim())
++    .filter((question) => question.length > 0)
++    .filter((question) => {
++      const key = question.toLocaleLowerCase()
++      if (seen.has(key)) {
++        return false
++      }
++      seen.add(key)
++      return true
++    })
++    .slice(0, MAX_BUILTIN_WEB_SEARCH_QUERIES)
++}
++
+ /**
+  * 使用预提取关键词的网络搜索工具
+  * 这个工具直接使用插件阶段分析的搜索意图，避免重复分析
+@@ -18,6 +44,7 @@ export const webSearchToolWithPreExtractedKeywords = (
+   requestId: string
+ ) => {
+   const webSearchProvider = WebSearchService.getWebSearchProvider(webSearchProviderId)
++  let cachedSearchResultsPromise: Promise<WebSearchProviderResponse> | undefined
+ 
+   return tool({
+     description: `Web search tool for finding current information, news, and real-time data from the internet.
+@@ -40,23 +67,23 @@ You can use this tool as-is to search with the prepared queries, or provide addi
+     }),
+ 
+     execute: async ({ additionalContext }) => {
+-      let finalQueries = [...extractedKeywords.question]
++      if (cachedSearchResultsPromise) {
++        return cachedSearchResultsPromise
++      }
++
++      let finalQueries = normalizeWebSearchQueries(extractedKeywords.question)
+ 
+       if (additionalContext?.trim()) {
+         // 如果大模型提供了额外上下文，使用更具体的描述
+         const cleanContext = additionalContext.trim()
+         if (cleanContext) {
+-          finalQueries = [cleanContext]
++          finalQueries = normalizeWebSearchQueries([cleanContext])
+         }
+       }
+ 
+-      let searchResults: WebSearchProviderResponse = {
+-        query: '',
+-        results: []
+-      }
+       // 检查是否需要搜索
+-      if (finalQueries[0] === 'not_needed') {
+-        return searchResults
++      if (finalQueries.length === 0 || finalQueries[0] === 'not_needed') {
++        return { query: '', results: [] }
+       }
+ 
+       // 构建 ExtractResults 结构用于 processWebsearch
+@@ -66,9 +93,13 @@ You can use this tool as-is to search with the prepared queries, or provide addi
+           links: extractedKeywords.links
+         }
+       }
+-      searchResults = await WebSearchService.processWebsearch(webSearchProvider!, extractResults, requestId)
+-
+-      return searchResults
++      cachedSearchResultsPromise = WebSearchService.processWebsearch(webSearchProvider!, extractResults, requestId)
++      try {
++        return await cachedSearchResultsPromise
++      } catch (error) {
++        cachedSearchResultsPromise = undefined
++        throw error
++      }
+     },
+     toModelOutput: ({ output: results }) => {
+       let summary = 'No search needed based on the query analysis.'
+@@ -80,15 +111,15 @@ You can use this tool as-is to search with the prepared queries, or provide addi
+         number: index + 1,
+         title: result.title,
+         content: result.content,
+-        url: result.url
++        url: getUrlOriginOrFallback(result.url)
+       }))
+ 
+-      // 🔑 返回引用友好的格式，复用 REFERENCE_PROMPT 逻辑
+       const referenceContent = `\`\`\`json\n${JSON.stringify(citationData, null, 2)}\n\`\`\``
+       const fullInstructions = REFERENCE_PROMPT.replace(
+         '{question}',
+         "Based on the search results, please answer the user's question with proper citations."
+       ).replace('{references}', referenceContent)
++      const instructions = fullInstructions
+       return {
+         type: 'content',
+         value: [
+@@ -102,7 +133,7 @@ You can use this tool as-is to search with the prepared queries, or provide addi
+           },
+           {
+             type: 'text',
+-            text: fullInstructions
++            text: instructions
+           }
+         ]
+       }
+@@ -110,95 +141,5 @@ You can use this tool as-is to search with the prepared queries, or provide addi
+   })
+ }
+ 
+-// export const webSearchToolWithExtraction = (
+-//   webSearchProviderId: WebSearchProvider['id'],
+-//   requestId: string,
+-//   assistant: Assistant
+-// ) => {
+-//   const webSearchService = WebSearchService.getInstance(webSearchProviderId)
+-
+-//   return tool({
+-//     name: 'web_search_with_extraction',
+-//     description: 'Search the web for information with automatic keyword extraction from user messages',
+-//     inputSchema: z.object({
+-//       userMessage: z.object({
+-//         content: z.string().describe('The main content of the message'),
+-//         role: z.enum(['user', 'assistant', 'system']).describe('Message role')
+-//       }),
+-//       lastAnswer: z.object({
+-//         content: z.string().describe('The main content of the message'),
+-//         role: z.enum(['user', 'assistant', 'system']).describe('Message role')
+-//       })
+-//     }),
+-//     outputSchema: z.object({
+-//       extractedKeywords: z.object({
+-//         question: z.array(z.string()),
+-//         links: z.array(z.string()).optional()
+-//       }),
+-//       searchResults: z.array(
+-//         z.object({
+-//           query: z.string(),
+-//           results: WebSearchProviderResult
+-//         })
+-//       )
+-//     }),
+-//     execute: async ({ userMessage, lastAnswer }) => {
+-//       const lastUserMessage: Message = {
+-//         id: requestId,
+-//         role: userMessage.role,
+-//         assistantId: assistant.id,
+-//         topicId: 'temp',
+-//         createdAt: new Date().toISOString(),
+-//         status: UserMessageStatus.SUCCESS,
+-//         blocks: []
+-//       }
+-
+-//       const lastAnswerMessage: Message | undefined = lastAnswer
+-//         ? {
+-//             id: requestId + '_answer',
+-//             role: lastAnswer.role,
+-//             assistantId: assistant.id,
+-//             topicId: 'temp',
+-//             createdAt: new Date().toISOString(),
+-//             status: UserMessageStatus.SUCCESS,
+-//             blocks: []
+-//           }
+-//         : undefined
+-
+-//       const extractResults = await extractSearchKeywords(lastUserMessage, assistant, {
+-//         shouldWebSearch: true,
+-//         shouldKnowledgeSearch: false,
+-//         lastAnswer: lastAnswerMessage
+-//       })
+-
+-//       if (!extractResults?.websearch || extractResults.websearch.question[0] === 'not_needed') {
+-//         return 'No search needed or extraction failed'
+-//       }
+-
+-//       const searchQueries = extractResults.websearch.question
+-//       const searchResults: Array<{ query: string; results: any }> = []
+-
+-//       for (const query of searchQueries) {
+-//         // 构建单个查询的ExtractResults结构
+-//         const queryExtractResults: ExtractResults = {
+-//           websearch: {
+-//             question: [query],
+-//             links: extractResults.websearch.links
+-//           }
+-//         }
+-//         const response = await webSearchService.processWebsearch(queryExtractResults, requestId)
+-//         searchResults.push({
+-//           query,
+-//           results: response
+-//         })
+-//       }
+-
+-//       return { extractedKeywords: extractResults.websearch, searchResults }
+-//     }
+-//   })
+-// }
+-
+-// export type WebSearchToolWithExtractionOutput = InferToolOutput<ReturnType<typeof webSearchToolWithExtraction>>
+-
+ export type WebSearchToolOutput = InferToolOutput<ReturnType<typeof webSearchToolWithPreExtractedKeywords>>
+ export type WebSearchToolInput = InferToolInput<ReturnType<typeof webSearchToolWithPreExtractedKeywords>>
+diff --git a/src/aiCore/tools/__tests__/WebSearchTool.test.ts b/src/aiCore/tools/__tests__/WebSearchTool.test.ts
+new file mode 100644
+index 0000000..f3e8884
+--- /dev/null
++++ b/src/aiCore/tools/__tests__/WebSearchTool.test.ts
+@@ -0,0 +1,104 @@
++import WebSearchService from '@renderer/services/WebSearchService'
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { webSearchToolWithPreExtractedKeywords } from '../WebSearchTool'
++
++vi.mock('@renderer/services/WebSearchService', () => ({
++  default: {
++    getWebSearchProvider: vi.fn(),
++    processWebsearch: vi.fn()
++  }
++}))
++
++describe('webSearchToolWithPreExtractedKeywords', () => {
++  beforeEach(() => {
++    vi.clearAllMocks()
++    vi.mocked(WebSearchService.getWebSearchProvider).mockReturnValue({ id: 'tavily' } as any)
++    vi.mocked(WebSearchService.processWebsearch).mockResolvedValue({
++      query: 'first | second',
++      results: [
++        {
++          title: 'Result',
++          content: 'Content',
++          url: 'https://example.com/path?utm_source=newsletter#details'
++        }
++      ]
++    })
++  })
++
++  it('deduplicates queries, limits them, keeps full URLs in output, and shortens model URLs', async () => {
++    const searchTool = webSearchToolWithPreExtractedKeywords(
++      'tavily',
++      {
++        question: [' first ', 'FIRST', 'second', 'third', 'fourth']
++      },
++      'request-1'
++    ) as any
++
++    const firstResult = await searchTool.execute({})
++    const secondResult = await searchTool.execute({ additionalContext: 'new context' })
++
++    expect(WebSearchService.processWebsearch).toHaveBeenCalledTimes(1)
++    expect(WebSearchService.processWebsearch).toHaveBeenCalledWith(
++      { id: 'tavily' },
++      {
++        websearch: {
++          question: ['first', 'second', 'third'],
++          links: undefined
++        }
++      },
++      'request-1'
++    )
++    expect(firstResult.results[0].url).toBe('https://example.com/path?utm_source=newsletter#details')
++    expect(secondResult).toBe(firstResult)
++
++    const modelOutput = searchTool.toModelOutput({ output: firstResult })
++    const modelText = modelOutput.value.map((part: { text: string }) => part.text).join('\n')
++
++    expect(modelText).toContain('"url": "https://example.com"')
++    expect(modelText).not.toContain('utm_source')
++  })
++
++  it('reuses the in-flight search request for concurrent executions', async () => {
++    const searchResponse = {
++      query: 'first',
++      results: [
++        {
++          title: 'Result',
++          content: 'Content',
++          url: 'https://example.com/path?utm_source=newsletter#details'
++        }
++      ]
++    }
++    vi.mocked(WebSearchService.processWebsearch).mockImplementation(
++      () => new Promise((resolve) => setTimeout(() => resolve(searchResponse), 0))
++    )
++
++    const searchTool = webSearchToolWithPreExtractedKeywords(
++      'tavily',
++      {
++        question: ['first']
++      },
++      'request-1'
++    ) as any
++
++    const [firstResult, secondResult] = await Promise.all([
++      searchTool.execute({ additionalContext: 'first context' }),
++      searchTool.execute({ additionalContext: 'second context' })
++    ])
++
++    expect(WebSearchService.processWebsearch).toHaveBeenCalledTimes(1)
++    expect(WebSearchService.processWebsearch).toHaveBeenCalledWith(
++      { id: 'tavily' },
++      {
++        websearch: {
++          question: ['first context'],
++          links: undefined
++        }
++      },
++      'request-1'
++    )
++    expect(firstResult).toBe(searchResponse)
++    expect(secondResult).toBe(searchResponse)
++  })
++})
+diff --git a/src/aiCore/types/merged.ts b/src/aiCore/types/merged.ts
+index 398476a..19b677c 100644
+--- a/src/aiCore/types/merged.ts
++++ b/src/aiCore/types/merged.ts
+@@ -75,6 +75,7 @@ function buildAppProviderIds(): ProviderIdsMap {
+     if (config.variants) {
+       config.variants.forEach((variant) => {
+         // 变体自反映射：'azure-responses' -> 'azure-responses'
++        // oxlint-disable-next-line typescript/no-unnecessary-type-assertion
+         const variantId = `${name}-${variant.suffix}` as KnownAppProviderId
+         ;(map as Record<string, KnownAppProviderId>)[variantId] = variantId
+       })
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 7c2b851..c06fce1 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -81,6 +81,7 @@ vi.mock('@renderer/config/models', async (importOriginal) => {
+     isSupportedThinkingTokenMiMoModel: vi.fn(() => false),
+     isSupportedReasoningEffortModel: vi.fn(() => false),
+     isDeepSeekHybridInferenceModel: vi.fn(() => false),
++    isDeepSeekV4PlusModel: vi.fn(() => false),
+     isSupportedReasoningEffortGrokModel: vi.fn(() => false),
+     getThinkModelType: vi.fn(() => 'default'),
+     isDoubaoSeedAfter251015: vi.fn(() => false),
+@@ -430,6 +431,54 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
++    it('should use enable_thinking:false for SiliconFlow + DeepSeek-V4-Flash when reasoning_effort is none', async () => {
++      const { isReasoningModel, isDeepSeekHybridInferenceModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isDeepSeekHybridInferenceModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'deepseek-ai/DeepSeek-V4-Flash',
++        name: 'DeepSeek V4 Flash',
++        provider: SystemProviderIds.silicon
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getReasoningEffort(assistant, model)
++      expect(result).toEqual({ enable_thinking: false })
++    })
++
++    it('should use enable_thinking:false for SiliconFlow + Zhipu model when reasoning_effort is none', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenZhipuModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenZhipuModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'THUDM/glm-4.5-thinking',
++        name: 'GLM-4.5 Thinking',
++        provider: SystemProviderIds.silicon
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getReasoningEffort(assistant, model)
++      expect(result).toEqual({ enable_thinking: false })
++    })
++
+     it('should return medium effort for deep research models', async () => {
+       const { isReasoningModel, isOpenAIDeepResearchModel } = await import('@renderer/config/models')
+ 
+@@ -522,6 +571,159 @@ describe('reasoning utils', () => {
+       const result = getReasoningEffort(assistant, model)
+       expect(result).toEqual({})
+     })
++
++    // Mistral models use reasoningEffort with only 'none' | 'high' support
++    describe('Mistral models (mistral-small-2603 and magistral-*)', () => {
++      // Helper: Create a Mistral model
++      const createMistralModel = (id: string): Model => ({
++        id,
++        name: id,
++        provider: 'mistral',
++        group: 'Mistral'
++      })
++
++      // Helper: Create an assistant with specific reasoning_effort setting
++      const createAssistantWithReasoning = (effort: string | undefined): Assistant =>
++        ({
++          id: 'test',
++          name: 'Test',
++          settings: {
++            reasoning_effort: effort as any
++          }
++        }) as Assistant
++
++      describe('mistral-small-2603', () => {
++        const mistralModel = createMistralModel('mistral-small-2603')
++
++        it('should return { reasoningEffort: "high" } when reasoning_effort is "high"', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('high')
++          const result = getReasoningEffort(assistant, mistralModel)
++          expect(result).toEqual({ reasoningEffort: 'high' })
++        })
++
++        it('should return { reasoningEffort: "none" } when reasoning_effort is "none"', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('none')
++          const result = getReasoningEffort(assistant, mistralModel)
++          expect(result).toEqual({ reasoningEffort: 'none' })
++        })
++
++        it('should return { reasoningEffort: "high" } when reasoning_effort is "low" (mapping)', async () => {
++          // Mistral models only support 'none' and 'high', so other values map to 'high'
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('low')
++          const result = getReasoningEffort(assistant, mistralModel)
++          expect(result).toEqual({ reasoningEffort: 'high' })
++        })
++
++        it('should return { reasoningEffort: "high" } when reasoning_effort is "medium" (mapping)', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('medium')
++          const result = getReasoningEffort(assistant, mistralModel)
++          expect(result).toEqual({ reasoningEffort: 'high' })
++        })
++
++        it('should return {} when reasoning_effort is "default"', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('default')
++          const result = getReasoningEffort(assistant, mistralModel)
++          expect(result).toEqual({})
++        })
++
++        it('should return {} when reasoning_effort is undefined', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = {
++            id: 'test',
++            name: 'Test',
++            settings: {
++              reasoning_effort: undefined
++            }
++          } as Assistant
++          const result = getReasoningEffort(assistant, mistralModel)
++          expect(result).toEqual({})
++        })
++      })
++
++      describe('magistral-small-latest', () => {
++        // Magistral models reason natively — they do NOT accept reasoning_effort parameter
++        const magistralModel = createMistralModel('magistral-small-latest')
++
++        it('should return {} for magistral (native reasoning, no parameter)', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('high')
++          const result = getReasoningEffort(assistant, magistralModel)
++          expect(result).toEqual({})
++        })
++
++        it('should return {} for magistral when reasoning_effort is "none"', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('none')
++          const result = getReasoningEffort(assistant, magistralModel)
++          expect(result).toEqual({})
++        })
++      })
++
++      describe('magistral-medium-latest', () => {
++        // Magistral models reason natively — no reasoning_effort parameter accepted
++        const magistralModel = createMistralModel('magistral-medium-latest')
++
++        it('should return {} for magistral-medium (native reasoning)', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('xhigh')
++          const result = getReasoningEffort(assistant, magistralModel)
++          expect(result).toEqual({})
++        })
++
++        it('should return {} for magistral-medium with auto effort', async () => {
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const assistant = createAssistantWithReasoning('auto')
++          const result = getReasoningEffort(assistant, magistralModel)
++          expect(result).toEqual({})
++        })
++      })
++
++      describe('edge cases', () => {
++        it('should return {} for non-reasoning Mistral models', async () => {
++          // isReasoningModel returns false by default in the top-level mock
++          const nonReasoningModel = createMistralModel('mistral-large-2407')
++          const assistant = createAssistantWithReasoning('high')
++          const result = getReasoningEffort(assistant, nonReasoningModel)
++          expect(result).toEqual({})
++        })
++
++        it('should handle model ID with different case', async () => {
++          // getLowerBaseModelName converts to lowercase, so case shouldn't matter
++          const { isReasoningModel } = await import('@renderer/config/models')
++          vi.mocked(isReasoningModel).mockReturnValue(true)
++
++          const upperCaseModel = createMistralModel('MISTRAL-SMALL-2603')
++          const assistant = createAssistantWithReasoning('high')
++          const result = getReasoningEffort(assistant, upperCaseModel)
++          expect(result).toEqual({ reasoningEffort: 'high' })
++        })
++      })
++    })
+   })
+ 
+   describe('getOpenAIReasoningParams', () => {
+@@ -762,6 +964,55 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
++    it('should use adaptive thinking with native xhigh effort and summarized display for Claude Opus 4.7', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh' }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'adaptive', display: 'summarized' },
++        effort: 'xhigh'
++      })
++    })
++
++    it('should use adaptive thinking with summarized display even without explicit effort for Claude Opus 4.7', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'auto' }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'adaptive', display: 'summarized' }
++      })
++    })
++
+     it('should use fallback budgetTokens when findTokenLimit returns undefined for Claude model', async () => {
+       const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
+         '@renderer/config/models'
+@@ -828,7 +1079,8 @@ describe('reasoning utils', () => {
+         thinking: {
+           type: 'enabled',
+           budgetTokens: expect.any(Number)
+-        }
++        },
++        sendReasoning: true
+       })
+       const thinking = result.thinking as { type: 'enabled'; budgetTokens?: number }
+       expect(thinking.budgetTokens).toBeGreaterThanOrEqual(1024)
+@@ -869,6 +1121,125 @@ describe('reasoning utils', () => {
+       const highThinking = highResult.thinking as { type: 'enabled'; budgetTokens?: number }
+       expect(highThinking.budgetTokens).toBeGreaterThanOrEqual(lowThinking.budgetTokens!)
+     })
++
++    it('should map DeepSeek V4+ xhigh effort to max on the Claude endpoint', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, isDeepSeekV4PlusModel, findTokenLimit } =
++        await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(isDeepSeekV4PlusModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'deepseek-v4-pro',
++        name: 'DeepSeek V4 Pro',
++        provider: 'deepseek'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh', maxTokens: 4096 }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'enabled', budgetTokens: expect.any(Number) },
++        sendReasoning: true,
++        effort: 'max'
++      })
++    })
++
++    it('should map DeepSeek V4+ high effort to high on the Claude endpoint', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, isDeepSeekV4PlusModel, findTokenLimit } =
++        await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(isDeepSeekV4PlusModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'deepseek-v4',
++        name: 'DeepSeek V4',
++        provider: 'deepseek'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high', maxTokens: 4096 }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'enabled', budgetTokens: expect.any(Number) },
++        sendReasoning: true,
++        effort: 'high'
++      })
++    })
++
++    it('should not add effort for DeepSeek V4+ when effort is outside the documented set', async () => {
++      // Guard against silent downgrade: if MODEL_SUPPORTED_REASONING_EFFORT.deepseek_v4 ever gains
++      // new levels (low/medium/auto), the explicit effortMap must be extended — otherwise effort
++      // is omitted here rather than being silently mapped to 'high'.
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, isDeepSeekV4PlusModel, findTokenLimit } =
++        await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(isDeepSeekV4PlusModel).mockReturnValue(true)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'deepseek-v4',
++        name: 'DeepSeek V4',
++        provider: 'deepseek'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'medium', maxTokens: 4096 }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'enabled', budgetTokens: expect.any(Number) },
++        sendReasoning: true
++      })
++      expect(result).not.toHaveProperty('effort')
++    })
++
++    it('should not add effort for non-DeepSeek models on the Claude endpoint', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel, isDeepSeekV4PlusModel, findTokenLimit } =
++        await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(false)
++      vi.mocked(isDeepSeekV4PlusModel).mockReturnValue(false)
++      vi.mocked(findTokenLimit).mockReturnValue(undefined)
++
++      const model: Model = {
++        id: 'kimi-k2-reasoning',
++        name: 'Kimi K2 Reasoning',
++        provider: 'custom-provider'
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh', maxTokens: 4096 }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'enabled', budgetTokens: expect.any(Number) },
++        sendReasoning: true
++      })
++      expect(result).not.toHaveProperty('effort')
++    })
+   })
+ 
+   describe('getGeminiReasoningParams', () => {
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 808a7a4..9f15968 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -11,7 +11,9 @@ import {
+   GEMINI_FLASH_MODEL_REGEX,
+   getModelSupportedReasoningEffortOptions,
+   isClaude46SeriesModel,
++  isClaude47SeriesModel,
+   isDeepSeekHybridInferenceModel,
++  isDeepSeekV4PlusModel,
+   isDoubaoSeed18Model,
+   isDoubaoSeedAfter251015,
+   isDoubaoThinkingAutoModel,
+@@ -142,7 +144,10 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       (provider.id === SystemProviderIds.dashscope &&
+         (isDeepSeekHybridInferenceModel(model) ||
+           isSupportedThinkingTokenZhipuModel(model) ||
+-          isSupportedThinkingTokenKimiModel(model)))
++          isSupportedThinkingTokenKimiModel(model))) ||
++      // SiliconFlow uses enable_thinking for DeepSeek and Zhipu models, same as positive path
++      (provider.id === SystemProviderIds.silicon &&
++        (isDeepSeekHybridInferenceModel(model) || isSupportedThinkingTokenZhipuModel(model)))
+     ) {
+       return { enable_thinking: false }
+     }
+@@ -185,7 +190,12 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       return { thinking: { type: 'disabled' } }
+     }
+ 
+-    // Deepseek, default behavior is non-thinking
++    // DeepSeek V4+ defaults to thinking enabled, explicitly disable it
++    if (isDeepSeekV4PlusModel(model)) {
++      return { thinking: { type: 'disabled' } }
++    }
++
++    // DeepSeek V3.x hybrid, default behavior is non-thinking
+     if (isDeepSeekHybridInferenceModel(model)) {
+       return {}
+     }
+@@ -207,6 +217,11 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+       }
+     }
+ 
++    // Mistral Small models: reasoningEffort 'none'
++    if (modelId.includes('mistral-small-2603')) {
++      return { reasoningEffort: 'none' }
++    }
++
+     logger.warn(`Model ${model.id} doesn't match any disable reasoning behavior. Fallback to empty reasoning param.`)
+     return {}
+   }
+@@ -341,6 +356,15 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     return {}
+   }
+ 
++  // DeepSeek V4+ models support reasoning_effort: "high" | "max" alongside thinking control
++  // UI uses "xhigh" which maps to API's "max"; all other effort levels map to "high"
++  if (isDeepSeekV4PlusModel(model)) {
++    return {
++      thinking: { type: 'enabled' as const },
++      reasoning_effort: reasoningEffort === 'xhigh' ? ('max' as OpenAIReasoningEffort) : 'high'
++    }
++  }
++
+   // DeepSeek hybrid inference models, v3.1 and maybe more in the future
+   // 不同的 provider 有不同的思考控制方式，在这里统一解决
+   if (isDeepSeekHybridInferenceModel(model)) {
+@@ -490,6 +514,11 @@ export function getReasoningEffort(assistant: Assistant, model: Model): Reasonin
+     }
+   }
+ 
++  // Mistral Small models use reasoningEffort with 'none' | 'high'
++  if (modelId.includes('mistral-small-2603')) {
++    return { reasoningEffort: 'high' }
++  }
++
+   // gemini series, openai compatible api
+   if (isSupportedThinkingTokenGeminiModel(model)) {
+     // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#openai_compatibility
+@@ -666,11 +695,19 @@ function getFallbackBudgetTokens(reasoningEffort: string | undefined): number {
+  *   Uses the new adaptive thinking API with effort-based control.
+  * - **Other Claude models** (4.0, 4.1, 4.5, etc.): `{ thinking: { type: 'enabled', budgetTokens: number } }`
+  *   Uses the classic thinking API with explicit token budget.
++ * - **Non-Anthropic models served via the Claude-compatible endpoint** (Kimi, MiniMax,
++ *   DeepSeek V4+, etc.): `{ thinking: { type: 'enabled', budgetTokens: number }, sendReasoning: true, effort? }`
++ *   `sendReasoning: true` ensures reasoning output is streamed back to the UI.
++ *   `effort` is only added for DeepSeek V4+ (`high` | `xhigh` → `high` | `max`).
+  */
+ export function getAnthropicReasoningParams(
+   assistant: Assistant,
+   model: Model
+-): Pick<AnthropicProviderOptions, 'thinking' | 'effort'> {
++): {
++  thinking?: AnthropicProviderOptions['thinking']
++  effort?: AnthropicProviderOptions['effort']
++  sendReasoning?: AnthropicProviderOptions['sendReasoning']
++} {
+   if (!isReasoningModel(model)) {
+     return {}
+   }
+@@ -691,6 +728,24 @@ export function getAnthropicReasoningParams(
+ 
+   // Claude reasoning parameters
+   if (isSupportedThinkingTokenClaudeModel(model)) {
++    // Claude 4.7: adaptive thinking + native 'xhigh' effort.
++    // Also requires thinking.display: 'summarized' — API defaults to 'omitted'
++    // (no reasoning text in response), which would break Cherry's thinking UI.
++    if (isClaude47SeriesModel(model)) {
++      const effort47Map = {
++        default: undefined,
++        auto: undefined,
++        minimal: 'low',
++        low: 'low',
++        medium: 'medium',
++        high: 'high',
++        xhigh: 'xhigh'
++      } as const satisfies Record<Exclude<ReasoningEffortOption, 'none'>, AnthropicProviderOptions['effort']>
++      const effort = effort47Map[reasoningEffort]
++      const thinking = { type: 'adaptive', display: 'summarized' } as const
++      return effort ? { thinking, effort } : { thinking }
++    }
++
+     // Claude 4.6 uses adaptive thinking + effort parameters
+     // Map reasoningEffort to Claude 4.6 supported effort values
+     if (isClaude46SeriesModel(model)) {
+@@ -727,10 +782,33 @@ export function getAnthropicReasoningParams(
+     // 其他使用claude端點的模型，比如Kimi,Minimax等等
+     const { maxTokens } = getAssistantSettings(assistant)
+     const budgetTokens = getThinkingBudget(maxTokens, reasoningEffort, model.id)
++    const params: Partial<ReturnType<typeof getAnthropicReasoningParams>> = {
++      thinking: {
++        type: 'enabled',
++        budgetTokens: budgetTokens ?? getFallbackBudgetTokens(reasoningEffort)
++      },
++      sendReasoning: true
++    }
++    // https://api-docs.deepseek.com/guides/thinking_mode
++    // DeepSeek V4+ exposes only 'high' and 'xhigh' as user-facing effort levels
++    // (see MODEL_SUPPORTED_REASONING_EFFORT.deepseek_v4); default/none are already
++    // short-circuited earlier in this function. The explicit map avoids silently
++    // downgrading future levels (low/medium/auto) to 'high' — unmapped values are
++    // simply omitted so callers fall back to API defaults instead.
++    if (isDeepSeekV4PlusModel(model)) {
++      const deepSeekV4EffortMap = {
++        high: 'high',
++        xhigh: 'max'
++      } as const
++      const effort = deepSeekV4EffortMap[reasoningEffort as keyof typeof deepSeekV4EffortMap]
++      if (effort) {
++        params.effort = effort
++      }
++    }
+     // Always include budgetTokens to prevent Claude Agent SDK from converting
+     // { type: 'enabled' } into '--thinking adaptive', which non-Anthropic
+     // upstream providers do not support (they only accept 'enabled'/'disabled').
+-    return { thinking: { type: 'enabled', budgetTokens: budgetTokens ?? getFallbackBudgetTokens(reasoningEffort) } }
++    return params
+   }
+ }
+ 
+@@ -893,8 +971,10 @@ export function getBedrockReasoningParams(
+     return {}
+   }
+ 
+-  // Claude 4.6 uses adaptive thinking + maxReasoningEffort
+-  if (isClaude46SeriesModel(model)) {
++  // Claude 4.6 / 4.7 use adaptive thinking + maxReasoningEffort.
++  // Bedrock's maxReasoningEffort enum doesn't yet include 'xhigh', so 4.7 xhigh
++  // falls back to 'max' here (matches the 4.6 mapping).
++  if (isClaude46SeriesModel(model) || isClaude47SeriesModel(model)) {
+     const effortMap = {
+       auto: undefined,
+       minimal: 'low',
