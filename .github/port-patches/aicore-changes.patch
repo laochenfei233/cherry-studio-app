@@ -1,0 +1,1150 @@
+diff --git a/src/aiCore/AiProvider.ts b/src/aiCore/AiProvider.ts
+index 9eba5b0..a1b1845 100644
+--- a/src/aiCore/AiProvider.ts
++++ b/src/aiCore/AiProvider.ts
+@@ -2,21 +2,12 @@ import { createExecutor } from '@cherrystudio/ai-core'
+ import type { generateImageResult } from '@cherrystudio/ai-core/core/runtime/types'
+ import { loggerService } from '@logger'
+ import { getEnableDeveloperMode } from '@renderer/hooks/useSettings'
+-import { normalizeGatewayModels } from '@renderer/services/models/ModelAdapter'
+ import { addSpan, endSpan } from '@renderer/services/SpanManagerService'
+ import type { StartSpanParams } from '@renderer/trace/types/ModelSpanEntity'
+-import {
+-  type Assistant,
+-  type EditImageParams,
+-  type GenerateImageParams,
+-  type Model,
+-  type Provider,
+-  SystemProviderIds
+-} from '@renderer/types'
++import type { Assistant, EditImageParams, GenerateImageParams, Model, Provider } from '@renderer/types'
+ import type { StreamTextParams } from '@renderer/types/aiCoreTypes'
+ import { getLowerBaseModelName } from '@renderer/utils'
+ import { buildClaudeCodeSystemModelMessage } from '@shared/anthropic'
+-import { createGateway } from 'ai'
+ 
+ import AiSdkToChunkAdapter from './chunk/AiSdkToChunkAdapter'
+ import { buildPlugins } from './plugins/PluginBuilder'
+@@ -266,7 +257,8 @@ export default class AiProvider {
+         middlewareConfig.enableWebSearch,
+         undefined,
+         undefined,
+-        providerConfig.providerId
++        providerConfig.providerId,
++        middlewareConfig.idleTimeout
+       )
+ 
+       const streamResult = await executor.streamText({
+@@ -329,13 +321,6 @@ export default class AiProvider {
+    * 使用 ModelListService 统一处理各 Provider 的模型列表获取
+    */
+   public async models(): Promise<Model[]> {
+-    // Gateway provider 使用 AI SDK 的 gateway API
+-    if (this.actualProvider.id === SystemProviderIds.gateway) {
+-      const gatewayModels = (await createGateway({ apiKey: this.actualProvider.apiKey }).getAvailableModels()).models
+-      return normalizeGatewayModels(this.actualProvider, gatewayModels)
+-    }
+-
+-    // 使用新的 ModelListService
+     return await listModels(this.actualProvider)
+   }
+ 
+diff --git a/src/aiCore/__tests__/ModernAiProvider.models.test.ts b/src/aiCore/__tests__/ModernAiProvider.models.test.ts
+deleted file mode 100644
+index 7f99d0e..0000000
+--- a/src/aiCore/__tests__/ModernAiProvider.models.test.ts
++++ /dev/null
+@@ -1,87 +0,0 @@
+-import type { GatewayLanguageModelEntry } from '@ai-sdk/gateway'
+-import type { Provider } from '@renderer/types'
+-import { SystemProviderIds } from '@renderer/types'
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
+-
+-const mockGetAvailableModels = vi.fn()
+-const mockCreateGateway = vi.fn()
+-
+-vi.mock('ai', async (importOriginal) => {
+-  const actual = (await importOriginal()) as any
+-  return {
+-    ...actual,
+-    createGateway: (opts: any) => {
+-      mockCreateGateway(opts)
+-      return { getAvailableModels: mockGetAvailableModels }
+-    }
+-  }
+-})
+-
+-vi.mock('@renderer/aiCore/provider/providerConfig', async (importOriginal) => {
+-  const actual = (await importOriginal()) as any
+-  return {
+-    ...actual,
+-    adaptProvider: ({ provider }: { provider: Provider }) => provider,
+-    providerToAiSdkConfig: vi.fn()
+-  }
+-})
+-
+-const makeGatewayProvider = (apiKey: string): Provider =>
+-  ({
+-    id: SystemProviderIds.gateway,
+-    name: 'Vercel AI Gateway',
+-    type: 'gateway',
+-    apiKey,
+-    apiHost: 'https://ai-gateway.vercel.sh/v1/ai',
+-    models: [],
+-    isSystem: true,
+-    enabled: true
+-  }) as unknown as Provider
+-
+-describe('AiProvider.models() — gateway provider', () => {
+-  beforeEach(() => {
+-    vi.clearAllMocks()
+-  })
+-
+-  it('passes the configured apiKey to createGateway', async () => {
+-    const { default: AiProvider } = await import('@renderer/aiCore/AiProvider')
+-
+-    mockGetAvailableModels.mockResolvedValue({ models: [] })
+-
+-    const provider = makeGatewayProvider('my-real-api-key')
+-    const ai = new AiProvider(provider)
+-    await ai.models()
+-
+-    expect(mockCreateGateway).toHaveBeenCalledWith({ apiKey: 'my-real-api-key' })
+-  })
+-
+-  it('returns normalized models on success', async () => {
+-    const { default: AiProvider } = await import('@renderer/aiCore/AiProvider')
+-
+-    const fakeEntries: GatewayLanguageModelEntry[] = [
+-      { id: 'openai/gpt-4o', name: 'GPT-4o', description: 'OpenAI GPT-4o' } as GatewayLanguageModelEntry,
+-      { id: 'anthropic/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet' } as GatewayLanguageModelEntry
+-    ]
+-    mockGetAvailableModels.mockResolvedValue({ models: fakeEntries })
+-
+-    const provider = makeGatewayProvider('valid-key')
+-    const ai = new AiProvider(provider)
+-    const models = await ai.models()
+-
+-    expect(models).toHaveLength(2)
+-    expect(models[0].id).toBe('openai/gpt-4o')
+-    expect(models[0].provider).toBe(SystemProviderIds.gateway)
+-    expect(models[1].id).toBe('anthropic/claude-3-5-sonnet')
+-  })
+-
+-  it('propagates error when getAvailableModels fails', async () => {
+-    const { default: AiProvider } = await import('@renderer/aiCore/AiProvider')
+-
+-    mockGetAvailableModels.mockRejectedValue(new Error('401 Invalid Token'))
+-
+-    const provider = makeGatewayProvider('bad-key')
+-    const ai = new AiProvider(provider)
+-
+-    await expect(ai.models()).rejects.toThrow('401 Invalid Token')
+-  })
+-})
+diff --git a/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts b/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
+index f6d6c2e..0f4e26a 100644
+--- a/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
++++ b/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
+@@ -43,8 +43,8 @@ function makeProvider(id: string, type: ProviderType): Provider {
+   return { id, name: id, type, apiKey: 'test', apiHost: 'https://test.com', isSystem: false, models: [] } as Provider
+ }
+ 
+-function makeModel(): Model {
+-  return { id: 'test-model', provider: 'test', name: 'Test', group: 'test' } as Model
++function makeModel(overrides: Partial<Model> = {}): Model {
++  return { id: 'test-model', provider: 'test', name: 'Test', group: 'test', ...overrides } as Model
+ }
+ 
+ function makePdfFilePart(filename = 'test.pdf') {
+@@ -157,6 +157,26 @@ describe('pdfCompatibilityPlugin', () => {
+     })
+   })
+ 
++  it('should convert PDF for qiniu openai-compatible GPT models', async () => {
++    const provider = makeProvider('qiniu', 'openai')
++    const model = makeModel({ id: 'gpt-5.4', name: 'gpt-5.4' })
++    mockExtractPdfText.mockResolvedValue('Extracted PDF content')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart('report.pdf')] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params, model)
++    expect(mockExtractPdfText).toHaveBeenCalledWith('base64pdfdata')
++    expect(result.prompt[0]).toMatchObject({
++      role: 'user',
++      content: [
++        { type: 'text', text: 'Hello' },
++        { type: 'text', text: 'report.pdf\nExtracted PDF content' }
++      ]
++    })
++  })
++
+   it('should convert PDF FilePart to TextPart for ollama provider', async () => {
+     const provider = makeProvider('ollama', 'ollama')
+     mockExtractPdfText.mockResolvedValue('Extracted PDF content')
+diff --git a/src/aiCore/plugins/pdfCompatibilityPlugin.ts b/src/aiCore/plugins/pdfCompatibilityPlugin.ts
+index 427199f..05e8f8c 100644
+--- a/src/aiCore/plugins/pdfCompatibilityPlugin.ts
++++ b/src/aiCore/plugins/pdfCompatibilityPlugin.ts
+@@ -10,6 +10,7 @@ import { loggerService } from '@logger'
+ import { isAnthropicModel, isGeminiModel } from '@renderer/config/models'
+ import { isOpenAILLMModel } from '@renderer/config/models/openai'
+ import type { Model, Provider, ProviderType } from '@renderer/types'
++import { SystemProviderIds } from '@renderer/types'
+ import { extractPdfText } from '@shared/utils/pdf'
+ import type { LanguageModelMiddleware } from 'ai'
+ import i18n from 'i18next'
+@@ -34,11 +35,17 @@ const PDF_NATIVE_PROVIDER_TYPES = new Set<ProviderType>([
+   'vertex-anthropic' // Vertex AI with Anthropic models
+ ])
+ 
++const PDF_FORCE_TEXT_EXTRACTION_PROVIDER_IDS = new Set<string>([SystemProviderIds.qiniu])
++
+ function isPdfFilePart(part: ContentPart): part is LanguageModelV3FilePart & { mediaType: 'application/pdf' } {
+   return part.type === 'file' && part.mediaType === 'application/pdf'
+ }
+ 
+ function supportsNativePdf(provider: Provider, model: Model): boolean {
++  if (PDF_FORCE_TEXT_EXTRACTION_PROVIDER_IDS.has(provider.id)) {
++    return false
++  }
++
+   // OpenAI, Claude, and Gemini models always support native PDF regardless of provider
+   if (isOpenAILLMModel(model) || isAnthropicModel(model) || isGeminiModel(model)) {
+     return true
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index 80b7d45..c905522 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -3,7 +3,7 @@ import { TopicType } from '@renderer/types'
+ import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ import { describe, expect, it, vi } from 'vitest'
+ 
+-import { getMaxTokens, getTemperature, getTimeout, getTopP } from '../modelParameters'
++import { filterStandardParams, getMaxTokens, getTemperature, getTimeout, getTopP } from '../modelParameters'
+ 
+ vi.mock('@renderer/services/AssistantService', () => ({
+   DEFAULT_ASSISTANT_SETTINGS: {
+@@ -191,6 +191,39 @@ describe('modelParameters', () => {
+ 
+       expect(getTemperature(assistant, model)).toBe(0.8)
+     })
++
++    it('always returns undefined for Claude Opus 4.7 (rejects sampling parameters)', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: 'anthropic',
++        group: 'Claude 4.7'
++      })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
++
++    it('returns undefined for Gemini 3.x models', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'gemini-3.5-flash', provider: 'gemini', group: 'Google' })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
++
++    it('returns undefined for Gemini 3.x aliases', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'gemini-flash-latest', provider: 'gemini', group: 'Google' })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
++
++    it('returns undefined for Gemini 3.x model ids on non-Gemini providers', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'gemini-3.5-flash', provider: 'openai', group: 'Google' })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
+   })
+ 
+   describe('getTopP', () => {
+@@ -234,6 +267,18 @@ describe('modelParameters', () => {
+       expect(getTopP(assistant, model)).toBeUndefined()
+     })
+ 
++    it('always returns undefined for Claude Opus 4.7 (rejects sampling parameters)', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.95 })
++      const model = createModel({
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: 'anthropic',
++        group: 'Claude 4.7'
++      })
++
++      expect(getTopP(assistant, model)).toBeUndefined()
++    })
++
+     it('clamps topP to [0.95, 1] for Claude reasoning models with reasoning effort', () => {
+       const assistant = createAssistant({ enableTopP: true, topP: 0.5, reasoning_effort: 'high' })
+       const model = createModel({ id: 'claude-sonnet-4.5', provider: 'anthropic', group: 'claude' })
+@@ -261,6 +306,59 @@ describe('modelParameters', () => {
+ 
+       expect(getTopP(assistant, model)).toBe(0.97)
+     })
++
++    it('returns undefined for Gemini 3.x models', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.95 })
++      const model = createModel({ id: 'gemini-pro-latest', provider: 'gemini', group: 'Google' })
++
++      expect(getTopP(assistant, model)).toBeUndefined()
++    })
++  })
++
++  describe('filterStandardParams', () => {
++    const opus47 = createModel({
++      id: 'claude-opus-4-7',
++      name: 'Claude Opus 4.7',
++      provider: 'anthropic',
++      group: 'Claude 4.7'
++    })
++    const sonnet = createModel({
++      id: 'claude-sonnet-4.5',
++      name: 'Claude Sonnet 4.5',
++      provider: 'anthropic',
++      group: 'claude'
++    })
++
++    it('drops topK for Claude Opus 4.7', () => {
++      expect(filterStandardParams({ topK: 40, frequencyPenalty: 0.1 }, opus47)).toEqual({ frequencyPenalty: 0.1 })
++    })
++
++    it('returns the same object when topK is absent for Opus 4.7', () => {
++      const input = { frequencyPenalty: 0.1, seed: 42 }
++      expect(filterStandardParams(input, opus47)).toBe(input)
++    })
++
++    it('keeps topK for non-Opus-4.7 models', () => {
++      const input = { topK: 40 }
++      expect(filterStandardParams(input, sonnet)).toBe(input)
++    })
++
++    it('returns the same object when standardParams is empty', () => {
++      const input = {}
++      expect(filterStandardParams(input, opus47)).toBe(input)
++    })
++
++    it('drops topK for Gemini 3.x models', () => {
++      const gemini35 = createModel({ id: 'gemini-3.5-flash', provider: 'gemini', group: 'Google' })
++
++      expect(filterStandardParams({ topK: 40, frequencyPenalty: 0.1 }, gemini35)).toEqual({ frequencyPenalty: 0.1 })
++    })
++
++    it('drops topK for Gemini 3.x model ids on non-Gemini providers', () => {
++      const proxyGemini = createModel({ id: 'gemini-3.5-flash', provider: 'openai', group: 'Google' })
++
++      expect(filterStandardParams({ topK: 40, frequencyPenalty: 0.1 }, proxyGemini)).toEqual({ frequencyPenalty: 0.1 })
++    })
+   })
+ 
+   describe('getTimeout', () => {
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 79c2d04..9474046 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -6,7 +6,9 @@
+ import { loggerService } from '@logger'
+ import {
+   isClaude46SeriesModel,
++  isClaude47SeriesModel,
+   isClaudeReasoningModel,
++  isGemini3Model,
+   isMaxTemperatureOneModel,
+   isSupportedFlexServiceTier,
+   isSupportedThinkingTokenClaudeModel,
+@@ -20,6 +22,7 @@ import {
+   getProviderByModel
+ } from '@renderer/services/AssistantService'
+ import { type Assistant, type Model } from '@renderer/types'
++import type { AiSdkParam } from '@renderer/types/aiCoreTypes'
+ import { DEFAULT_TIMEOUT } from '@shared/config/constant'
+ 
+ import { getThinkingBudget } from '../utils/reasoning'
+@@ -28,18 +31,32 @@ const logger = loggerService.withContext('modelParameters')
+ 
+ /**
+  * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Gemini 3.x models.
+  * - Disabled when enableTemperature is off.
++ * - Disabled unconditionally for Claude Opus 4.7 (rejects sampling params with HTTP 400).
+  * - Disabled for Claude reasoning models when reasoning effort is set (excluding 'default' and 'none').
+  * - Disabled for models that do not support temperature.
+  * - Clamped to 1 for models with max temperature of 1.
+  * Otherwise, returns the temperature value.
+  */
+ export function getTemperature(assistant: Assistant, model: Model): number | undefined {
++  if (isGemini3Model(model)) {
++    logger.info(`Gemini 3.x model ${model.id} uses default sampling settings, disabling temperature`)
++    return undefined
++  }
++
+   const enableTemperature = assistant.settings?.enableTemperature ?? DEFAULT_ASSISTANT_SETTINGS.enableTemperature
+   if (!enableTemperature) {
+     return undefined
+   }
+ 
++  // Claude Opus 4.7 rejects sampling params (temperature/top_p/top_k) with HTTP 400
++  // regardless of reasoning settings. See Vercel AI SDK PR #14529.
++  if (isClaude47SeriesModel(model)) {
++    logger.info(`Model ${model.id} rejects sampling parameters, disabling temperature`)
++    return undefined
++  }
++
+   // Thinking isn't compatible with temperature or top_k modifications as well as forced tool use.
+   // See: https://platform.claude.com/docs/en/build-with-claude/extended-thinking#feature-compatibility
+   if (
+@@ -73,18 +90,31 @@ export function getTemperature(assistant: Assistant, model: Model): number | und
+ 
+ /**
+  * Retrieves the TopP parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Gemini 3.x models.
+  * - Disabled when enableTopP is off.
++ * - Disabled unconditionally for Claude Opus 4.7 (rejects sampling params with HTTP 400).
+  * - Disabled for models that do not support TopP.
+  * - Disabled for mutually exclusive models when temperature is enabled.
+  * - Clamped to [0.95, 1] for Claude reasoning models with reasoning effort set (excluding 'default' and 'none').
+  * Otherwise, returns the TopP value.
+  */
+ export function getTopP(assistant: Assistant, model: Model): number | undefined {
++  if (isGemini3Model(model)) {
++    logger.info(`Gemini 3.x model ${model.id} uses default sampling settings, disabling topP`)
++    return undefined
++  }
++
+   const enableTopP = assistant.settings?.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
+   if (!enableTopP) {
+     return undefined
+   }
+ 
++  // Claude Opus 4.7 rejects sampling params unconditionally (see getTemperature).
++  if (isClaude47SeriesModel(model)) {
++    logger.info(`Model ${model.id} rejects sampling parameters, disabling topP`)
++    return undefined
++  }
++
+   if (!isSupportTopPModel(model, assistant)) {
+     logger.info(`Model ${model.id} does not support topP, disabling topP.`)
+     return undefined
+@@ -116,6 +146,29 @@ export function getTopP(assistant: Assistant, model: Model): number | undefined
+   return topP
+ }
+ 
++/**
++ * Filters AI SDK standard parameters extracted from custom parameters, removing any
++ * the model rejects. Currently strips `topK` for Gemini 3.x models and Claude Opus 4.7
++ * since both reject or discourage sampling params.
++ */
++export function filterStandardParams(
++  standardParams: Partial<Record<AiSdkParam, any>>,
++  model: Model
++): Partial<Record<AiSdkParam, any>> {
++  if (isGemini3Model(model) && 'topK' in standardParams) {
++    const { topK, ...rest } = standardParams
++    logger.info(`Gemini 3.x model ${model.id} uses default sampling settings, dropping topK=${topK} from custom params`)
++    return rest
++  }
++
++  if (isClaude47SeriesModel(model) && 'topK' in standardParams) {
++    const { topK, ...rest } = standardParams
++    logger.info(`Model ${model.id} rejects sampling parameters, dropping topK=${topK} from custom params`)
++    return rest
++  }
++  return standardParams
++}
++
+ /**
+  * 获取超时设置
+  */
+@@ -139,11 +192,13 @@ export function getMaxTokens(assistant: Assistant, model: Model): number | undef
+   }
+ 
+   const provider = getProviderByModel(model)
+-  // Claude 4.6 uses adaptive thinking (no budgetTokens), so the AI SDK does not add budget back
+-  // to maxOutputTokens. Skip the subtraction to avoid incorrectly reducing max_tokens.
++  // Claude 4.6 / 4.7 use adaptive thinking and do not send budgetTokens, so the
++  // AI SDK does not add budget back to maxOutputTokens. Skip the subtraction to avoid
++  // incorrectly reducing max_tokens.
+   if (
+     isSupportedThinkingTokenClaudeModel(model) &&
+     !isClaude46SeriesModel(model) &&
++    !isClaude47SeriesModel(model) &&
+     ['anthropic', 'aws-bedrock'].includes(provider.type)
+   ) {
+     const { reasoning_effort: reasoningEffort } = assistantSettings
+diff --git a/src/aiCore/prepareParams/parameterBuilder.ts b/src/aiCore/prepareParams/parameterBuilder.ts
+index 77afcc1..c87f89d 100644
+--- a/src/aiCore/prepareParams/parameterBuilder.ts
++++ b/src/aiCore/prepareParams/parameterBuilder.ts
+@@ -42,7 +42,7 @@ import { setupToolsConfig } from '../utils/mcp'
+ import { buildProviderOptions } from '../utils/options'
+ import { buildProviderBuiltinWebSearchConfig } from '../utils/websearch'
+ import { addAnthropicHeaders } from './header'
+-import { getMaxTokens, getTemperature, getTopP } from './modelParameters'
++import { filterStandardParams, getMaxTokens, getTemperature, getTopP } from './modelParameters'
+ 
+ const logger = loggerService.withContext('parameterBuilder')
+ 
+@@ -212,7 +212,8 @@ export async function buildStreamTextParams(
+     temperature: getTemperature(assistant, model),
+     topP: getTopP(assistant, model),
+     // Include AI SDK standard params extracted from custom parameters
+-    ...standardParams,
++    // (filtered to drop ones the model rejects, e.g. topK on Claude Opus 4.7)
++    ...filterStandardParams(standardParams, model),
+     abortSignal: finalSignal,
+     headers,
+     providerOptions,
+diff --git a/src/aiCore/provider/custom/aihubmix-provider.ts b/src/aiCore/provider/custom/aihubmix-provider.ts
+index 8333256..8fbdbcb 100644
+--- a/src/aiCore/provider/custom/aihubmix-provider.ts
++++ b/src/aiCore/provider/custom/aihubmix-provider.ts
+@@ -89,7 +89,7 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+ 
+   const createOpenAICompatibleChatModel = (modelId: string): LanguageModelV3 =>
+     new OpenAICompatibleChatLanguageModel(modelId, {
+-      provider: `${AIHUBMIX_PROVIDER_NAME}.openai-compatible-chat`,
++      provider: `openai-compatible.${AIHUBMIX_PROVIDER_NAME}`,
+       url,
+       headers: authHeaders,
+       fetch: customFetch
+@@ -97,7 +97,7 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+ 
+   const createOpenAIChatModel = (modelId: string): LanguageModelV3 =>
+     new OpenAIChatLanguageModel(modelId, {
+-      provider: `${AIHUBMIX_PROVIDER_NAME}.openai-compatible-chat`,
++      provider: `openai-compatible.${AIHUBMIX_PROVIDER_NAME}`,
+       url,
+       headers: authHeaders,
+       fetch: customFetch
+diff --git a/src/aiCore/services/__tests__/listModels.test.ts b/src/aiCore/services/__tests__/listModels.test.ts
+index 0abc3af..10b2b01 100644
+--- a/src/aiCore/services/__tests__/listModels.test.ts
++++ b/src/aiCore/services/__tests__/listModels.test.ts
+@@ -47,7 +47,6 @@ vi.mock('@renderer/utils', () => ({
+ }))
+ 
+ vi.mock('@renderer/utils/provider', () => ({
+-  isAIGatewayProvider: (p: Provider) => p.id === 'gateway',
+   isGeminiProvider: (p: Provider) => p.id === 'gemini' || p.type === 'gemini',
+   isOllamaProvider: (p: Provider) => p.id === 'ollama' || p.type === 'ollama',
+   isVertexProvider: (p: Provider) => p.id === 'vertexai' || p.type === 'vertexai'
+@@ -179,6 +178,45 @@ const REAL_PPIO_CHAT = {
+   ]
+ }
+ 
++// From https://ai-gateway.vercel.sh/v3/ai/config (Vercel AI Gateway model registry)
++const REAL_VERCEL_GATEWAY = {
++  models: [
++    {
++      id: 'alibaba/qwen3-max',
++      name: 'Qwen3 Max',
++      description: 'The Qwen 3 series Max model.',
++      modelType: 'language',
++      tags: ['tool-use', 'implicit-caching'],
++      specification: {
++        specificationVersion: 'v3',
++        provider: 'alibaba',
++        modelId: 'alibaba/qwen3-max',
++        type: 'language'
++      },
++      pricing: { input: '0.0000012', output: '0.000006' }
++    },
++    {
++      id: 'openai/gpt-4o',
++      name: 'GPT-4o',
++      modelType: 'language',
++      specification: {
++        specificationVersion: 'v3',
++        provider: 'openai',
++        modelId: 'openai/gpt-4o'
++      }
++    },
++    {
++      id: 'openai/text-embedding-3-large',
++      modelType: 'embedding',
++      specification: {
++        specificationVersion: 'v3',
++        provider: 'openai',
++        modelId: 'openai/text-embedding-3-large'
++      }
++    }
++  ]
++}
++
+ // From https://aihubmix.com/api/v1/models (custom schema with model_id/model_name)
+ const REAL_AIHUBMIX = {
+   data: [
+@@ -742,9 +780,59 @@ describe('listModels', () => {
+     })
+   })
+ 
++  describe('Vercel AI Gateway', () => {
++    it('should hit /v3/ai/config and normalize entries', async () => {
++      mockGetFromApi.mockResolvedValue({ value: REAL_VERCEL_GATEWAY })
++      const models = await listModels(
++        makeProvider({
++          id: 'gateway',
++          type: 'gateway' as any,
++          apiHost: 'https://ai-gateway.vercel.sh/v1/ai',
++          apiKey: 'sk-gw'
++        })
++      )
++
++      expect(mockGetFromApi).toHaveBeenCalledTimes(1)
++      const [request] = mockGetFromApi.mock.calls[0]
++      expect(request).toMatchObject({
++        url: 'https://ai-gateway.vercel.sh/v3/ai/config',
++        headers: expect.objectContaining({
++          Authorization: 'Bearer sk-gw',
++          'ai-gateway-protocol-version': '0.0.1'
++        })
++      })
++      assertValidModels(models)
++      expect(models).toHaveLength(3)
++      expect(models[0]).toMatchObject({
++        id: 'alibaba/qwen3-max',
++        name: 'Qwen3 Max',
++        provider: 'gateway',
++        group: 'alibaba',
++        owned_by: 'alibaba',
++        description: 'The Qwen 3 series Max model.'
++      })
++      expect(models[2].name).toBe('openai/text-embedding-3-large')
++    })
++
++    it('should fall back to id when name is missing and deduplicate', async () => {
++      mockGetFromApi.mockResolvedValue({
++        value: {
++          models: [
++            { id: 'openai/gpt-4o', specification: { provider: 'openai' } },
++            { id: 'openai/gpt-4o', specification: { provider: 'openai' } }
++          ]
++        }
++      })
++      const models = await listModels(
++        makeProvider({ id: 'gateway', type: 'gateway' as any, apiHost: 'https://ai-gateway.vercel.sh/v1/ai' })
++      )
++      expect(models).toHaveLength(1)
++      expect(models[0].name).toBe('openai/gpt-4o')
++    })
++  })
++
+   describe('Unsupported providers', () => {
+     it.each([
+-      ['gateway', { id: 'gateway' }],
+       ['aws-bedrock', { id: 'aws-bedrock' }],
+       ['anthropic', { id: 'anthropic' }],
+       ['vertex-anthropic', { id: 'vertex-anthro', type: 'vertex-anthropic' as any }]
+diff --git a/src/aiCore/services/listModels.ts b/src/aiCore/services/listModels.ts
+index 13d438c..4603b0a 100644
+--- a/src/aiCore/services/listModels.ts
++++ b/src/aiCore/services/listModels.ts
+@@ -15,7 +15,7 @@ import store from '@renderer/store'
+ import type { EndpointType, Model, Provider } from '@renderer/types'
+ import { SystemProviderIds } from '@renderer/types'
+ import { formatApiHost, withoutTrailingSlash } from '@renderer/utils'
+-import { isAIGatewayProvider, isGeminiProvider, isOllamaProvider, isVertexProvider } from '@renderer/utils/provider'
++import { isGeminiProvider, isOllamaProvider, isVertexProvider } from '@renderer/utils/provider'
+ import { defaultAppHeaders } from '@shared/utils'
+ import * as z from 'zod'
+ 
+@@ -35,6 +35,7 @@ import {
+   OpenAIModelsResponseSchema,
+   OVMSConfigResponseSchema,
+   TogetherModelsResponseSchema,
++  VercelGatewayModelsResponseSchema,
+   VertexPublisherModelsResponseSchema
+ } from './schemas'
+ 
+@@ -454,6 +455,28 @@ const aiHubMixFetcher: ModelFetcher = {
+   }
+ }
+ 
++const gatewayFetcher: ModelFetcher = {
++  match: (p) => p.id === SystemProviderIds.gateway,
++  fetch: async (provider, signal) => {
++    const response = await getFromApi({
++      url: `https://ai-gateway.vercel.sh/v3/ai/config`,
++      headers: {
++        ...defaultHeaders(provider),
++        'ai-gateway-protocol-version': '0.0.1'
++      },
++      responseSchema: VercelGatewayModelsResponseSchema,
++      abortSignal: signal
++    })
++    return dedup(response.models, (m) => m.id).map((m) =>
++      toModel(m.id, provider, {
++        name: m.name || m.id,
++        description: m.description,
++        owned_by: m.specification?.provider
++      })
++    )
++  }
++}
++
+ /** Default fallback: OpenAI-compatible /models endpoint */
+ const openAICompatibleFetcher: ModelFetcher = {
+   match: () => true,
+@@ -483,6 +506,7 @@ const fetchers: ModelFetcher[] = [
+   newApiFetcher,
+   openRouterFetcher,
+   ppioFetcher,
++  gatewayFetcher,
+   openAICompatibleFetcher // always-match fallback, must be last
+ ]
+ 
+@@ -491,7 +515,7 @@ const fetchers: ModelFetcher[] = [
+ const UNSUPPORTED_PROVIDERS = new Set<string>([SystemProviderIds['aws-bedrock'], SystemProviderIds.anthropic])
+ 
+ function isUnsupported(provider: Provider): boolean {
+-  return isAIGatewayProvider(provider) || UNSUPPORTED_PROVIDERS.has(provider.id) || provider.type === 'vertex-anthropic'
++  return UNSUPPORTED_PROVIDERS.has(provider.id) || provider.type === 'vertex-anthropic'
+ }
+ 
+ // === Public API ===
+diff --git a/src/aiCore/services/schemas.ts b/src/aiCore/services/schemas.ts
+index 99489cc..38cd8ad 100644
+--- a/src/aiCore/services/schemas.ts
++++ b/src/aiCore/services/schemas.ts
+@@ -157,6 +157,27 @@ export const OVMSConfigResponseSchema = z.record(
+   })
+ )
+ 
++// === Vercel AI Gateway (/v3/ai/config) ===
++
++export const VercelGatewayModelsResponseSchema = z.object({
++  models: z.array(
++    z.looseObject({
++      id: z.string(),
++      name: z.string().optional(),
++      description: z.string().optional(),
++      modelType: z.string().optional(),
++      specification: z
++        .looseObject({
++          specificationVersion: z.string().optional(),
++          provider: z.string().optional(),
++          modelId: z.string().optional(),
++          type: z.string().optional()
++        })
++        .optional()
++    })
++  )
++})
++
+ // === AIHubMix ===
+ 
+ export const AIHubMixModelsResponseSchema = z.object({
+diff --git a/src/aiCore/types/middlewareConfig.ts b/src/aiCore/types/middlewareConfig.ts
+index f278b2f..3257032 100644
+--- a/src/aiCore/types/middlewareConfig.ts
++++ b/src/aiCore/types/middlewareConfig.ts
+@@ -2,6 +2,7 @@ import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugi
+ import type { MCPTool } from '@renderer/types'
+ import type { Assistant, Message } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ 
+ /**
+  * AI SDK 中间件配置项（用于插件构建）
+@@ -26,4 +27,6 @@ export interface AiSdkMiddlewareConfig {
+   urlContextConfig?: Record<string, any>
+   knowledgeRecognition?: 'off' | 'on'
+   mcpMode?: string
++  /** Resettable idle timeout handle — reset() on each chunk, cleanup() on stream end */
++  idleTimeout?: IdleTimeoutHandle
+ }
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 77b4c18..5906b05 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -230,6 +230,22 @@ describe('options utils', () => {
+         expect(result.providerOptions.openai).toHaveProperty('serviceTier')
+         expect(result.providerOptions.openai.serviceTier).toBe(OpenAIServiceTiers.auto)
+       })
++
++      it('should not throw when model.provider is not in the provider store (regression: issue #14999)', () => {
++        const gpt5Model: Model = {
++          id: 'gpt-5',
++          name: 'GPT-5',
++          provider: 'orphaned-provider-id'
++        } as Model
++
++        expect(() =>
++          buildProviderOptions(mockAssistant, gpt5Model, openaiProvider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: false
++          })
++        ).not.toThrow()
++      })
+     })
+ 
+     describe('Anthropic provider', () => {
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 15596fc..8b19f53 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -90,6 +90,7 @@ vi.mock('@renderer/config/models', async (importOriginal) => {
+     isGrokReasoningModel: vi.fn(() => false),
+     isOpenAIReasoningModel: vi.fn(() => false),
+     isQwenAlwaysThinkModel: vi.fn(() => false),
++    isHostedGemma4ThinkingModel: vi.fn(() => false),
+     isSupportedThinkingTokenHunyuanModel: vi.fn(() => false),
+     isSupportedThinkingTokenModel: vi.fn(() => false),
+     isGPT51SeriesModel: vi.fn(() => false),
+@@ -964,6 +965,55 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
++    it('should use adaptive thinking with native xhigh effort and summarized display for Claude Opus 4.7', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'xhigh' }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'adaptive', display: 'summarized' },
++        effort: 'xhigh'
++      })
++    })
++
++    it('should use adaptive thinking with summarized display even without explicit effort for Claude Opus 4.7', async () => {
++      const { isReasoningModel, isSupportedThinkingTokenClaudeModel } = await import('@renderer/config/models')
++
++      vi.mocked(isReasoningModel).mockReturnValue(true)
++      vi.mocked(isSupportedThinkingTokenClaudeModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'claude-opus-4-7',
++        name: 'Claude Opus 4.7',
++        provider: SystemProviderIds.anthropic
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'auto' }
++      } as Assistant
++
++      const result = getAnthropicReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinking: { type: 'adaptive', display: 'summarized' }
++      })
++    })
++
+     it('should use fallback budgetTokens when findTokenLimit returns undefined for Claude model', async () => {
+       const { isReasoningModel, isSupportedThinkingTokenClaudeModel, findTokenLimit } = await import(
+         '@renderer/config/models'
+@@ -1517,6 +1567,58 @@ describe('reasoning utils', () => {
+       })
+     })
+ 
++    it('should map hosted Gemma 4 minimal effort to minimal thinkingLevel without thoughts', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isHostedGemma4ThinkingModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemma-4-31b-it',
++        name: 'Gemma 4 31B',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'minimal' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: false,
++          thinkingLevel: 'minimal'
++        }
++      })
++    })
++
++    it('should map hosted Gemma 4 high effort to high thinkingLevel with thoughts', () => {
++      vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
++      vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
++      vi.mocked(mockModels.isHostedGemma4ThinkingModel).mockReturnValue(true)
++
++      const model: Model = {
++        id: 'gemma-4-31b-it',
++        name: 'Gemma 4 31B',
++        provider: SystemProviderIds.gemini
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: { reasoning_effort: 'high' }
++      } as Assistant
++
++      const result = getGeminiReasoningParams(assistant, model)
++      expect(result).toEqual({
++        thinkingConfig: {
++          includeThoughts: true,
++          thinkingLevel: 'high'
++        }
++      })
++    })
++
+     it('should enable thinking with budget for reasoning effort', () => {
+       vi.mocked(mockModels.isReasoningModel).mockReturnValue(true)
+       vi.mocked(mockModels.isSupportedThinkingTokenGeminiModel).mockReturnValue(true)
+@@ -1718,6 +1820,44 @@ describe('reasoning utils', () => {
+       expect(result).toHaveProperty('reasoningEffort')
+       expect(result.reasoningEffort).toBe('high')
+     })
++
++    it('should preserve none for Grok 4.3', () => {
++      const model: Model = {
++        id: 'grok-4.3',
++        name: 'Grok 4.3',
++        provider: SystemProviderIds.grok
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getXAIReasoningParams(assistant, model)
++      expect(result).toEqual({ reasoningEffort: 'none' })
++    })
++
++    it('should preserve medium for Grok 4.3', () => {
++      const model: Model = {
++        id: 'grok-4.3',
++        name: 'Grok 4.3',
++        provider: SystemProviderIds.grok
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'medium'
++        }
++      } as Assistant
++
++      const result = getXAIReasoningParams(assistant, model)
++      expect(result).toEqual({ reasoningEffort: 'medium' })
++    })
+   })
+ 
+   describe('getBedrockReasoningParams', () => {
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index ec1e488..e793e89 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -2,7 +2,7 @@ import type { BedrockProviderOptions } from '@ai-sdk/amazon-bedrock'
+ import { type AnthropicProviderOptions } from '@ai-sdk/anthropic'
+ import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
+ import type { OpenAIResponsesProviderOptions } from '@ai-sdk/openai'
+-import type { XaiProviderOptions } from '@ai-sdk/xai'
++import type { XaiResponsesProviderOptions } from '@ai-sdk/xai'
+ import { loggerService } from '@logger'
+ import {
+   getModelSupportedVerbosity,
+@@ -101,7 +101,8 @@ function getServiceTier<T extends Provider>(model: Model, provider: T): OpenAISe
+ }
+ 
+ function getVerbosity(model: Model): OpenAIVerbosity {
+-  if (!isSupportVerbosityModel(model) || !isSupportVerbosityProvider(getProviderById(model.provider)!)) {
++  const provider = getProviderById(model.provider)
++  if (!provider || !isSupportVerbosityModel(model) || !isSupportVerbosityProvider(provider)) {
+     return undefined
+   }
+   const openAI = getStoreSetting('openAI')
+@@ -338,11 +339,7 @@ function buildOpenAIProviderOptions(
+   }
+   const provider = getProviderById(model.provider)
+ 
+-  if (!provider) {
+-    throw new Error(`Provider ${model.provider} not found`)
+-  }
+-
+-  if (isSupportVerbosityModel(model) && isSupportVerbosityProvider(provider)) {
++  if (provider && isSupportVerbosityModel(model) && isSupportVerbosityProvider(provider)) {
+     const openAI = getStoreSetting<'openAI'>('openAI')
+     const userVerbosity = openAI?.verbosity
+ 
+@@ -436,7 +433,7 @@ function buildXAIProviderOptions(
+   assistant: Assistant,
+   model: Model,
+   capabilities: Pick<ProviderCapabilities, 'enableReasoning' | 'enableWebSearch' | 'enableGenerateImage'>
+-): Record<string, XaiProviderOptions> {
++): Record<string, XaiResponsesProviderOptions> {
+   const { enableReasoning } = capabilities
+   let providerOptions: Record<string, any> = {}
+ 
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index 623071e..a13b8e1 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -2,7 +2,7 @@ import type { BedrockProviderOptions } from '@ai-sdk/amazon-bedrock'
+ import type { AnthropicProviderOptions } from '@ai-sdk/anthropic'
+ import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
+ import type { OpenAIResponsesProviderOptions } from '@ai-sdk/openai'
+-import type { XaiProviderOptions } from '@ai-sdk/xai'
++import type { XaiResponsesProviderOptions } from '@ai-sdk/xai'
+ import type OpenAI from '@cherrystudio/openai'
+ import { loggerService } from '@logger'
+ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+@@ -11,6 +11,7 @@ import {
+   GEMINI_FLASH_MODEL_REGEX,
+   getModelSupportedReasoningEffortOptions,
+   isClaude46SeriesModel,
++  isClaude47SeriesModel,
+   isDeepSeekHybridInferenceModel,
+   isDeepSeekV4PlusModel,
+   isDoubaoSeed18Model,
+@@ -18,6 +19,7 @@ import {
+   isDoubaoThinkingAutoModel,
+   isGemini3ThinkingTokenModel,
+   isGrok4FastReasoningModel,
++  isHostedGemma4ThinkingModel,
+   isOpenAIDeepResearchModel,
+   isOpenAIModel,
+   isOpenAIOpenWeightModel,
+@@ -704,7 +706,7 @@ export function getAnthropicReasoningParams(
+   model: Model
+ ): {
+   thinking?: AnthropicProviderOptions['thinking']
+-  effort?: Exclude<AnthropicProviderOptions['effort'], 'xhigh'>
++  effort?: AnthropicProviderOptions['effort']
+   sendReasoning?: AnthropicProviderOptions['sendReasoning']
+ } {
+   if (!isReasoningModel(model)) {
+@@ -727,6 +729,24 @@ export function getAnthropicReasoningParams(
+ 
+   // Claude reasoning parameters
+   if (isSupportedThinkingTokenClaudeModel(model)) {
++    // Claude 4.7: adaptive thinking + native 'xhigh' effort.
++    // Also requires thinking.display: 'summarized' — API defaults to 'omitted'
++    // (no reasoning text in response), which would break Cherry's thinking UI.
++    if (isClaude47SeriesModel(model)) {
++      const effort47Map = {
++        default: undefined,
++        auto: undefined,
++        minimal: 'low',
++        low: 'low',
++        medium: 'medium',
++        high: 'high',
++        xhigh: 'xhigh'
++      } as const satisfies Record<Exclude<ReasoningEffortOption, 'none'>, AnthropicProviderOptions['effort']>
++      const effort = effort47Map[reasoningEffort]
++      const thinking = { type: 'adaptive', display: 'summarized' } as const
++      return effort ? { thinking, effort } : { thinking }
++    }
++
+     // Claude 4.6 uses adaptive thinking + effort parameters
+     // Map reasoningEffort to Claude 4.6 supported effort values
+     if (isClaude46SeriesModel(model)) {
+@@ -841,6 +861,21 @@ export function getGeminiReasoningParams(
+   let thinkingLevel: GoogleThinkingLevel | null = null
+   const includeThoughts = reasoningEffort !== 'none'
+ 
++  if (isHostedGemma4ThinkingModel(model)) {
++    // Hosted Gemma 4 does not expose a distinct hard-off mode on the Gemini API.
++    // We only surface minimal/high in the UI and collapse legacy or unexpected
++    // `none` inputs to `minimal` for compatibility.
++    const isHighThinking = reasoningEffort === 'high' || reasoningEffort === 'xhigh'
++    thinkingLevel = isHighThinking ? 'high' : 'minimal'
++
++    return {
++      thinkingConfig: {
++        includeThoughts: isHighThinking,
++        thinkingLevel
++      }
++    }
++  }
++
+   // https://ai.google.dev/gemini-api/docs/gemini-3?thinking=high#new_api_features_in_gemini_3
+   if (isGemini3ThinkingTokenModel(model)) {
+     thinkingLevel = mapToGeminiThinkingLevel(reasoningEffort)
+@@ -898,13 +933,33 @@ export function getGeminiReasoningParams(
+  * @param model - The model being used
+  * @returns XAI-specific reasoning parameters
+  */
+-export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<XaiProviderOptions, 'reasoningEffort'> {
+-  if (!isSupportedReasoningEffortGrokModel(model)) {
++export function getXAIReasoningParams(
++  assistant: Assistant,
++  model: Model
++): Pick<XaiResponsesProviderOptions, 'reasoningEffort'> {
++  const isGrok43 =
++    getLowerBaseModelName(model.id).includes('grok-4.3') && !getLowerBaseModelName(model.id).includes('non-reasoning')
++
++  if (!isSupportedReasoningEffortGrokModel(model) && !isGrok43) {
+     return {}
+   }
+ 
+   const { reasoning_effort: reasoningEffort } = getAssistantSettings(assistant)
++  if (!reasoningEffort || reasoningEffort === 'default') return {}
++
++  if (isGrok43) {
++    switch (reasoningEffort) {
++      case 'none':
++      case 'low':
++      case 'medium':
++      case 'high':
++        return { reasoningEffort }
++      default:
++        return {}
++    }
++  }
+ 
++  // Legacy grok models (grok-3-mini, openrouter/grok-4-fast): constrained effort mapping
+   switch (reasoningEffort) {
+     case 'auto':
+     case 'minimal':
+@@ -915,8 +970,6 @@ export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<
+       return { reasoningEffort }
+     case 'xhigh':
+       return { reasoningEffort: 'high' }
+-    case 'default':
+-    case 'none':
+     default:
+       return {}
+   }
+@@ -952,8 +1005,10 @@ export function getBedrockReasoningParams(
+     return {}
+   }
+ 
+-  // Claude 4.6 uses adaptive thinking + maxReasoningEffort
+-  if (isClaude46SeriesModel(model)) {
++  // Claude 4.6 / 4.7 use adaptive thinking + maxReasoningEffort.
++  // Bedrock's maxReasoningEffort enum doesn't yet include 'xhigh', so 4.7 xhigh
++  // falls back to 'max' here (matches the 4.6 mapping).
++  if (isClaude46SeriesModel(model) || isClaude47SeriesModel(model)) {
+     const effortMap = {
+       auto: undefined,
+       minimal: 'low',
