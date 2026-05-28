@@ -1,0 +1,619 @@
+diff --git a/src/aiCore/AiProvider.ts b/src/aiCore/AiProvider.ts
+index 21a074d..a1b1845 100644
+--- a/src/aiCore/AiProvider.ts
++++ b/src/aiCore/AiProvider.ts
+@@ -257,7 +257,8 @@ export default class AiProvider {
+         middlewareConfig.enableWebSearch,
+         undefined,
+         undefined,
+-        providerConfig.providerId
++        providerConfig.providerId,
++        middlewareConfig.idleTimeout
+       )
+ 
+       const streamResult = await executor.streamText({
+diff --git a/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts b/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
+index f6d6c2e..93f4276 100644
+--- a/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
++++ b/src/aiCore/plugins/__tests__/pdfCompatibilityPlugin.test.ts
+@@ -43,8 +43,8 @@ function makeProvider(id: string, type: ProviderType): Provider {
+   return { id, name: id, type, apiKey: 'test', apiHost: 'https://test.com', isSystem: false, models: [] } as Provider
+ }
+ 
+-function makeModel(): Model {
+-  return { id: 'test-model', provider: 'test', name: 'Test', group: 'test' } as Model
++function makeModel(overrides: Partial<Model> = {}): Model {
++  return { id: 'test-model', provider: 'test', name: 'Test', group: 'test', ...overrides } as Model
+ }
+ 
+ function makePdfFilePart(filename = 'test.pdf') {
+@@ -87,35 +87,120 @@ describe('pdfCompatibilityPlugin', () => {
+     vi.mocked(isGeminiModel).mockReturnValue(false)
+   })
+ 
+-  it('should pass through for OpenAI model on any provider type', async () => {
++  it('should pass through for OpenAI model routed via openai-response endpoint', async () => {
+     vi.mocked(isOpenAILLMModel).mockReturnValue(true)
+     const provider = makeProvider('moonshot', 'openai')
++    const model = makeModel({ endpoint_type: 'openai-response' as const })
+ 
+     const params = {
+       prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
+     } as unknown as LanguageModelV3CallOptions
+ 
+-    const result = await runMiddleware(provider, params)
++    const result = await runMiddleware(provider, params, model)
+     expect(result).toEqual(params)
+     expect(mockExtractPdfText).not.toHaveBeenCalled()
+   })
+ 
+-  it('should pass through for Claude model on any provider type', async () => {
++  it('should convert PDF for OpenAI model on generic openai provider without endpoint_type', async () => {
++    vi.mocked(isOpenAILLMModel).mockReturnValue(true)
++    const provider = makeProvider('moonshot', 'openai')
++    mockExtractPdfText.mockResolvedValue('Extracted PDF content')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart('report.pdf')] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params)
++    expect(mockExtractPdfText).toHaveBeenCalledWith('base64pdfdata')
++    expect(result.prompt[0]).toMatchObject({
++      role: 'user',
++      content: [
++        { type: 'text', text: 'Hello' },
++        { type: 'text', text: 'report.pdf\nExtracted PDF content' }
++      ]
++    })
++  })
++
++  it('should pass through for Claude model routed via Anthropic endpoint (endpoint_type=anthropic)', async () => {
+     vi.mocked(isAnthropicModel).mockReturnValue(true)
+     const provider = makeProvider('my-aggregator', 'new-api')
++    const claudeModel = { ...makeModel(), id: 'claude-opus-4-7', endpoint_type: 'anthropic' as const }
+ 
+     const params = {
+       prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
+     } as unknown as LanguageModelV3CallOptions
+ 
+-    const result = await runMiddleware(provider, params)
++    const result = await runMiddleware(provider, params, claudeModel)
+     expect(result).toEqual(params)
+     expect(mockExtractPdfText).not.toHaveBeenCalled()
+   })
+ 
+-  it('should pass through for Gemini model on any provider type', async () => {
++  it('should convert PDF for Claude model routed via chat-completions endpoint (no endpoint_type)', async () => {
++    // An Anthropic-named model wired through an OpenAI-compatible aggregator (e.g. NewAPI
++    // without endpoint_type='anthropic') uses chat-completions, which does NOT accept the
++    // 'file' part type. Native PDF must be downgraded to text in this case.
++    vi.mocked(isAnthropicModel).mockReturnValue(true)
++    const provider = makeProvider('my-aggregator', 'new-api')
++    const claudeModel = { ...makeModel(), id: 'claude-opus-4-7' }
++    mockExtractPdfText.mockResolvedValue('Extracted PDF content')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart('report.pdf')] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params, claudeModel)
++    expect(mockExtractPdfText).toHaveBeenCalledWith('base64pdfdata')
++    expect(result.prompt[0]).toMatchObject({
++      role: 'user',
++      content: [
++        { type: 'text', text: 'Hello' },
++        { type: 'text', text: 'report.pdf\nExtracted PDF content' }
++      ]
++    })
++  })
++
++  it('should convert PDF for Gemini model accessed through non-Gemini provider (e.g., GitHub Copilot)', async () => {
++    // A Gemini-named model through GitHub Copilot (type: 'openai') uses OpenAI-compatible
++    // format which does NOT support native PDF file parts (would cause 400 "type has to be
++    // either 'image_url' or 'text'" errors). PDF must be converted to text.
++    // Mocking isGeminiModel(true) ensures this test would fail under the old
++    // `isGeminiModel(model)` branch — i.e. it now actually guards the regression.
++    vi.mocked(isGeminiModel).mockReturnValue(true)
++    const provider = makeProvider('copilot', 'openai')
++    const geminiModel = { ...makeModel(), id: 'gemini-3.1-pro-preview' }
++    mockExtractPdfText.mockResolvedValue('Extracted PDF content')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart('report.pdf')] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params, geminiModel)
++    expect(mockExtractPdfText).toHaveBeenCalledWith('base64pdfdata')
++    expect(result.prompt[0]).toMatchObject({
++      role: 'user',
++      content: [
++        { type: 'text', text: 'Hello' },
++        { type: 'text', text: 'report.pdf\nExtracted PDF content' }
++      ]
++    })
++  })
++
++  it('should pass through for Gemini model routed via Gemini endpoint (endpoint_type=gemini)', async () => {
+     vi.mocked(isGeminiModel).mockReturnValue(true)
+     const provider = makeProvider('my-aggregator', 'new-api')
++    const geminiModel = { ...makeModel(), id: 'gemini-3.1-pro-preview', endpoint_type: 'gemini' as const }
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params, geminiModel)
++    expect(result).toEqual(params)
++    expect(mockExtractPdfText).not.toHaveBeenCalled()
++  })
++
++  it('should pass through for Gemini model on native Gemini provider', async () => {
++    const provider = makeProvider('gemini', 'gemini')
+ 
+     const params = {
+       prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart()] }]
+@@ -157,6 +242,26 @@ describe('pdfCompatibilityPlugin', () => {
+     })
+   })
+ 
++  it('should convert PDF for qiniu openai-compatible GPT models', async () => {
++    const provider = makeProvider('qiniu', 'openai')
++    const model = makeModel({ id: 'gpt-5.4', name: 'gpt-5.4' })
++    mockExtractPdfText.mockResolvedValue('Extracted PDF content')
++
++    const params = {
++      prompt: [{ role: 'user' as const, content: [makeTextPart('Hello'), makePdfFilePart('report.pdf')] }]
++    } as unknown as LanguageModelV3CallOptions
++
++    const result = await runMiddleware(provider, params, model)
++    expect(mockExtractPdfText).toHaveBeenCalledWith('base64pdfdata')
++    expect(result.prompt[0]).toMatchObject({
++      role: 'user',
++      content: [
++        { type: 'text', text: 'Hello' },
++        { type: 'text', text: 'report.pdf\nExtracted PDF content' }
++      ]
++    })
++  })
++
+   it('should convert PDF FilePart to TextPart for ollama provider', async () => {
+     const provider = makeProvider('ollama', 'ollama')
+     mockExtractPdfText.mockResolvedValue('Extracted PDF content')
+diff --git a/src/aiCore/plugins/pdfCompatibilityPlugin.ts b/src/aiCore/plugins/pdfCompatibilityPlugin.ts
+index 427199f..b9eb6d5 100644
+--- a/src/aiCore/plugins/pdfCompatibilityPlugin.ts
++++ b/src/aiCore/plugins/pdfCompatibilityPlugin.ts
+@@ -10,6 +10,7 @@ import { loggerService } from '@logger'
+ import { isAnthropicModel, isGeminiModel } from '@renderer/config/models'
+ import { isOpenAILLMModel } from '@renderer/config/models/openai'
+ import type { Model, Provider, ProviderType } from '@renderer/types'
++import { SystemProviderIds } from '@renderer/types'
+ import { extractPdfText } from '@shared/utils/pdf'
+ import type { LanguageModelMiddleware } from 'ai'
+ import i18n from 'i18next'
+@@ -34,15 +35,31 @@ const PDF_NATIVE_PROVIDER_TYPES = new Set<ProviderType>([
+   'vertex-anthropic' // Vertex AI with Anthropic models
+ ])
+ 
++const PDF_FORCE_TEXT_EXTRACTION_PROVIDER_IDS = new Set<string>([SystemProviderIds.qiniu])
++
+ function isPdfFilePart(part: ContentPart): part is LanguageModelV3FilePart & { mediaType: 'application/pdf' } {
+   return part.type === 'file' && part.mediaType === 'application/pdf'
+ }
+ 
+ function supportsNativePdf(provider: Provider, model: Model): boolean {
+-  // OpenAI, Claude, and Gemini models always support native PDF regardless of provider
+-  if (isOpenAILLMModel(model) || isAnthropicModel(model) || isGeminiModel(model)) {
++  if (PDF_FORCE_TEXT_EXTRACTION_PROVIDER_IDS.has(provider.id)) {
++    return false
++  }
++
++  // We assume here that the OpenAI model using the responses API,
++  // the Claude model using the messages API,
++  // and the Gemini model using the Gemini generateContent API natively support PDF input.
++  if (
++    (model.endpoint_type === 'openai-response' && isOpenAILLMModel(model)) ||
++    (model.endpoint_type === 'anthropic' && isAnthropicModel(model)) ||
++    (model.endpoint_type === 'gemini' && isGeminiModel(model))
++  ) {
+     return true
+   }
++  // Check provider type for other native providers (e.g., Vertex, Bedrock, Azure OpenAI).
++  // Native Anthropic and Gemini providers ('anthropic', 'gemini') are also covered here,
++  // so a Claude/Gemini model on its native provider still passes through even without an
++  // explicit endpoint_type annotation.
+   if (PDF_NATIVE_PROVIDER_TYPES.has(provider.type)) {
+     return true
+   }
+diff --git a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+index 6c2e27d..c905522 100644
+--- a/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
++++ b/src/aiCore/prepareParams/__tests__/model-parameters.test.ts
+@@ -203,6 +203,27 @@ describe('modelParameters', () => {
+ 
+       expect(getTemperature(assistant, model)).toBeUndefined()
+     })
++
++    it('returns undefined for Gemini 3.x models', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'gemini-3.5-flash', provider: 'gemini', group: 'Google' })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
++
++    it('returns undefined for Gemini 3.x aliases', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'gemini-flash-latest', provider: 'gemini', group: 'Google' })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
++
++    it('returns undefined for Gemini 3.x model ids on non-Gemini providers', () => {
++      const assistant = createAssistant({ enableTemperature: true, temperature: 0.5 })
++      const model = createModel({ id: 'gemini-3.5-flash', provider: 'openai', group: 'Google' })
++
++      expect(getTemperature(assistant, model)).toBeUndefined()
++    })
+   })
+ 
+   describe('getTopP', () => {
+@@ -285,6 +306,13 @@ describe('modelParameters', () => {
+ 
+       expect(getTopP(assistant, model)).toBe(0.97)
+     })
++
++    it('returns undefined for Gemini 3.x models', () => {
++      const assistant = createAssistant({ enableTopP: true, topP: 0.95 })
++      const model = createModel({ id: 'gemini-pro-latest', provider: 'gemini', group: 'Google' })
++
++      expect(getTopP(assistant, model)).toBeUndefined()
++    })
+   })
+ 
+   describe('filterStandardParams', () => {
+@@ -319,6 +347,18 @@ describe('modelParameters', () => {
+       const input = {}
+       expect(filterStandardParams(input, opus47)).toBe(input)
+     })
++
++    it('drops topK for Gemini 3.x models', () => {
++      const gemini35 = createModel({ id: 'gemini-3.5-flash', provider: 'gemini', group: 'Google' })
++
++      expect(filterStandardParams({ topK: 40, frequencyPenalty: 0.1 }, gemini35)).toEqual({ frequencyPenalty: 0.1 })
++    })
++
++    it('drops topK for Gemini 3.x model ids on non-Gemini providers', () => {
++      const proxyGemini = createModel({ id: 'gemini-3.5-flash', provider: 'openai', group: 'Google' })
++
++      expect(filterStandardParams({ topK: 40, frequencyPenalty: 0.1 }, proxyGemini)).toEqual({ frequencyPenalty: 0.1 })
++    })
+   })
+ 
+   describe('getTimeout', () => {
+diff --git a/src/aiCore/prepareParams/modelParameters.ts b/src/aiCore/prepareParams/modelParameters.ts
+index 1833c51..9474046 100644
+--- a/src/aiCore/prepareParams/modelParameters.ts
++++ b/src/aiCore/prepareParams/modelParameters.ts
+@@ -8,6 +8,7 @@ import {
+   isClaude46SeriesModel,
+   isClaude47SeriesModel,
+   isClaudeReasoningModel,
++  isGemini3Model,
+   isMaxTemperatureOneModel,
+   isSupportedFlexServiceTier,
+   isSupportedThinkingTokenClaudeModel,
+@@ -30,6 +31,7 @@ const logger = loggerService.withContext('modelParameters')
+ 
+ /**
+  * Retrieves the temperature parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Gemini 3.x models.
+  * - Disabled when enableTemperature is off.
+  * - Disabled unconditionally for Claude Opus 4.7 (rejects sampling params with HTTP 400).
+  * - Disabled for Claude reasoning models when reasoning effort is set (excluding 'default' and 'none').
+@@ -38,6 +40,11 @@ const logger = loggerService.withContext('modelParameters')
+  * Otherwise, returns the temperature value.
+  */
+ export function getTemperature(assistant: Assistant, model: Model): number | undefined {
++  if (isGemini3Model(model)) {
++    logger.info(`Gemini 3.x model ${model.id} uses default sampling settings, disabling temperature`)
++    return undefined
++  }
++
+   const enableTemperature = assistant.settings?.enableTemperature ?? DEFAULT_ASSISTANT_SETTINGS.enableTemperature
+   if (!enableTemperature) {
+     return undefined
+@@ -83,6 +90,7 @@ export function getTemperature(assistant: Assistant, model: Model): number | und
+ 
+ /**
+  * Retrieves the TopP parameter, adapting it based on assistant.settings and model capabilities.
++ * - Disabled for Gemini 3.x models.
+  * - Disabled when enableTopP is off.
+  * - Disabled unconditionally for Claude Opus 4.7 (rejects sampling params with HTTP 400).
+  * - Disabled for models that do not support TopP.
+@@ -91,6 +99,11 @@ export function getTemperature(assistant: Assistant, model: Model): number | und
+  * Otherwise, returns the TopP value.
+  */
+ export function getTopP(assistant: Assistant, model: Model): number | undefined {
++  if (isGemini3Model(model)) {
++    logger.info(`Gemini 3.x model ${model.id} uses default sampling settings, disabling topP`)
++    return undefined
++  }
++
+   const enableTopP = assistant.settings?.enableTopP ?? DEFAULT_ASSISTANT_SETTINGS.enableTopP
+   if (!enableTopP) {
+     return undefined
+@@ -135,13 +148,19 @@ export function getTopP(assistant: Assistant, model: Model): number | undefined
+ 
+ /**
+  * Filters AI SDK standard parameters extracted from custom parameters, removing any
+- * the model rejects. Currently strips `topK` for Claude Opus 4.7 since it rejects
+- * sampling params (temperature/top_p/top_k) with HTTP 400. See `getTemperature`.
++ * the model rejects. Currently strips `topK` for Gemini 3.x models and Claude Opus 4.7
++ * since both reject or discourage sampling params.
+  */
+ export function filterStandardParams(
+   standardParams: Partial<Record<AiSdkParam, any>>,
+   model: Model
+ ): Partial<Record<AiSdkParam, any>> {
++  if (isGemini3Model(model) && 'topK' in standardParams) {
++    const { topK, ...rest } = standardParams
++    logger.info(`Gemini 3.x model ${model.id} uses default sampling settings, dropping topK=${topK} from custom params`)
++    return rest
++  }
++
+   if (isClaude47SeriesModel(model) && 'topK' in standardParams) {
+     const { topK, ...rest } = standardParams
+     logger.info(`Model ${model.id} rejects sampling parameters, dropping topK=${topK} from custom params`)
+diff --git a/src/aiCore/provider/custom/aihubmix-provider.ts b/src/aiCore/provider/custom/aihubmix-provider.ts
+index 8333256..8fbdbcb 100644
+--- a/src/aiCore/provider/custom/aihubmix-provider.ts
++++ b/src/aiCore/provider/custom/aihubmix-provider.ts
+@@ -89,7 +89,7 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+ 
+   const createOpenAICompatibleChatModel = (modelId: string): LanguageModelV3 =>
+     new OpenAICompatibleChatLanguageModel(modelId, {
+-      provider: `${AIHUBMIX_PROVIDER_NAME}.openai-compatible-chat`,
++      provider: `openai-compatible.${AIHUBMIX_PROVIDER_NAME}`,
+       url,
+       headers: authHeaders,
+       fetch: customFetch
+@@ -97,7 +97,7 @@ export function createAihubmix(options: AihubmixProviderSettings = {}): Aihubmix
+ 
+   const createOpenAIChatModel = (modelId: string): LanguageModelV3 =>
+     new OpenAIChatLanguageModel(modelId, {
+-      provider: `${AIHUBMIX_PROVIDER_NAME}.openai-compatible-chat`,
++      provider: `openai-compatible.${AIHUBMIX_PROVIDER_NAME}`,
+       url,
+       headers: authHeaders,
+       fetch: customFetch
+diff --git a/src/aiCore/types/middlewareConfig.ts b/src/aiCore/types/middlewareConfig.ts
+index f278b2f..3257032 100644
+--- a/src/aiCore/types/middlewareConfig.ts
++++ b/src/aiCore/types/middlewareConfig.ts
+@@ -2,6 +2,7 @@ import type { WebSearchPluginConfig } from '@cherrystudio/ai-core/built-in/plugi
+ import type { MCPTool } from '@renderer/types'
+ import type { Assistant, Message } from '@renderer/types'
+ import type { Chunk } from '@renderer/types/chunk'
++import type { IdleTimeoutHandle } from '@renderer/utils/IdleTimeoutController'
+ 
+ /**
+  * AI SDK 中间件配置项（用于插件构建）
+@@ -26,4 +27,6 @@ export interface AiSdkMiddlewareConfig {
+   urlContextConfig?: Record<string, any>
+   knowledgeRecognition?: 'off' | 'on'
+   mcpMode?: string
++  /** Resettable idle timeout handle — reset() on each chunk, cleanup() on stream end */
++  idleTimeout?: IdleTimeoutHandle
+ }
+diff --git a/src/aiCore/utils/__tests__/options.test.ts b/src/aiCore/utils/__tests__/options.test.ts
+index 77b4c18..5906b05 100644
+--- a/src/aiCore/utils/__tests__/options.test.ts
++++ b/src/aiCore/utils/__tests__/options.test.ts
+@@ -230,6 +230,22 @@ describe('options utils', () => {
+         expect(result.providerOptions.openai).toHaveProperty('serviceTier')
+         expect(result.providerOptions.openai.serviceTier).toBe(OpenAIServiceTiers.auto)
+       })
++
++      it('should not throw when model.provider is not in the provider store (regression: issue #14999)', () => {
++        const gpt5Model: Model = {
++          id: 'gpt-5',
++          name: 'GPT-5',
++          provider: 'orphaned-provider-id'
++        } as Model
++
++        expect(() =>
++          buildProviderOptions(mockAssistant, gpt5Model, openaiProvider, {
++            enableReasoning: false,
++            enableWebSearch: false,
++            enableGenerateImage: false
++          })
++        ).not.toThrow()
++      })
+     })
+ 
+     describe('Anthropic provider', () => {
+diff --git a/src/aiCore/utils/__tests__/reasoning.test.ts b/src/aiCore/utils/__tests__/reasoning.test.ts
+index 2772feb..8b19f53 100644
+--- a/src/aiCore/utils/__tests__/reasoning.test.ts
++++ b/src/aiCore/utils/__tests__/reasoning.test.ts
+@@ -1820,6 +1820,44 @@ describe('reasoning utils', () => {
+       expect(result).toHaveProperty('reasoningEffort')
+       expect(result.reasoningEffort).toBe('high')
+     })
++
++    it('should preserve none for Grok 4.3', () => {
++      const model: Model = {
++        id: 'grok-4.3',
++        name: 'Grok 4.3',
++        provider: SystemProviderIds.grok
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'none'
++        }
++      } as Assistant
++
++      const result = getXAIReasoningParams(assistant, model)
++      expect(result).toEqual({ reasoningEffort: 'none' })
++    })
++
++    it('should preserve medium for Grok 4.3', () => {
++      const model: Model = {
++        id: 'grok-4.3',
++        name: 'Grok 4.3',
++        provider: SystemProviderIds.grok
++      } as Model
++
++      const assistant: Assistant = {
++        id: 'test',
++        name: 'Test',
++        settings: {
++          reasoning_effort: 'medium'
++        }
++      } as Assistant
++
++      const result = getXAIReasoningParams(assistant, model)
++      expect(result).toEqual({ reasoningEffort: 'medium' })
++    })
+   })
+ 
+   describe('getBedrockReasoningParams', () => {
+diff --git a/src/aiCore/utils/options.ts b/src/aiCore/utils/options.ts
+index ec1e488..43340da 100644
+--- a/src/aiCore/utils/options.ts
++++ b/src/aiCore/utils/options.ts
+@@ -2,7 +2,7 @@ import type { BedrockProviderOptions } from '@ai-sdk/amazon-bedrock'
+ import { type AnthropicProviderOptions } from '@ai-sdk/anthropic'
+ import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
+ import type { OpenAIResponsesProviderOptions } from '@ai-sdk/openai'
+-import type { XaiProviderOptions } from '@ai-sdk/xai'
++import type { XaiResponsesProviderOptions } from '@ai-sdk/xai'
+ import { loggerService } from '@logger'
+ import {
+   getModelSupportedVerbosity,
+@@ -101,7 +101,8 @@ function getServiceTier<T extends Provider>(model: Model, provider: T): OpenAISe
+ }
+ 
+ function getVerbosity(model: Model): OpenAIVerbosity {
+-  if (!isSupportVerbosityModel(model) || !isSupportVerbosityProvider(getProviderById(model.provider)!)) {
++  const provider = getProviderById(model.provider)
++  if (!provider || !isSupportVerbosityModel(model) || !isSupportVerbosityProvider(provider)) {
+     return undefined
+   }
+   const openAI = getStoreSetting('openAI')
+@@ -338,11 +339,7 @@ function buildOpenAIProviderOptions(
+   }
+   const provider = getProviderById(model.provider)
+ 
+-  if (!provider) {
+-    throw new Error(`Provider ${model.provider} not found`)
+-  }
+-
+-  if (isSupportVerbosityModel(model) && isSupportVerbosityProvider(provider)) {
++  if (provider && isSupportVerbosityModel(model) && isSupportVerbosityProvider(provider)) {
+     const openAI = getStoreSetting<'openAI'>('openAI')
+     const userVerbosity = openAI?.verbosity
+ 
+@@ -407,7 +404,30 @@ function buildGeminiProviderOptions(
+   capabilities: Pick<ProviderCapabilities, 'enableReasoning' | 'enableWebSearch' | 'enableGenerateImage'>
+ ): Record<string, GoogleGenerativeAIProviderOptions> {
+   const { enableReasoning, enableGenerateImage } = capabilities
+-  let providerOptions: GoogleGenerativeAIProviderOptions = {}
++  let providerOptions: GoogleGenerativeAIProviderOptions = {
++    safetySettings: [
++      {
++        category: 'HARM_CATEGORY_HATE_SPEECH',
++        threshold: 'BLOCK_NONE'
++      },
++      {
++        category: 'HARM_CATEGORY_DANGEROUS_CONTENT',
++        threshold: 'BLOCK_NONE'
++      },
++      {
++        category: 'HARM_CATEGORY_HARASSMENT',
++        threshold: 'BLOCK_NONE'
++      },
++      {
++        category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
++        threshold: 'BLOCK_NONE'
++      },
++      {
++        category: 'HARM_CATEGORY_CIVIC_INTEGRITY',
++        threshold: 'BLOCK_NONE'
++      }
++    ]
++  }
+ 
+   // Gemini 推理参数
+   if (enableReasoning) {
+@@ -436,7 +456,7 @@ function buildXAIProviderOptions(
+   assistant: Assistant,
+   model: Model,
+   capabilities: Pick<ProviderCapabilities, 'enableReasoning' | 'enableWebSearch' | 'enableGenerateImage'>
+-): Record<string, XaiProviderOptions> {
++): Record<string, XaiResponsesProviderOptions> {
+   const { enableReasoning } = capabilities
+   let providerOptions: Record<string, any> = {}
+ 
+diff --git a/src/aiCore/utils/reasoning.ts b/src/aiCore/utils/reasoning.ts
+index c643dec..a13b8e1 100644
+--- a/src/aiCore/utils/reasoning.ts
++++ b/src/aiCore/utils/reasoning.ts
+@@ -2,7 +2,7 @@ import type { BedrockProviderOptions } from '@ai-sdk/amazon-bedrock'
+ import type { AnthropicProviderOptions } from '@ai-sdk/anthropic'
+ import type { GoogleGenerativeAIProviderOptions } from '@ai-sdk/google'
+ import type { OpenAIResponsesProviderOptions } from '@ai-sdk/openai'
+-import type { XaiProviderOptions } from '@ai-sdk/xai'
++import type { XaiResponsesProviderOptions } from '@ai-sdk/xai'
+ import type OpenAI from '@cherrystudio/openai'
+ import { loggerService } from '@logger'
+ import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+@@ -933,13 +933,33 @@ export function getGeminiReasoningParams(
+  * @param model - The model being used
+  * @returns XAI-specific reasoning parameters
+  */
+-export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<XaiProviderOptions, 'reasoningEffort'> {
+-  if (!isSupportedReasoningEffortGrokModel(model)) {
++export function getXAIReasoningParams(
++  assistant: Assistant,
++  model: Model
++): Pick<XaiResponsesProviderOptions, 'reasoningEffort'> {
++  const isGrok43 =
++    getLowerBaseModelName(model.id).includes('grok-4.3') && !getLowerBaseModelName(model.id).includes('non-reasoning')
++
++  if (!isSupportedReasoningEffortGrokModel(model) && !isGrok43) {
+     return {}
+   }
+ 
+   const { reasoning_effort: reasoningEffort } = getAssistantSettings(assistant)
++  if (!reasoningEffort || reasoningEffort === 'default') return {}
+ 
++  if (isGrok43) {
++    switch (reasoningEffort) {
++      case 'none':
++      case 'low':
++      case 'medium':
++      case 'high':
++        return { reasoningEffort }
++      default:
++        return {}
++    }
++  }
++
++  // Legacy grok models (grok-3-mini, openrouter/grok-4-fast): constrained effort mapping
+   switch (reasoningEffort) {
+     case 'auto':
+     case 'minimal':
+@@ -950,8 +970,6 @@ export function getXAIReasoningParams(assistant: Assistant, model: Model): Pick<
+       return { reasoningEffort }
+     case 'xhigh':
+       return { reasoningEffort: 'high' }
+-    case 'default':
+-    case 'none':
+     default:
+       return {}
+   }
