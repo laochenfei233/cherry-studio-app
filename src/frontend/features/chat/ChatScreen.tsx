@@ -11,7 +11,7 @@ import { Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { MainHeader } from '@/frontend/appShell/header';
-import { ReadingContentFrame } from '@/frontend/appShell/layout';
+import { ChatDockFooter, ReadingContentFrame } from '@/frontend/appShell/layout';
 import {
   type ChatRouteParamsInput,
   type ChatTarget,
@@ -145,7 +145,7 @@ function ResolvedChatContent({ target }: { target: ChatTarget }) {
       </ComposerDismissArea>
       {hasComposer ? (
         <ComposerDock layoutMode="flow">
-          <View className="gap-2">
+          <View>
             <ChatInput
               agentId={resolvedAgentId}
               controls={controls}
@@ -157,9 +157,11 @@ function ResolvedChatContent({ target }: { target: ChatTarget }) {
               }
               sessionId={sessionId}
             />
-            <Text className="text-center text-xs text-muted-foreground">
-              {t('chat.input.disclaimer')}
-            </Text>
+            <ChatDockFooter>
+              <Text className="text-center text-xs text-muted-foreground">
+                {t('chat.input.disclaimer')}
+              </Text>
+            </ChatDockFooter>
           </View>
         </ComposerDock>
       ) : null}
