@@ -122,6 +122,12 @@ Image generation keeps its existing independent pipeline:
 - the image executor owns generate/edit inputs, canonical parameter splitting, vendor options,
   submit/poll/cancel behavior, downloads, and managed artifacts.
 
+AI SDK text and image requests share only `resolveAiSdkServing`, which returns the connection,
+selected credentials, and wire model and carries no request parameters. `AiService.generateImage`
+builds image parameters from that result, and `AiImageRequest` accepts transport options only. Text
+options such as `systemMessageMode`, `store`, and reasoning or service-tier controls must not be
+merged into image requests.
+
 An image-only transport must not be added to the language binding. A language-only transport must
 not acquire image parameter or artifact responsibilities.
 
