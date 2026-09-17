@@ -40,6 +40,12 @@ source factory. Document and HTML callers put generation/persistence in that fac
 cancellation before admission, after asynchronous preparation and before opening the system sheet,
 and releases its prepared temporary image even when cancellation wins.
 
+`shareFiles(source, { watermark, signal })` admits an ordered collection or its asynchronous
+factory through the same availability and cancellation checks. Document exports use it for paged
+PNG delivery. All files are prepared and copied before one chooser opens: single-file delivery uses
+Expo Sharing, while multiple files use React Native Share. Completed document pages are copied
+without re-encoding, and a failed copy never opens a partial share sheet.
+
 `useShareFile` owns ordinary-file busy state, unmount cancellation and localized feedback.
 `useSaveImageToPhotos` owns add-only permission guidance and releases its prepared image after
 Photos copies it. System opening reuses `prepareFileExport`.
