@@ -173,7 +173,7 @@ function createTestRuntime(
       preflightModel: () => ({
         contextWindow: holder.resolution.model.contextWindow,
         inputModalities: [...holder.resolution.model.input],
-        maxInputTokens: holder.resolution.model.contextWindow - holder.resolution.model.maxTokens,
+        maxInputTokens: holder.resolution.maxInputTokens ?? holder.resolution.model.contextWindow,
         maxOutputTokens: holder.resolution.model.maxTokens,
         supportsTools: holder.resolution.supportsTools,
       }),
@@ -1266,6 +1266,32 @@ describe('PiRuntime mapping', () => {
     });
     await session.close();
   });
+
+  test.each([32_000, 500_000])(
+    'admits a short prompt when the output capability equals the %i-token context window',
+    async (contextWindow) => {
+      const runtime = createTestRuntime();
+      const holder = arrange(runtime, (context) => emitText(context, '可用。'));
+      holder.resolution = {
+        ...holder.resolution,
+        model: { ...holder.resolution.model, contextWindow, maxTokens: contextWindow },
+      };
+      const session = await runtime.open();
+
+      const events = await collect(
+        session.execute(
+          baseRequest('turn-shared-output-window', {
+            input: [{ type: 'text', text: '测试' }],
+          }),
+        ),
+      );
+
+      expect(events.some((event) => event.type === 'failed')).toBe(false);
+      expect(events.at(-1)).toEqual({ type: 'completed' });
+      expect(holder.lastOptions?.initialState?.model?.maxTokens).toBe(contextWindow);
+      await session.close();
+    },
+  );
 
   test('reserves output once while respecting independent input and total context limits', () => {
     const context = { messages: [], systemPrompt: 'x'.repeat(400), tools: [] };

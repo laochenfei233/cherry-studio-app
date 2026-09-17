@@ -118,6 +118,16 @@ limits, and native tool support. The Host calls it before reservation; provider 
 credentials, endpoints, and headers remain private to the Runtime adapter. Pi preflight and final
 model resolution read the same mobile model/provider services and enforce the same endpoint rules.
 
+Preflight reports the independent input limit, bounded by the total context window, without
+subtracting the model's maximum output capability. The SDK dynamically fits the actual output cap
+to each request's remaining context, keeping 4,096 tokens clear of the window before sizing output.
+Hard admission therefore retains the safety margin plus an output reserve that covers that clamp
+and a usable answer of at least 1,024 tokens; an admitted request is never reduced to a one-token
+response. The compaction reserve (at most 16,384 tokens and 20% of the window) is a soft trigger,
+not a sending limit, and never drops below the admission reserve, so a small window reaches
+compaction before the hard limit rejects it. Output space outside an independent input cap does not
+reduce that input cap again.
+
 Capabilities describe what the engine contract can represent. In particular, `tools: true` means
 Pi can run a tool loop; it does not mean any effective tool will enter the turn. The Host derives
 the effective tools from system and Agent-owned inputs, and the Pi model adapter separately checks
@@ -353,10 +363,12 @@ invalid, incompatible, oversized, or orphaned candidate—the Host supplies the 
 history. Pi owns all later selection, formatting, and compaction policy.
 
 Pi estimates reconstructed history with `pi-agent-core`'s content estimator. Persisted assistant
-usage aggregates multiple requests for analytics and is never a context-size measurement. The adapter adds system
-instructions, current input, tool schemas, image reserves, requested output, and a fixed safety
-margin before calling Pi's `shouldCompact`. A current input whose fixed costs alone exceed the
-window fails before the first model call.
+usage aggregates multiple requests for analytics and is never a context-size measurement. The adapter
+adds system instructions, current input, tool schemas, image reserves, and a fixed safety margin
+before calling Pi's `shouldCompact`. Historical image reserves follow the checkpoint-projected
+history; they are removable history costs, not part of the current input's fixed cost. A current
+input whose fixed costs exceed the hard budget fails before the first model call. Crossing the
+compaction trigger alone never proves that a request cannot be sent.
 
 On compaction, Pi owns the cut point, `previousSummary` merge, retained tail, and split-turn prefix
 summary. Checkpoint payloads store the redacted summary and an optional structural resume cursor;
@@ -365,9 +377,16 @@ durable Turns. A split-turn cursor reconstructs the retained suffix from the Hos
 Turn so tool calls and results remain paired after restart. Summary calls reuse the current model
 transport, credentials, timeout, and cancellation signal, and emit separate invocation usage reports attributed to the active Turn.
 
+If automatic compaction fails, cannot prepare a summary, or produces a summary that does not fit,
+the Runtime keeps the original projected context when it still fits the hard budget. It emits no
+checkpoint for that fallback. Cancellation still ends the turn, and oversized original context is
+never sent merely because compaction failed.
+
 Initial compaction is not the last admission check. Before Pi continues after a tool batch, the
-Runtime re-estimates the live assistant request and tool-result messages together with system,
-tool-schema, attachment, output, and safety reserves. A continuation that no longer fits stops as
+Runtime uses the latest valid provider usage plus subsequent messages when available. That usage
+already covers the old system prompt, tool schemas, and images; only unmeasured images and newly
+introduced tool definitions receive additional reserves. Without valid usage, those costs are
+estimated from content. A continuation that no longer fits the hard budget stops as
 `context_window_exceeded` before another provider request. Model-only catalog results additionally
 consume this live headroom while they are produced. At assistant response completion, only the new
 response content is deducted; that request's input was already budgeted before execution.

@@ -53,6 +53,7 @@ import {
   estimatePiLoopContextHeadroomTokens,
   estimatePiMessagesTokens,
   PI_ESTIMATED_CHARACTERS_PER_TOKEN,
+  PI_MIN_OUTPUT_RESERVE_TOKENS,
   planPiContext,
   type PiContextCompactionOptions,
 } from './contextCompaction';
@@ -737,7 +738,7 @@ class PiRuntimeSession implements AgentRuntimeSession {
               contextWindow: model.contextWindow,
               maxInputTokens: resolution.maxInputTokens,
               messages: context.messages,
-              outputReserveTokens: options?.maxTokens ?? model.maxTokens,
+              outputReserveTokens: PI_MIN_OUTPUT_RESERVE_TOKENS,
               systemPrompt: context.systemPrompt ?? '',
               tools: context.tools ?? [],
             }) < 0
@@ -767,7 +768,6 @@ class PiRuntimeSession implements AgentRuntimeSession {
           model: resolution.model,
           models,
           options: this.contextOptions,
-          outputReserveTokens: request.options.maxOutputTokens ?? resolution.model.maxTokens,
           redactSummary: (summary) => redactCompactionSummary(summary, compactionRedactions),
           signal: turn.abortController.signal,
           thinkingLevel,
@@ -790,7 +790,6 @@ class PiRuntimeSession implements AgentRuntimeSession {
       if (contextPlan.checkpoint) {
         this.emit(turn, { type: 'context.checkpoint', checkpoint: contextPlan.checkpoint });
       }
-      const outputReserveTokens = request.options.maxOutputTokens ?? resolution.model.maxTokens;
       let modelContext: Pick<PiAgentContext, 'systemPrompt' | 'tools'> = {
         systemPrompt: conversation.systemPrompt,
         tools: piTools,
@@ -801,7 +800,7 @@ class PiRuntimeSession implements AgentRuntimeSession {
           contextWindow: resolution.model.contextWindow,
           maxInputTokens: resolution.maxInputTokens,
           messages,
-          outputReserveTokens,
+          outputReserveTokens: PI_MIN_OUTPUT_RESERVE_TOKENS,
           systemPrompt: modelContext.systemPrompt,
           tools: modelContext.tools ?? [],
         });
