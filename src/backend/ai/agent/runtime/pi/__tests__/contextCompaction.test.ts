@@ -93,6 +93,34 @@ function plan(
 }
 
 describe('Pi context admission and compaction', () => {
+  test('charges a retry prefix to the current turn instead of compactible history', async () => {
+    const withPrefix = conversation(100_000);
+    const retainedResult: ToolResultMessage = {
+      role: 'toolResult',
+      toolCallId: 'retained',
+      toolName: 'search',
+      content: [{ type: 'text', text: 'x'.repeat(40_000 * 4) }],
+      isError: false,
+      timestamp: 5,
+    };
+    withPrefix.resume = [retainedResult];
+    const completeSimple = jest.fn(async () => response());
+
+    // The same history admits without compaction when no prefix shares the budget.
+    expect(await plan({ conversation: conversation(100_000) }, completeSimple)).toMatchObject({
+      ok: true,
+      checkpoint: null,
+    });
+    expect(completeSimple).not.toHaveBeenCalled();
+
+    const result = await plan({ conversation: withPrefix }, completeSimple);
+
+    expect(completeSimple).toHaveBeenCalled();
+    // History is summarized; the current-turn prefix is never a compaction candidate.
+    expect(result.ok && result.messages).not.toContain(retainedResult);
+    expect(result.ok && result.checkpoint).not.toBeNull();
+  });
+
   test('admits a current input above the compaction trigger when Pi can shrink the output', async () => {
     const current = conversation();
     current.prompt.content = 'x'.repeat(480_000 * 4);

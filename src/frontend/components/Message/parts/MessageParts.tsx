@@ -45,7 +45,6 @@ export function MessageParts({ message, renderMode = 'markdown' }: MessagePartsP
       {boundaries.map(({ index, part }) => (
         <MessagePartRenderer
           isStreaming={isStreaming}
-          isTextSelectionEnabled={false}
           key={getMessagePartKey(message, part, index)}
           part={part}
         />

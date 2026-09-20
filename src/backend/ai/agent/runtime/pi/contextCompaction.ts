@@ -267,9 +267,10 @@ export function estimatePiContextFixedCosts(input: {
   outputReserveTokens: number;
   tools: readonly PiToolSchema[];
 }): PiContextFixedCosts {
-  const currentInputTokens = estimatePiMessagesTokens([input.conversation.prompt]);
+  const currentMessages = [input.conversation.prompt, ...(input.conversation.resume ?? [])];
+  const currentInputTokens = estimatePiMessagesTokens(currentMessages);
   const fixedCosts = estimatePiNonMessageContextCosts({
-    imageMessages: [input.conversation.prompt],
+    imageMessages: currentMessages,
     outputReserveTokens: input.outputReserveTokens,
     systemPrompt: input.conversation.systemPrompt,
     tools: input.tools,
@@ -291,7 +292,9 @@ export async function planPiContext(
     ...input,
     projected: projectContext(input.checkpoint, input.conversation.historyTurns),
     historyTurns: input.conversation.historyTurns,
-    currentInput: input.conversation.prompt,
+    // A retry's retained prefix belongs to the turn being produced, not to
+    // completed history, so it is never a compaction candidate.
+    currentMessages: [input.conversation.prompt, ...(input.conversation.resume ?? [])],
     systemPrompt: input.conversation.systemPrompt,
   });
 }
@@ -328,7 +331,8 @@ async function planProjectedContext(
   input: PiContextPlanInput & {
     projected: ProjectedContext;
     historyTurns: PiHistoryTurn[];
-    currentInput?: PiConversation['prompt'];
+    /** Current-turn messages: the prompt, plus any retained retry prefix. */
+    currentMessages?: AgentMessage[];
     systemPrompt: string;
   },
 ): Promise<PiContextPlan> {
@@ -343,7 +347,7 @@ async function planProjectedContext(
     resolveCompactionSettings(
       Math.min(input.model.contextWindow, input.maxInputTokens ?? input.model.contextWindow),
     );
-  const currentMessages = input.currentInput ? [input.currentInput] : [];
+  const currentMessages = input.currentMessages ?? [];
   const fixedCosts = estimatePiNonMessageContextCosts({
     imageMessages: currentMessages,
     outputReserveTokens: PI_MIN_OUTPUT_RESERVE_TOKENS,
