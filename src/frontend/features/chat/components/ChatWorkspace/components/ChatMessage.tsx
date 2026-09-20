@@ -140,6 +140,9 @@ function ChatMessageContextMenu({
   // These existing actions and the text projection accept either message role.
   const text =
     message.status === 'pending' ? '' : copyAssistantMessageText(message.data.parts ?? []);
+  // Non-destructive actions only. A long press competes with native text
+  // selection and lands on whatever the finger happens to reach, which is not
+  // a gesture that should be able to remove a turn.
   const items: readonly MenuItem[] =
     message.status === 'pending'
       ? []

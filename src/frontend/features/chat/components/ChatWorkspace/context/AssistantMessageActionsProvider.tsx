@@ -1,4 +1,4 @@
-import { useToast } from '@cherrystudio/ui/components';
+import { useAlert, useToast } from '@cherrystudio/ui/components';
 import * as Clipboard from 'expo-clipboard';
 import { router, useFocusEffect } from 'expo-router';
 import {
@@ -17,7 +17,12 @@ import { Keyboard } from 'react-native';
 import { useAgentSession } from '@/frontend/hooks/agent';
 import { loggerService } from '@/shared/core/logger/LoggerService';
 
-import { useAgentChatBusy, useAgentChatFork, useAgentChatRetry } from '../../../runtime';
+import {
+  useAgentChatBusy,
+  useAgentChatDeleteTurn,
+  useAgentChatFork,
+  useAgentChatRetry,
+} from '../../../runtime';
 import { getSendErrorLabelKey } from '../../ChatInput/utils/sendErrorLabel';
 
 const COPIED_FEEDBACK_DURATION_MS = 1_200;
@@ -28,6 +33,8 @@ const logger = loggerService.withContext('AssistantMessageActions');
 type AssistantMessageActionsState = {
   copiedMessageId?: string;
   isAssistantToolbarEnabled: boolean;
+  /** A running turn owns the transcript; its rows must not disappear underneath it. */
+  isDeleteDisabled: boolean;
   isRetryDisabled: boolean;
   /** The Session's latest answer, the only one retry may replace. */
   retryableMessageId?: string;
@@ -39,6 +46,8 @@ type AssistantMessageActions = {
   copyAssistantMessage: (input: { messageId: string; text: string }) => void;
   /** Copies the transcript up to this message into a new chat and opens it. */
   forkFromAssistantMessage: (input: { messageId: string }) => void;
+  /** Confirms, then removes the pressed message's whole exchange. */
+  deleteMessageTurn: (input: { turnId: string }) => void;
 };
 
 const AssistantMessageActionsStateContext = createContext<AssistantMessageActionsState | null>(
@@ -60,6 +69,8 @@ export function AssistantMessageActionsProvider({
 }: AssistantMessageActionsProviderProps) {
   const { t } = useTranslation();
   const { toast } = useToast();
+  const { alert } = useAlert();
+  const deleteTurn = useAgentChatDeleteTurn();
   const forkSession = useAgentChatFork();
   const retryMessage = useAgentChatRetry();
   const isSessionBusy = useAgentChatBusy(sessionId);
@@ -156,6 +167,32 @@ export function AssistantMessageActionsProvider({
     [forkSession, sessionId, sourceTitle, t, toast],
   );
 
+  const deleteMessageTurn = useCallback(
+    ({ turnId }: { turnId: string }) => {
+      if (!sessionId) {
+        return;
+      }
+      alert.confirm({
+        confirmLabel: t('common.delete'),
+        description: t('chat.messageActions.deleteMessage'),
+        onConfirm: () => {
+          void deleteTurn({ sessionId, turnId }).catch((error) => {
+            logger.error('Delete message turn failed', error as Error);
+
+            if (!isMountedRef.current) {
+              return;
+            }
+
+            toast.show({ label: t('chat.messageActions.deleteFailed'), variant: 'danger' });
+          });
+        },
+        role: 'destructive',
+        title: t('chat.messageActions.deleteTitle'),
+      });
+    },
+    [alert, deleteTurn, sessionId, t, toast],
+  );
+
   const retryAssistantMessage = useCallback(
     ({ messageId }: { messageId: string }) => {
       if (!sessionId || retryInFlightRef.current || isSessionBusy) return;
@@ -181,6 +218,7 @@ export function AssistantMessageActionsProvider({
     () => ({
       copiedMessageId,
       isAssistantToolbarEnabled,
+      isDeleteDisabled: isSessionBusy || !sessionId,
       isRetryDisabled: isSessionBusy || !sessionId,
       ...(retryableMessageId ? { retryableMessageId } : {}),
     }),
@@ -189,11 +227,18 @@ export function AssistantMessageActionsProvider({
   const actionsValue = useMemo(
     () => ({
       copyAssistantMessage,
+      deleteMessageTurn,
       forkFromAssistantMessage,
       retryAssistantMessage,
       shareAssistantMessage,
     }),
-    [copyAssistantMessage, forkFromAssistantMessage, retryAssistantMessage, shareAssistantMessage],
+    [
+      copyAssistantMessage,
+      deleteMessageTurn,
+      forkFromAssistantMessage,
+      retryAssistantMessage,
+      shareAssistantMessage,
+    ],
   );
 
   useEffect(() => {

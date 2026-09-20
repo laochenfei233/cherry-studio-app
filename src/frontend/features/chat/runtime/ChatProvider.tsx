@@ -48,6 +48,11 @@ export type PendingChatSend = Readonly<{
   messages: ReturnType<typeof createPendingChatMessages>;
 }>;
 
+type AgentChatDeleteTurnInput = {
+  sessionId: string;
+  turnId: string;
+};
+
 type AgentChatForkInput = {
   fromMessageId: string;
   sessionId: string;
@@ -58,6 +63,7 @@ type AgentChatForkInput = {
 type AgentChatContextValue = {
   client: AgentSessionChatClient;
   completeDraftHandoff: (sessionId: string) => void;
+  deleteTurn: (input: AgentChatDeleteTurnInput) => Promise<void>;
   forkSession: (input: AgentChatForkInput) => Promise<void>;
   retryMessage: (input: AgentRetryMessageInput) => Promise<void>;
   getDraftHandoff: (sessionId: string | undefined) => AgentChatDraftHandoff | undefined;
@@ -135,6 +141,12 @@ export function ChatProvider({ children }: PropsWithChildren) {
     },
     [client, draftHandoff, navigation, queryClient],
   );
+  const deleteTurn = useCallback(
+    async ({ sessionId, turnId }: AgentChatDeleteTurnInput) => {
+      await client.deleteTurn(sessionId, turnId);
+    },
+    [client],
+  );
   const forkSession = useCallback(
     async ({ fromMessageId, sessionId, title }: AgentChatForkInput) => {
       const session = await client.forkSession(sessionId, fromMessageId, title);
@@ -151,12 +163,13 @@ export function ChatProvider({ children }: PropsWithChildren) {
     () => ({
       client,
       completeDraftHandoff: draftHandoff.complete,
+      deleteTurn,
       forkSession,
       retryMessage,
       getDraftHandoff: draftHandoff.get,
       sendMessage,
     }),
-    [client, draftHandoff, forkSession, retryMessage, sendMessage],
+    [client, deleteTurn, draftHandoff, forkSession, retryMessage, sendMessage],
   );
 
   return (
@@ -341,6 +354,11 @@ export function useAgentChatActions() {
 /** Forks a Session at one message and navigates to the copy. */
 export function useAgentChatFork() {
   return useAgentChatContext().forkSession;
+}
+
+/** Removes one settled turn from the observed Session's transcript. */
+export function useAgentChatDeleteTurn() {
+  return useAgentChatContext().deleteTurn;
 }
 
 export function useAgentChatRetry() {
