@@ -1674,5 +1674,6 @@
   "settings.websearch.provider.saveFailed": "Salvare eșuată",
   "settings.websearch.provider.selection": "Furnizor de căutare",
   "settings.websearch.provider.showApiKeys": "Afișează cheia API",
-  "settings.websearch.provider.title": "Furnizor de căutare"
+  "settings.websearch.provider.title": "Furnizor de căutare",
+  "systemEntry.failed": "Această partajare nu a putut fi deschisă. Partajați din nou conținutul."
 }

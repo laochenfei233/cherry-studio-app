@@ -26,6 +26,7 @@ import {
 import { configureReporting, wrapReportingRoot } from '@/frontend/appShell/observability';
 import { APP_SEARCH_TRANSITION_DURATION_MS } from '@/frontend/appShell/search';
 import { StartupCoordinator, StartupRouteReadyReporter } from '@/frontend/appShell/startup';
+import { SystemEntryBridge } from '@/frontend/appShell/systemEntry';
 import { QueryProvider } from '@/frontend/data';
 import { useThemeColor } from '@/frontend/hooks/useThemeColor';
 import { LanguagePreferenceObserver } from '@/frontend/i18n';
@@ -59,6 +60,7 @@ function RootLayout() {
                               <RouteHeaderProvider rootAction="back">
                                 <BackgroundActivityBridge />
                                 <LanguagePreferenceObserver />
+                                <SystemEntryBridge />
                                 <RootStack />
                               </RouteHeaderProvider>
                             </BottomSheetProvider>

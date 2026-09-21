@@ -1664,5 +1664,6 @@
   "settings.websearch.provider.saveFailed": "Không lưu được",
   "settings.websearch.provider.selection": "Nhà cung cấp dịch vụ tìm kiếm",
   "settings.websearch.provider.showApiKeys": "Hiển thị khóa API",
-  "settings.websearch.provider.title": "Nhà cung cấp dịch vụ tìm kiếm"
+  "settings.websearch.provider.title": "Nhà cung cấp dịch vụ tìm kiếm",
+  "systemEntry.failed": "Không thể mở nội dung chia sẻ này. Hãy chia sẻ lại."
 }

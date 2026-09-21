@@ -1669,5 +1669,6 @@
   "settings.websearch.provider.saveFailed": "Speichern fehlgeschlagen",
   "settings.websearch.provider.selection": "Suchanbieter",
   "settings.websearch.provider.showApiKeys": "API-Schlüssel anzeigen",
-  "settings.websearch.provider.title": "Suchanbieter"
+  "settings.websearch.provider.title": "Suchanbieter",
+  "systemEntry.failed": "Diese Freigabe konnte nicht geöffnet werden. Teilen Sie den Inhalt erneut."
 }

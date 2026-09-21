@@ -1669,5 +1669,6 @@
   "settings.websearch.provider.saveFailed": "Failed to save",
   "settings.websearch.provider.selection": "Search provider",
   "settings.websearch.provider.showApiKeys": "Show API Key",
-  "settings.websearch.provider.title": "Search provider"
+  "settings.websearch.provider.title": "Search provider",
+  "systemEntry.failed": "Could not open this share. Share the content again."
 }

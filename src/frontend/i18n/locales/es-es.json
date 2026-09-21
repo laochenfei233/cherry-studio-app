@@ -1674,5 +1674,6 @@
   "settings.websearch.provider.saveFailed": "No se pudo guardar",
   "settings.websearch.provider.selection": "Proveedor de búsqueda",
   "settings.websearch.provider.showApiKeys": "Mostrar clave API",
-  "settings.websearch.provider.title": "Proveedor de búsqueda"
+  "settings.websearch.provider.title": "Proveedor de búsqueda",
+  "systemEntry.failed": "No se pudo abrir este contenido compartido. Vuelve a compartirlo."
 }

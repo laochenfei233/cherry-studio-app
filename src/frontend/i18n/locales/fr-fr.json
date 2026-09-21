@@ -1674,5 +1674,6 @@
   "settings.websearch.provider.saveFailed": "Échec de l'enregistrement",
   "settings.websearch.provider.selection": "Fournisseur de recherche",
   "settings.websearch.provider.showApiKeys": "Afficher la clé API",
-  "settings.websearch.provider.title": "Fournisseur de recherche"
+  "settings.websearch.provider.title": "Fournisseur de recherche",
+  "systemEntry.failed": "Impossible d’ouvrir ce partage. Partagez à nouveau le contenu."
 }

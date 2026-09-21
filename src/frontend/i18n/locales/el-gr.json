@@ -1669,5 +1669,6 @@
   "settings.websearch.provider.saveFailed": "Αποτυχία αποθήκευσης",
   "settings.websearch.provider.selection": "Πάροχος αναζήτησης",
   "settings.websearch.provider.showApiKeys": "Εμφάνιση κλειδιού API",
-  "settings.websearch.provider.title": "Πάροχος αναζήτησης"
+  "settings.websearch.provider.title": "Πάροχος αναζήτησης",
+  "systemEntry.failed": "Δεν ήταν δυνατό το άνοιγμα αυτής της κοινοποίησης. Κοινοποιήστε ξανά το περιεχόμενο."
 }

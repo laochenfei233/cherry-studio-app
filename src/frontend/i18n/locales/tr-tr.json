@@ -1669,5 +1669,6 @@
   "settings.websearch.provider.saveFailed": "Kaydedilemedi",
   "settings.websearch.provider.selection": "Arama sağlayıcısı",
   "settings.websearch.provider.showApiKeys": "API Anahtarını Göster",
-  "settings.websearch.provider.title": "Arama sağlayıcısı"
+  "settings.websearch.provider.title": "Arama sağlayıcısı",
+  "systemEntry.failed": "Bu paylaşım açılamadı. İçeriği yeniden paylaşın."
 }

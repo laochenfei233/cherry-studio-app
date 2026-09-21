@@ -1679,5 +1679,6 @@
   "settings.websearch.provider.saveFailed": "Не удалось сохранить",
   "settings.websearch.provider.selection": "Поставщик поиска",
   "settings.websearch.provider.showApiKeys": "Показать ключ API",
-  "settings.websearch.provider.title": "Поставщик поиска"
+  "settings.websearch.provider.title": "Поставщик поиска",
+  "systemEntry.failed": "Не удалось открыть этот материал. Поделитесь содержимым ещё раз."
 }

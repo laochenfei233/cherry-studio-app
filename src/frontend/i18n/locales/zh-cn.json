@@ -1664,5 +1664,6 @@
   "settings.websearch.provider.saveFailed": "保存失败",
   "settings.websearch.provider.selection": "搜索服务商",
   "settings.websearch.provider.showApiKeys": "显示 API Key",
-  "settings.websearch.provider.title": "搜索服务商"
+  "settings.websearch.provider.title": "搜索服务商",
+  "systemEntry.failed": "无法打开此分享，请重新分享内容。"
 }

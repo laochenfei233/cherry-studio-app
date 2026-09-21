@@ -1664,5 +1664,6 @@
   "settings.websearch.provider.saveFailed": "保存に失敗しました",
   "settings.websearch.provider.selection": "検索プロバイダー",
   "settings.websearch.provider.showApiKeys": "API キーを表示",
-  "settings.websearch.provider.title": "検索プロバイダー"
+  "settings.websearch.provider.title": "検索プロバイダー",
+  "systemEntry.failed": "この共有を開けませんでした。もう一度共有してください。"
 }
