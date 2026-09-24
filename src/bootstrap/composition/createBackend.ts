@@ -1,3 +1,5 @@
+import { createMMKV } from 'react-native-mmkv';
+
 import { checkChatModel } from '@/backend/ai/agent/modelCheck';
 import type { AgentRuntime } from '@/backend/ai/agent/runtime';
 import {
@@ -15,6 +17,7 @@ import { DesktopConnectionService } from '@/backend/data/services/DesktopConnect
 import { FileEntryService } from '@/backend/data/services/FileEntryService';
 import { materializeRemoteModels } from '@/backend/data/services/materializeRemoteModels';
 import { providerRegistryService } from '@/backend/data/services/ProviderRegistryService';
+import { RemoteAgentCommandJournal } from '@/backend/data/services/RemoteAgentCommandJournal';
 import { agentAvatarImages } from '@/backend/services/agents/agentAvatarStorage';
 import {
   type AgentAvatars,
@@ -47,6 +50,7 @@ import {
 } from '@/backend/services/providers/providerAvatarStorage';
 import type { ProviderRegistryUpdaterService } from '@/backend/services/providers/ProviderRegistryUpdaterService';
 import { providerRegistryUpdates } from '@/backend/services/providers/providerRegistryUpdates';
+import type { RemoteAgentRuntime } from '@/backend/services/remoteAgent';
 import { createSystemEntryModule, createSystemShareImporter } from '@/backend/services/systemEntry';
 import type { BackendServices } from '@/bootstrap/composition/createBackendServices';
 import type { Backend } from '@/shared/contracts';
@@ -72,6 +76,7 @@ export function createBackend(
     documentExport: DocumentExportRuntime;
     desktopConnections: DesktopConnectionRuntime;
     desktopConnectionManager: DesktopConnectionManager;
+    remoteAgent: RemoteAgentRuntime;
     languageServing: LanguageServingSupport & AgentRuntime;
     providerRegistryUpdater: Pick<ProviderRegistryUpdaterService, 'applyUpdate' | 'ensureReady'>;
   },
@@ -79,6 +84,10 @@ export function createBackend(
   const { dbService } = infrastructure;
   // Capture this host's database; late work never resolves a replacement host.
   const exportFiles = new FileEntryService(dbService);
+  infrastructure.remoteAgent.configure({
+    connections: infrastructure.desktopConnectionManager,
+    journal: new RemoteAgentCommandJournal(createMMKV({ id: 'cherry-remote-agent-commands' })),
+  });
   infrastructure.documentExport.configure(createDocumentExportDependencies(exportFiles));
   const desktopStore = new DesktopConnectionService(dbService);
   infrastructure.desktopConnectionManager.configure(desktopStore);
@@ -213,6 +222,7 @@ export function createBackend(
       backup: infrastructure.backup,
       systemEntry: systemEntry.module,
       agent: services.agent,
+      remoteAgent: infrastructure.remoteAgent,
       desktopConnections: infrastructure.desktopConnections,
       documentExport: infrastructure.documentExport,
       file: {

@@ -82,6 +82,7 @@ export type BackendCacheSchema = {
  * `undefined` — the backing store round-trips every value through JSON.
  */
 export type PersistCacheSchema = {
+  'remote_agent.drafts': Record<string, string>;
   // Last composer effort per Agent; clearing the cache restores model defaults.
   'chat.reasoning_efforts': Record<string, ReasoningEffortOption>;
   // Persist-layer self-test key: exercises the typed persist API and round-trip
@@ -90,6 +91,7 @@ export type PersistCacheSchema = {
 };
 
 export const DefaultPersistCache: PersistCacheSchema = {
+  'remote_agent.drafts': {},
   'chat.reasoning_efforts': {},
   'internal.persist_probe': 0,
 };

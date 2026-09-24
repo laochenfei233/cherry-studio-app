@@ -14,16 +14,15 @@ import {
 import { useTranslation } from 'react-i18next';
 import { Keyboard } from 'react-native';
 
-import { useAgentSession } from '@/frontend/hooks/agent';
+import type {
+  ConversationMessage,
+  ConversationSnapshot,
+  ConversationAction,
+} from '@/frontend/appShell/conversation';
+import { conversationHref } from '@/frontend/appShell/navigation/chat';
 import { loggerService } from '@/shared/core/logger/LoggerService';
 
-import {
-  useAgentChatBusy,
-  useAgentChatDeleteTurn,
-  useAgentChatFork,
-  useAgentChatRetry,
-} from '../../../runtime';
-import { getSendErrorLabelKey } from '../../ChatInput/utils/sendErrorLabel';
+import { getSendErrorCodeLabelKey } from '../../ChatInput/utils/sendErrorLabel';
 
 const COPIED_FEEDBACK_DURATION_MS = 1_200;
 /** Matches the Session title column, which the fork input also caps at 255. */
@@ -41,13 +40,12 @@ type AssistantMessageActionsState = {
 };
 
 type AssistantMessageActions = {
-  retryAssistantMessage: (input: { messageId: string }) => void;
+  retryAssistantMessage?: (input: { messageId: string }) => void;
   shareAssistantMessage: (input: { messageId: string }) => void;
   copyAssistantMessage: (input: { messageId: string; text: string }) => void;
   /** Copies the transcript up to this message into a new chat and opens it. */
-  forkFromAssistantMessage: (input: { messageId: string }) => void;
-  /** Confirms, then removes the pressed message's whole exchange. */
-  deleteMessageTurn: (input: { turnId: string }) => void;
+  forkFromAssistantMessage?: (input: { messageId: string }) => void;
+  deleteMessageTurn?: (input: { turnId: string }) => void;
 };
 
 const AssistantMessageActionsStateContext = createContext<AssistantMessageActionsState | null>(
@@ -58,49 +56,152 @@ const AssistantMessageActionsContext = createContext<AssistantMessageActions | n
 type AssistantMessageActionsProviderProps = PropsWithChildren<{
   isAssistantToolbarEnabled: boolean;
   retryableMessageId?: string;
-  sessionId?: string;
+  /** Opens the source-owned share selector; absent while no Session exists. */
+  onShare?: (messageId: string) => void;
+  snapshot: ConversationSnapshot;
+  messages: readonly ConversationMessage[];
 }>;
 
 export function AssistantMessageActionsProvider({
   children,
   isAssistantToolbarEnabled,
   retryableMessageId,
-  sessionId,
+  onShare,
+  snapshot,
+  messages,
 }: AssistantMessageActionsProviderProps) {
   const { t } = useTranslation();
   const { toast } = useToast();
   const { alert } = useAlert();
-  const deleteTurn = useAgentChatDeleteTurn();
-  const forkSession = useAgentChatFork();
-  const retryMessage = useAgentChatRetry();
-  const isSessionBusy = useAgentChatBusy(sessionId);
-  const retryInFlightRef = useRef(false);
-  const currentSessionRef = useRef(sessionId);
+  const mounted = useRef(true);
+  const inFlight = useRef(new Set<string>());
   useEffect(() => {
-    currentSessionRef.current = sessionId;
+    mounted.current = true;
     return () => {
-      currentSessionRef.current = undefined;
+      mounted.current = false;
     };
-  }, [sessionId]);
-  const shareNavigationInFlightRef = useRef(false);
+  }, []);
+  const sharing = useRef(false);
   useFocusEffect(
     useCallback(() => {
-      // The chat screen remains mounted underneath the selector. Unlock only when
-      // it regains focus so rapid taps cannot push duplicate selector routes.
-      shareNavigationInFlightRef.current = false;
+      sharing.current = false;
     }, []),
   );
-  const shareAssistantMessage = useCallback(
-    ({ messageId }: { messageId: string }) => {
-      if (!sessionId || shareNavigationInFlightRef.current) return;
-      shareNavigationInFlightRef.current = true;
-      Keyboard.dismiss();
-      router.push({ pathname: '/chat-share', params: { sessionId, messageId } });
-    },
-    [sessionId, shareNavigationInFlightRef],
+  const share = ({ messageId }: { messageId: string }) => {
+    if (!onShare || sharing.current) return;
+    sharing.current = true;
+    Keyboard.dismiss();
+    onShare(messageId);
+  };
+  async function run<Input, Output>(
+    key: string,
+    action: ConversationAction<Input, Output> | undefined,
+    value: Input,
+    errorLabel: 'retryFailed' | 'forkFailed' | 'deleteFailed',
+    applied?: (result: Output) => void,
+  ) {
+    if (!action || action.availability.state !== 'enabled' || inFlight.current.has(key)) return;
+    inFlight.current.add(key);
+    try {
+      const outcome = await action.execute(value);
+      if (!mounted.current) return;
+      if (outcome.state === 'applied') applied?.(outcome.value);
+      else if (outcome.state === 'rejected' || outcome.state === 'interrupted')
+        toast.show({
+          label: t(
+            (outcome.state === 'rejected' &&
+              getSendErrorCodeLabelKey(outcome.failure.detail?.code)) ||
+              `chat.messageActions.${errorLabel}`,
+          ),
+          variant: 'danger',
+        });
+    } catch (error) {
+      logger.error('Conversation message action failed', error as Error);
+      if (mounted.current)
+        toast.show({ label: t(`chat.messageActions.${errorLabel}`), variant: 'danger' });
+    } finally {
+      inFlight.current.delete(key);
+    }
+  }
+  const retryMessage = messages.find((message) => message.key === retryableMessageId);
+  const isBusy = snapshot.executions.some(
+    (execution) =>
+      execution.state === 'running' ||
+      execution.state === 'awaiting-approval' ||
+      execution.state === 'awaiting-input' ||
+      execution.state === 'finalizing',
   );
-  // Already in cache: the chat screen resolves this same Session to render.
-  const sourceTitle = useAgentSession(sessionId).data?.title?.trim();
+  const retry = ({ messageId }: { messageId: string }) => {
+    if (messageId !== retryableMessageId || isBusy) return;
+    void run(`retry:${messageId}`, retryMessage?.actions.retry, undefined, 'retryFailed');
+  };
+  const fork = ({ messageId }: { messageId: string }) => {
+    const sourceTitle = snapshot.title.trim();
+    const title = sourceTitle
+      ? t('chat.fork.sessionTitle', { title: sourceTitle }).slice(0, SESSION_TITLE_MAX_LENGTH)
+      : undefined;
+    void run(
+      `fork:${messageId}`,
+      messages.find((message) => message.key === messageId)?.actions.fork,
+      { title },
+      'forkFailed',
+      (ref) => router.replace(conversationHref(ref)),
+    );
+  };
+  const remove = ({ turnId }: { turnId: string }) => {
+    const message = messages.find(
+      (message) => message.display.turnId === turnId && message.actions.remove,
+    );
+    if (!message || isBusy) return;
+    alert.confirm({
+      confirmLabel: t('common.delete'),
+      description: t('chat.messageActions.deleteMessage'),
+      role: 'destructive',
+      title: t('chat.messageActions.deleteTitle'),
+      onConfirm: () => {
+        void run(`delete:${turnId}`, message.actions.remove, undefined, 'deleteFailed');
+      },
+    });
+  };
+  return (
+    <ChatMessageActionsProvider
+      isAssistantToolbarEnabled={isAssistantToolbarEnabled}
+      onShare={share}
+      onFork={messages.some((message) => message.actions.fork) ? fork : undefined}
+      onDelete={messages.some((message) => message.actions.remove) ? remove : undefined}
+      onRetry={retryMessage?.actions.retry ? retry : undefined}
+      isDeleteDisabled={isBusy}
+      isRetryDisabled={isBusy || retryMessage?.actions.retry?.availability.state !== 'enabled'}
+      retryableMessageId={retryableMessageId}
+    >
+      {children}
+    </ChatMessageActionsProvider>
+  );
+}
+
+/** Presentation actions shared by local and PC-owned conversations. */
+export function ChatMessageActionsProvider({
+  children,
+  isAssistantToolbarEnabled,
+  onShare: shareAssistantMessage,
+  onFork: forkFromAssistantMessage,
+  onDelete: deleteMessageTurn,
+  onRetry: retryAssistantMessage,
+  isDeleteDisabled = true,
+  isRetryDisabled = true,
+  retryableMessageId,
+}: PropsWithChildren<{
+  isAssistantToolbarEnabled: boolean;
+  onShare: AssistantMessageActions['shareAssistantMessage'];
+  onFork?: AssistantMessageActions['forkFromAssistantMessage'];
+  onDelete?: AssistantMessageActions['deleteMessageTurn'];
+  onRetry?: AssistantMessageActions['retryAssistantMessage'];
+  isDeleteDisabled?: boolean;
+  isRetryDisabled?: boolean;
+  retryableMessageId?: string;
+}>) {
+  const { t } = useTranslation();
+  const { toast } = useToast();
   const [copiedMessageId, setCopiedMessageId] = useState<string>();
   const copiedFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyOperationIdRef = useRef(0);
@@ -142,87 +243,21 @@ export function AssistantMessageActionsProvider({
     [t, toast],
   );
 
-  const forkFromAssistantMessage = useCallback(
-    ({ messageId }: { messageId: string }) => {
-      if (!sessionId) {
-        return;
-      }
-      // An unnamed source stays unnamed, so the fork keeps the empty title that
-      // lets auto-naming name it from its own first message. A prefix alone
-      // would block that forever.
-      const title = sourceTitle
-        ? t('chat.fork.sessionTitle', { title: sourceTitle }).slice(0, SESSION_TITLE_MAX_LENGTH)
-        : undefined;
-
-      void forkSession({ fromMessageId: messageId, sessionId, title }).catch((error) => {
-        logger.error('Fork assistant message failed', error as Error);
-
-        if (!isMountedRef.current) {
-          return;
-        }
-
-        toast.show({ label: t('chat.messageActions.forkFailed'), variant: 'danger' });
-      });
-    },
-    [forkSession, sessionId, sourceTitle, t, toast],
-  );
-
-  const deleteMessageTurn = useCallback(
-    ({ turnId }: { turnId: string }) => {
-      if (!sessionId) {
-        return;
-      }
-      alert.confirm({
-        confirmLabel: t('common.delete'),
-        description: t('chat.messageActions.deleteMessage'),
-        onConfirm: () => {
-          void deleteTurn({ sessionId, turnId }).catch((error) => {
-            logger.error('Delete message turn failed', error as Error);
-
-            if (!isMountedRef.current) {
-              return;
-            }
-
-            toast.show({ label: t('chat.messageActions.deleteFailed'), variant: 'danger' });
-          });
-        },
-        role: 'destructive',
-        title: t('chat.messageActions.deleteTitle'),
-      });
-    },
-    [alert, deleteTurn, sessionId, t, toast],
-  );
-
-  const retryAssistantMessage = useCallback(
-    ({ messageId }: { messageId: string }) => {
-      if (!sessionId || retryInFlightRef.current || isSessionBusy) return;
-      retryInFlightRef.current = true;
-      void retryMessage({ sessionId, messageId })
-        .catch((error: unknown) => {
-          logger.error('Retry assistant message failed', error as Error);
-          if (currentSessionRef.current === sessionId) {
-            toast.show({
-              label: t(getSendErrorLabelKey(error) ?? 'chat.messageActions.retryFailed'),
-              variant: 'danger',
-            });
-          }
-        })
-        .finally(() => {
-          retryInFlightRef.current = false;
-        });
-    },
-    [isSessionBusy, retryMessage, sessionId, t, toast],
-  );
-
   const stateValue = useMemo(
     () => ({
       copiedMessageId,
       isAssistantToolbarEnabled,
-      isDeleteDisabled: isSessionBusy || !sessionId,
-      isRetryDisabled: isSessionBusy || !sessionId,
+      isDeleteDisabled,
+      isRetryDisabled,
       ...(retryableMessageId ? { retryableMessageId } : {}),
     }),
-    [copiedMessageId, isAssistantToolbarEnabled, isSessionBusy, retryableMessageId, sessionId],
+    [
+      copiedMessageId,
+      isAssistantToolbarEnabled,
+      isDeleteDisabled,
+      isRetryDisabled,
+      retryableMessageId,
+    ],
   );
   const actionsValue = useMemo(
     () => ({

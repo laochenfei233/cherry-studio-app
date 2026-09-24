@@ -1,12 +1,9 @@
 import { webSearchOutputSchema } from '@cherrystudio/universal/ai/builtinTools';
 
+import type { TranscriptMessage } from '@/frontend/appShell/conversation';
 import { getMessageProcessDurationMs } from '@/frontend/utils/messageProcessDuration';
 import { omitGeneratedImageReferencesFromMarkdown } from '@/frontend/utils/omitGeneratedImageReferences';
-import {
-  AgentToolResultSchema,
-  type AgentMessagePart,
-  type AgentMessageView,
-} from '@/shared/contracts/agent';
+import { AgentToolResultSchema, type AgentMessageView } from '@/shared/contracts/agent';
 import {
   DOCUMENT_EXPORT_MAX_SECTIONS,
   DocumentExportError,
@@ -30,14 +27,19 @@ export type ChatExportOptions = {
   };
 };
 
-export function isChatMessageExportable(message: AgentMessageView) {
+export type ChatExportMessage = TranscriptMessage & { truncated?: boolean };
+
+export function isChatMessageExportable(message: ChatExportMessage) {
   return (
-    message.role !== 'system' && message.status !== 'pending' && message.status !== 'streaming'
+    !message.truncated &&
+    message.role !== 'system' &&
+    message.status !== 'pending' &&
+    message.status !== 'streaming'
   );
 }
 
 export function toChatExportDocument(
-  messages: readonly AgentMessageView[],
+  messages: readonly ChatExportMessage[],
   options: ChatExportOptions,
 ): ExportDocument {
   if (messages.length > DOCUMENT_EXPORT_MAX_SECTIONS) throw new DocumentExportError('size-limit');
@@ -91,7 +93,7 @@ export function toChatExportDocument(
           presentation: 'reasoning',
           blocks: [{ kind: 'markdown', source: part.text }],
         });
-      } else if (part.type === 'tool' && options.includeProcess) {
+      } else if ((part.type === 'tool' || part.type === 'tool-summary') && options.includeProcess) {
         // Only the readable tool name is shared. Inputs, credentials and raw result envelopes stay private.
         process.push({ kind: 'details', summary: part.displayName, blocks: [] });
       }
@@ -118,6 +120,8 @@ export function toChatExportDocument(
           url: source.url,
         })),
       });
+    for (const attachment of message.attachments ?? [])
+      blocks.push({ kind: 'attachment', ...attachment });
     const metadata: { label: string; value: string }[] = [];
     if (message.status !== 'success')
       metadata.push({
@@ -136,7 +140,7 @@ export function toChatExportDocument(
 }
 
 /** Match the article's final-answer boundary using persisted Agent parts, without UI projections. */
-function finalTextIndex(parts: readonly AgentMessagePart[]): number | undefined {
+function finalTextIndex(parts: Readonly<TranscriptMessage['parts']>): number | undefined {
   for (let index = parts.length - 1; index >= 0; index--) {
     const part = parts[index];
     if (
@@ -152,7 +156,7 @@ function finalTextIndex(parts: readonly AgentMessagePart[]): number | undefined 
 }
 
 type CitationSource = { title: string; url: string };
-function collectSources(parts: readonly AgentMessagePart[]): Map<string, CitationSource> {
+function collectSources(parts: Readonly<TranscriptMessage['parts']>): Map<string, CitationSource> {
   const sources = new Map<string, CitationSource>();
   for (const part of parts) {
     if (

@@ -10,6 +10,7 @@ import type { PermissionsModule } from './permissions';
 import type { PluginsModule } from './plugins';
 import type { ProfileModule } from './profile';
 import type { ProvidersModule } from './providers';
+import type { RemoteAgentModule } from './remoteAgent';
 import type { SystemEntryModule } from './systemEntry';
 import type { WebSearchModule } from './webSearch';
 
@@ -17,6 +18,7 @@ export interface Backend {
   readonly backup: BackupModule;
   readonly systemEntry: SystemEntryModule;
   readonly agent: AgentProtocol;
+  readonly remoteAgent: RemoteAgentModule;
   readonly desktopConnections: DesktopConnectionsModule;
   readonly documentExport: DocumentExportModule;
   readonly file: FileModule;

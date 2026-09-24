@@ -6,6 +6,7 @@ import {
   remoteLimits,
   type RemoteAuthorization,
 } from '@cherrystudio/remote-protocol';
+import { agentMethods } from '@cherrystudio/remote-protocol/agent';
 import { configurationMethods } from '@cherrystudio/remote-protocol/configuration';
 import type { SecureChannel } from '@cherrystudio/remote-transport';
 import type { MessageStream } from '@libp2p/interface';
@@ -24,6 +25,7 @@ export const desktopMethods = {
   ...connectionMethods(remoteAuthorizationSchema),
   ...pairingMethods(remoteAuthorizationSchema),
   ...configurationMethods,
+  ...agentMethods,
 };
 export type DesktopMethod = keyof typeof desktopMethods;
 export type DesktopParams<M extends DesktopMethod> = z.input<(typeof desktopMethods)[M]['params']>;
@@ -61,6 +63,7 @@ function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 
 /** One pinned encrypted stream; address selection belongs to the connection manager. */
 export class DesktopSession {
+  agentFailureVersion?: number;
   static async connect(options: DesktopSessionOptions): Promise<DesktopSession> {
     let session: DesktopSession | undefined;
     try {
@@ -74,11 +77,12 @@ export class DesktopSession {
         signal: options.signal,
       });
       session = new DesktopSession(channel, options.address);
-      await session.request(
+      const hello = await session.request(
         'connection.hello',
         { protocolVersions: PROTOCOL_VERSIONS },
         options.signal,
       );
+      session.agentFailureVersion = hello.agentFailureVersion;
       options.signal.throwIfAborted();
       return session;
     } catch (error) {
@@ -124,6 +128,11 @@ export class DesktopSession {
   ): Promise<DesktopResult<M>> {
     if (this.closed) throw new DesktopUnreachableError(['connection closed']);
     signal?.throwIfAborted();
+    if (method.startsWith('agent.') && this.agentFailureVersion !== 1)
+      throw new RemoteFailureError({
+        reason: 'UPGRADE_REQUIRED',
+        message: 'Desktop Agent failure contract is not supported',
+      });
     if (this.inFlight >= remoteLimits.inFlightRequests)
       throw new RemoteFailureError({ reason: 'RESOURCE_EXHAUSTED', message: 'Too many requests' });
     const schema = desktopMethods[method];

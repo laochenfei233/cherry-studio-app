@@ -39,24 +39,26 @@ export function SidebarHeader() {
         <Text className="flex-1 font-semibold text-2xl text-sidebar-foreground" numberOfLines={1}>
           Cherry Studio
         </Text>
-        <Surface interactive shape="circle">
-          <Pressable
-            accessibilityLabel={t('session.search.placeholder')}
-            accessibilityRole="button"
-            hitSlop={4}
-            onPress={openSearch}
-            style={({ pressed }) => ({
-              alignItems: 'center',
-              height: appSidebar.headerRowHeight,
-              justifyContent: 'center',
-              opacity: pressed ? 0.6 : 1,
-              width: appSidebar.headerRowHeight,
-            })}
-            testID="sidebar-search"
-          >
-            <SearchIcon className="size-5 text-sidebar-foreground" />
-          </Pressable>
-        </Surface>
+        {openSearch ? (
+          <Surface interactive shape="circle">
+            <Pressable
+              accessibilityLabel={t('session.search.placeholder')}
+              accessibilityRole="button"
+              hitSlop={4}
+              onPress={openSearch}
+              style={({ pressed }) => ({
+                alignItems: 'center',
+                height: appSidebar.headerRowHeight,
+                justifyContent: 'center',
+                opacity: pressed ? 0.6 : 1,
+                width: appSidebar.headerRowHeight,
+              })}
+              testID="sidebar-search"
+            >
+              <SearchIcon className="size-5 text-sidebar-foreground" />
+            </Pressable>
+          </Surface>
+        ) : null}
       </View>
     </View>
   );

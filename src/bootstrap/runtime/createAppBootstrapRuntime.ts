@@ -35,6 +35,7 @@ import type { DocumentExportRuntime } from '@/backend/services/documentExport';
 import { resetFilePreviewsForRestore } from '@/backend/services/file/filePreviewStorage';
 import type { JobRuntime } from '@/backend/services/jobs/JobRuntime';
 import type { ProviderRegistryUpdaterService } from '@/backend/services/providers/ProviderRegistryUpdaterService';
+import type { RemoteAgentRuntime } from '@/backend/services/remoteAgent';
 import type { WebSearchService } from '@/backend/services/webSearch/WebSearchService';
 import { createBackend } from '@/bootstrap/composition/createBackend';
 import { createBackendServices } from '@/bootstrap/composition/createBackendServices';
@@ -114,12 +115,13 @@ export function createAppBootstrapRuntime(
   const cache = host.container.get<CacheService>('CacheService');
   const dbService = host.container.get<DbService>('DbService');
   const backup = host.container.get<BackupRuntime>('BackupRuntime');
-  const desktopConnectionManager = host.container.get<DesktopConnectionManager>(
-    'DesktopConnectionManager',
-  );
   const desktopConnections = host.container.get<DesktopConnectionRuntime>(
     'DesktopConnectionRuntime',
   );
+  const desktopConnectionManager = host.container.get<DesktopConnectionManager>(
+    'DesktopConnectionManager',
+  );
+  const remoteAgent = host.container.get<RemoteAgentRuntime>('RemoteAgentRuntime');
   const documentExport = host.container.get<DocumentExportRuntime>('DocumentExportRuntime');
   const jobRuntime = host.container.get<JobRuntime>('JobRuntime');
   const languageServing = host.container.get<LanguageServingSupport & AgentRuntime>('AgentRuntime');
@@ -149,6 +151,7 @@ export function createAppBootstrapRuntime(
     documentExport,
     desktopConnections,
     desktopConnectionManager,
+    remoteAgent,
     languageServing,
     providerRegistryUpdater,
   });

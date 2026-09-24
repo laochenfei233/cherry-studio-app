@@ -1,7 +1,7 @@
 import type { AgentMessageView } from '@/shared/contracts/agent';
 import { DOCUMENT_EXPORT_MAX_SECTIONS } from '@/shared/contracts/documentExport';
 
-import { loadChatExportMessages } from '../loadChatExportMessages';
+import { prepareChatExport } from '../prepareChatExport';
 import {
   replaceChatCitations,
   toChatExportDocument,
@@ -292,3 +292,23 @@ test('multiline inline code and quoted fences retain citation examples', () => {
     ),
   ).toBe(`${code}[1](<https://example.com/>)`);
 });
+
+async function loadChatExportMessages(
+  ids: readonly string[],
+  readPage: (query: { ids: string[] }) => Promise<{ items: AgentMessageView[] }>,
+  signal: AbortSignal,
+) {
+  const snapshot = await prepareChatExport(
+    {
+      prepareSelection: async (selected) => {
+        const page = await readPage({ ids: [...selected] });
+        return {
+          messages: page.items.filter((message) => selected.includes(message.id)).toReversed(),
+        };
+      },
+    },
+    ids,
+    signal,
+  );
+  return snapshot.messages;
+}
