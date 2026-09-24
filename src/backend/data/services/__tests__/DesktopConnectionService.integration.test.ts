@@ -58,9 +58,10 @@ describe('DesktopConnectionService provider synchronization', () => {
       {
         id: connectionId,
         name: 'Desktop',
-        desktopVersion: '2.0.8',
-        activeBaseUrl: 'http://192.168.1.2:23333',
-        baseUrls: ['http://192.168.1.2:23333'],
+        deviceId: 'device-1',
+        desktopIdentity: '12D3KooWDesktop',
+
+        grants: [{ domain: 'configuration', grantId: 'grant-1' }],
       },
       false,
       signal(),

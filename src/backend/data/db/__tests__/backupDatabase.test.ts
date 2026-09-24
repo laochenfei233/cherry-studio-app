@@ -24,8 +24,8 @@ function database() {
       VALUES ('plugin', 'feishu', 'feishu_user', 'Account', '{"storage":"secure-store-v1","id":"10000000-0000-4000-8000-000000000001"}', 1, 1);
     INSERT INTO mcp_server (id, name, origin, builtin_id, authorization_id, created_at, updated_at)
       VALUES ('mcp', 'Feishu', 'builtin', 'feishu', 'plugin', 1, 1);
-    INSERT INTO desktop_connection (id, name, base_urls, active_base_url, desktop_version, status, created_at, updated_at)
-      VALUES ('desktop', 'Desktop', '[]', 'http://localhost', '1.0.0', 'paired', 1, 1);
+    INSERT INTO desktop_connection (id, name, device_id, desktop_identity, grants, status, created_at, updated_at)
+      VALUES ('desktop', 'Desktop', 'phone', 'peer', '[]', 'paired', 1, 1);
     INSERT INTO preference (key, value, created_at, updated_at)
       VALUES ('ui.theme_mode', '"dark"', 1, 1), ('app.user.id', '"source-device"', 1, 1),
              ('app.privacy.data_collection.enabled', 'true', 1, 1);

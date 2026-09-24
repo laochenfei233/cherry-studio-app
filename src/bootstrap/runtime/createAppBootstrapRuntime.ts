@@ -27,7 +27,10 @@ import type { BackgroundActivityEnvironment } from '@/backend/services/backgroun
 import { createLiveActivityPresenter } from '@/backend/services/backgroundActivity/liveActivityPresenter';
 import { createReplyCompletionNotifier } from '@/backend/services/backgroundReply/replyCompletionNotifications';
 import { type BackupRuntime, validateRestoringStorage } from '@/backend/services/backup';
-import type { DesktopConnectionRuntime } from '@/backend/services/desktopConnections/DesktopConnectionRuntime';
+import type {
+  DesktopConnectionManager,
+  DesktopConnectionRuntime,
+} from '@/backend/services/desktopConnections';
 import type { DocumentExportRuntime } from '@/backend/services/documentExport';
 import { resetFilePreviewsForRestore } from '@/backend/services/file/filePreviewStorage';
 import type { JobRuntime } from '@/backend/services/jobs/JobRuntime';
@@ -111,6 +114,9 @@ export function createAppBootstrapRuntime(
   const cache = host.container.get<CacheService>('CacheService');
   const dbService = host.container.get<DbService>('DbService');
   const backup = host.container.get<BackupRuntime>('BackupRuntime');
+  const desktopConnectionManager = host.container.get<DesktopConnectionManager>(
+    'DesktopConnectionManager',
+  );
   const desktopConnections = host.container.get<DesktopConnectionRuntime>(
     'DesktopConnectionRuntime',
   );
@@ -142,6 +148,7 @@ export function createAppBootstrapRuntime(
     dbService,
     documentExport,
     desktopConnections,
+    desktopConnectionManager,
     languageServing,
     providerRegistryUpdater,
   });
@@ -157,6 +164,7 @@ export function createAppBootstrapRuntime(
       aiUsageRecords: services.aiUsageRecord,
       contentSearch: services.contentSearch,
       desktopConnections: services.desktopConnection,
+      desktopConnectionEndpointsChanged: (id) => desktopConnectionManager.refreshEndpoints(id),
       entitySearch: services.entitySearch,
       files: services.fileEntry,
       jobs: services.job,

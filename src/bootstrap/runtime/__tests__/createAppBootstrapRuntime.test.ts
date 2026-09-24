@@ -21,6 +21,10 @@ const mockFailStorageBoot = jest.fn();
 const mockRejectStorageCandidate = jest.fn();
 const mockValidateRestoringStorage = jest.fn(async () => {});
 const mockDocumentExport = { kind: 'document-export' };
+const mockDesktopConnectionManager = {
+  kind: 'desktop-connection-manager',
+  refreshEndpoints: jest.fn(),
+};
 const mockDesktopConnections = { kind: 'desktop-connections' };
 const mockJobRuntime = { kind: 'job-runtime' };
 const mockMcpRuntime = { kind: 'mcp-runtime' };
@@ -119,6 +123,7 @@ const createRuntime = () =>
     DbService: mockDb,
     BackupRuntime: mockBackup,
     DesktopConnectionRuntime: mockDesktopConnections,
+    DesktopConnectionManager: mockDesktopConnectionManager,
     DocumentExportRuntime: mockDocumentExport,
     JobRuntime: mockJobRuntime,
     McpRuntimeService: mockMcpRuntime,
@@ -225,6 +230,7 @@ describe('createAppBootstrapRuntime', () => {
       backup: mockBackup,
       dbService: mockDb,
       desktopConnections: mockDesktopConnections,
+      desktopConnectionManager: mockDesktopConnectionManager,
       documentExport: mockDocumentExport,
       languageServing: mockAgentRuntime,
       providerRegistryUpdater: mockProviderRegistryUpdater,

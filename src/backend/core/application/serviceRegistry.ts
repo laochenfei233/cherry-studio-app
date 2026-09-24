@@ -14,7 +14,10 @@ import { BackgroundActivityEnvironment } from '@/backend/services/backgroundActi
 import { BackgroundActivityManager } from '@/backend/services/backgroundActivity/BackgroundActivityManager';
 import { BackgroundReplyRuntime } from '@/backend/services/backgroundReply';
 import { BackupRuntime } from '@/backend/services/backup';
-import { DesktopConnectionRuntime } from '@/backend/services/desktopConnections/DesktopConnectionRuntime';
+import {
+  DesktopConnectionManager,
+  DesktopConnectionRuntime,
+} from '@/backend/services/desktopConnections';
 import { DocumentExportRuntime } from '@/backend/services/documentExport';
 import { JobHandlerRegistry } from '@/backend/services/jobs/JobHandlerRegistry';
 import { JobRuntime } from '@/backend/services/jobs/JobRuntime';
@@ -46,6 +49,7 @@ export const services = {
   CacheService,
   DbService,
   BackupRuntime,
+  DesktopConnectionManager,
   DesktopConnectionRuntime,
   DocumentExportRuntime,
   PreferenceService,
