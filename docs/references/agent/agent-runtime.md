@@ -268,10 +268,13 @@ file storage first, `AgentInputPart` carries the resulting `fileEntryId`, and th
 live entry and managed blob before message reservation. The Host authorizes tools from managed ids
 referenced by the current input and complete Session transcript, while it resolves attachment
 content only for the current input and checkpoint-visible history. A Runtime never reads the device
-filesystem. For supported images, the Host enforces the shared JPEG/PNG/GIF/WebP whitelist plus
-at most 9 images, 10 MiB per file, 20 MiB total, and a conservative context reserve of 4,096 input
-tokens per image plus 1,024 tokens for text. This remains the Host's current-input admission ceiling;
-S2b separately includes image costs in Pi compression-trigger estimates. The Host then reads a
+filesystem. For supported images, the Host enforces the shared JPEG/PNG/GIF/WebP whitelist and
+10 MiB per file. There is no request-level image count or byte ceiling: every request replays the
+checkpoint-visible history with its images, and Pi prices each image into the context window by the
+endpoint's documented formula (Anthropic, OpenAI, or Gemini) over the dimensions read from the
+image header, falling back to that dialect's typical cost. Compaction folds old images away like any
+other history; a current input that alone exceeds the window fails as a context error before the
+provider call. The Host then reads a
 temporary Data URL after reservation. Cancellation aborts that read boundary and late content is
 discarded. Current image read failure settles the reserved turn; missing historical content is
 omitted while its persisted reference remains.
@@ -372,9 +375,12 @@ history. Pi owns all later selection, formatting, and compaction policy.
 
 Pi estimates reconstructed history with `pi-agent-core`'s content estimator. Persisted assistant
 usage aggregates multiple requests for analytics and is never a context-size measurement. The adapter
-adds system instructions, current input, tool schemas, image reserves, and a fixed safety margin
-before calling Pi's `shouldCompact`. Historical image reserves follow the checkpoint-projected
-history; they are removable history costs, not part of the current input's fixed cost. A current
+adds system instructions, current input, tool schemas, per-image dialect estimates (replacing Pi's
+flat image charge), and a fixed safety margin before calling Pi's `shouldCompact`. Because replayed
+history carries no provider usage, Chat Completions endpoints, which also serve non-OpenAI vision
+models, take the larger of the OpenAI and Anthropic image estimates. Historical image estimates
+follow the checkpoint-projected history; they are removable history costs, not part of the current
+input's fixed cost. A current
 input whose fixed costs exceed the hard budget fails before the first model call. Crossing the
 compaction trigger alone never proves that a request cannot be sent.
 
