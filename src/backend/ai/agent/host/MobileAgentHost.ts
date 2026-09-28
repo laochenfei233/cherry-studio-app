@@ -56,7 +56,7 @@ import {
   AgentRespondQuestionSchema,
   type AgentRespondQuestionInput,
   type AgentPendingQuestion,
-  type AgentUserQuestion,
+  type AgentUserQuestions,
   AgentCancelTurnInputSchema,
   AgentDeleteSessionInputSchema,
   AgentDeleteTurnInputSchema,
@@ -757,7 +757,7 @@ export class MobileAgentHost extends BaseService implements AgentProtocol {
    * The call's turn id selects the live turn; a call from a turn that is no
    * longer active fails closed instead of reaching a different session.
    */
-  private async askUserQuestion(question: AgentUserQuestion, call: RuntimeToolCall) {
+  private async askUserQuestion(question: AgentUserQuestions, call: RuntimeToolCall) {
     call.signal.throwIfAborted();
     const state = [...this.activeTurns.values()].find((entry) => entry.turn.id === call.turnId);
     if (!state || state.abortController.signal.aborted) {
