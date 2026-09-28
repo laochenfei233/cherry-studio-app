@@ -87,6 +87,7 @@ function fixture(scope = 'scope', binding = 'binding') {
     },
     recover: jest.fn(async () => undefined),
     dismiss: jest.fn(),
+    resync: jest.fn(),
     dispose: jest.fn(),
   };
   const source = createRemoteConversationSource('pc', remote);
@@ -367,7 +368,48 @@ it('carries the rejected send explanation through both the action and its operat
       .actions.send!.execute({ parts: [{ type: 'text', text: 'hello' }] }),
   ).toMatchObject({ state: 'rejected', failure });
   expect(handle.operations.getSnapshot()[0]).toMatchObject({ state: 'rejected', failure });
+  expect(test.remote.dismiss).not.toHaveBeenCalled();
   handle.dispose();
+  test.source.dispose();
+});
+
+it('lets an operation row rebuild the state of the Session that owns it', async () => {
+  const test = fixture();
+  test.remote.getCommands = () => [
+    { id: 'send', kind: 'send', status: 'failed', sessionId: 's', error: 'CONFLICT' },
+  ];
+  const handle = await test.source.openSession(address, signal());
+  const resync = handle.operations.getSnapshot()[0].resync!;
+  expect(resync.availability.state).toBe('enabled');
+  await expect(resync.execute(undefined)).resolves.toEqual({ state: 'applied', value: undefined });
+  expect(test.remote.resync).toHaveBeenCalledWith('s');
+  handle.dispose();
+  test.source.dispose();
+});
+
+it('drops a first send the caller has already been told was rejected', async () => {
+  const test = fixture();
+  test.remote.start = jest.fn(async () => ({
+    id: 'start',
+    draftId: 'draft',
+    agentId: 'a',
+    workspaceId: 'w',
+    text: 'hello',
+    status: 'rejected' as const,
+    error: 'TARGET_UNAVAILABLE',
+  }));
+  const agent = (await test.source.catalog.listAgents(undefined, signal())).items[0].ref;
+  const workspace = (await test.source.catalog.listWorkspaces!(agent, undefined, signal())).items[0]
+    .ref;
+  const draft = await test.source.catalog.prepareDraft(
+    { agent, workspace, draftId: 'draft' as DraftId },
+    signal(),
+  );
+  await expect(
+    draft.state.getSnapshot().start.execute({ parts: [{ type: 'text', text: 'hello' }] }),
+  ).resolves.toMatchObject({ state: 'rejected', failure: { code: 'target-unavailable' } });
+  expect(test.remote.dismiss).toHaveBeenCalledWith('start');
+  draft.dispose();
   test.source.dispose();
 });
 
