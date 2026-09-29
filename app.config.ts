@@ -70,6 +70,20 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         if (plugin === 'expo-localization') {
           return [plugin, { supportedLocales: APP_LANGUAGES.map(({ value }) => value) }];
         }
+        if (Array.isArray(plugin) && plugin[0] === 'expo-build-properties') {
+          return [
+            plugin[0],
+            {
+              ...plugin[1],
+              android: {
+                ...plugin[1].android,
+                // Compressed native libraries only help direct APK downloads; the Google Play profile opts out.
+                useLegacyPackaging:
+                  profile !== 'development' && process.env.ANDROID_COMPRESS_NATIVE_LIBS !== 'false',
+              },
+            },
+          ];
+        }
         if (Array.isArray(plugin) && plugin[0] === 'expo-widgets') {
           return [
             plugin[0],

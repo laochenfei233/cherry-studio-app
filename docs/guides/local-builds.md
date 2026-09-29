@@ -167,6 +167,19 @@ For production monitoring, provide a valid upload token and keep automatic uploa
 matching source maps and debug symbols, reported error stacks may not resolve back to source.
 Missing or invalid upload credentials can fail the build.
 
+Android preview and production APKs use arm64 Release builds without R8 code shrinking, so the
+Java and Kotlin stack traces Sentry receives stay readable without a mapping upload. The APK
+profiles set `useLegacyPackaging` to compress native `.so` libraries for direct downloads. Android
+extracts those libraries during installation, so a smaller APK does not mean less installed storage
+or a faster startup. The `production-google-play` profile sets `ANDROID_COMPRESS_NATIVE_LIBS=false`
+so the AAB keeps uncompressed libraries: Google Play compresses the download itself, and compressed
+libraries in an AAB only slow installation and double on-device storage. Development builds keep
+uncompressed native libraries. The EAS Release commands pass `-Xmx4096m` as the Gradle JVM
+arguments, which also drops the template Metaspace cap that made `lintVitalAnalyzeRelease` fail on
+local production builds. After changing native dependencies or packaging options, verify that a
+Release build starts and completes desktop QR pairing. Compare APK sizes using the same profile and
+architecture.
+
 Rebuild the native client after adding or changing native dependencies such as Sentry. Starting
 Metro again does not add a native module to an already installed client. Local and cloud EAS builds
 generate native projects from the selected profile because `.easignore` excludes `ios` and `android`.
