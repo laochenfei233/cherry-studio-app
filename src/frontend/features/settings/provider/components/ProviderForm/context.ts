@@ -6,6 +6,7 @@ import type { ApiKeyEntry, Provider } from '@/shared/data/types/provider';
 import type { ProviderFormValues } from './utils/providerFormValues';
 
 export type ProviderFormActions = {
+  replaceSavedApiKeys: (apiKeys: ApiKeyEntry[]) => void;
   reset: (values?: ProviderFormValues) => void;
   addApiKey: (entry: ApiKeyEntry) => void;
   updateApiKey: (id: string, updates: Partial<Omit<ApiKeyEntry, 'id'>>) => void;

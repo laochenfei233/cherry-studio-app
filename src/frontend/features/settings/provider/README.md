@@ -131,3 +131,41 @@ provider models for management, labels unavailable models, and supports detail, 
 menus, and scoped multi-selection. The detail page's `model/` branch owns model inspection and its
 `edit/` child. Model grouping, deletion protection, selection, and synchronization remain under
 `models/`.
+
+## Provider Accounts
+
+`backend.providers.accounts` is the shared account contract. Setup and detail compose
+`components/ProviderAccount/` using its capability declaration; `account/` receives the
+`/oauth/callback` route. UI, callback handling, query keys and credential ownership do not branch on
+provider IDs. The registered adapter determines sign-in, model API-key and balance support.
+Mobile adds only login-based providers that the desktop app already supports.
+
+The account panel follows provider identity and precedes manual configuration in setup, detail
+and onboarding. Signed-out accounts expose one primary sign-in action. Signed-in accounts show
+identity and local sign-out in the header, with a balance and adjacent refresh action below.
+
+The backend's `providers/account/ProviderAccountRuntime` owns attempts, callback validation,
+credential persistence, refresh, logout and provider deletion cleanup. `providerOauth` supplies the
+shared PKCE authorization-code client. Adapters own client configuration and account API response
+parsing. The composition root currently registers only CherryIN. The desktop app's Codex and Grok
+CLI logins are not available on mobile: their upstream clients accept only loopback callbacks.
+
+An in-progress attempt (state, PKCE verifier and deadline) exists only in runtime memory. A callback
+must match that attempt's registered redirect URL exactly, so one provider's callback cannot
+complete another provider's attempt. If the app is terminated during sign-in, the returning
+callback is rejected and the user signs in again.
+
+Model calls keep their existing supported authentication paths. Account login adds model API keys
+when the adapter supplies them; logout removes only unchanged keys owned by that local account.
+Account key changes update the form baseline without discarding other edits. Balance values carry
+their currency instead of assuming USD throughout the shared UI.
+
+Desktop OAuth imports use the same registered model-key capability. They discard the desktop grant,
+preserve local keys and IDs/enabled choices, and add new PC keys. The balance belongs to the account
+signed in on this phone; imported keys may belong to a different account. Unsupported upstream
+OAuth/model protocols are not enabled merely by catalog metadata.
+
+Each adapter declares the desktop app's registered client ID and redirect URL. CherryIN shares
+`cherrystudio://oauth/callback` with desktop; a custom-scheme callback only reaches the app on the
+device that opened the browser. Only production builds register the `cherrystudio` scheme, so
+development and preview builds cannot complete provider sign-in.

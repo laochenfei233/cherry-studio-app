@@ -34,6 +34,7 @@ import type {
 import type { DocumentExportRuntime } from '@/backend/services/documentExport';
 import { resetFilePreviewsForRestore } from '@/backend/services/file/filePreviewStorage';
 import type { JobRuntime } from '@/backend/services/jobs/JobRuntime';
+import type { ProviderAccountRuntime } from '@/backend/services/providers/account';
 import type { ProviderRegistryUpdaterService } from '@/backend/services/providers/ProviderRegistryUpdaterService';
 import type { RemoteAgentRuntime } from '@/backend/services/remoteAgent';
 import type { WebSearchService } from '@/backend/services/webSearch/WebSearchService';
@@ -118,6 +119,7 @@ export function createAppBootstrapRuntime(
   const desktopConnections = host.container.get<DesktopConnectionRuntime>(
     'DesktopConnectionRuntime',
   );
+  const providerAccounts = host.container.get<ProviderAccountRuntime>('ProviderAccountRuntime');
   const desktopConnectionManager = host.container.get<DesktopConnectionManager>(
     'DesktopConnectionManager',
   );
@@ -148,6 +150,7 @@ export function createAppBootstrapRuntime(
   const { backend, dataApiDependencies, disposeSystemEntry } = createBackend(services, {
     backup,
     dbService,
+    providerAccounts,
     documentExport,
     desktopConnections,
     desktopConnectionManager,
@@ -180,6 +183,7 @@ export function createAppBootstrapRuntime(
         listConnections: () => services.mcpRuntime.pluginAuthorizations.listConnections(),
       },
       providers: services.provider,
+      providerAccounts,
       systemModelSupport: dataApiDependencies.systemModelSupport,
     }),
   );

@@ -31,6 +31,7 @@ const mockPreference = {
   subscribeChange: jest.fn((_key: string) => (_listener: () => void) => () => {}),
 };
 const mockDesktopConnectionManager = { kind: 'desktop-connection-manager' };
+const mockProviderAccounts = { kind: 'provider-accounts' };
 const mockProviderRegistryUpdater = { kind: 'provider-registry-updater' };
 const mockWebSearch = { kind: 'web-search' };
 const mockBackgroundActivityEnvironment = { configure: jest.fn() };
@@ -128,6 +129,7 @@ const createRuntime = () =>
     McpRuntimeService: mockMcpRuntime,
     MobileAgentHost: mockAgent,
     PreferenceService: mockPreference,
+    ProviderAccountRuntime: mockProviderAccounts,
     ProviderRegistryUpdaterService: mockProviderRegistryUpdater,
     WebSearchService: mockWebSearch,
   });
@@ -235,6 +237,7 @@ describe('createAppBootstrapRuntime', () => {
       desktopConnectionManager: mockDesktopConnectionManager,
       documentExport: mockDocumentExport,
       languageServing: mockAgentRuntime,
+      providerAccounts: mockProviderAccounts,
       providerRegistryUpdater: mockProviderRegistryUpdater,
     });
     expect(mockInitializeAppRuntime).toHaveBeenCalledWith(mockServices);

@@ -32,6 +32,7 @@ let mockModels: Model[] = [];
 let mockApiKeys: ApiKeyEntry[] = [];
 const mockSave = jest.fn();
 const mockReplaceApiKeys = jest.fn();
+const mockRefetchApiKeys = jest.fn();
 const mockConfirm = jest.fn();
 const mockAlert = jest.fn();
 const mockToast = jest.fn();
@@ -47,6 +48,11 @@ jest.mock('react-i18next', () => ({
   }),
 }));
 jest.mock('@/frontend/data', () => ({
+  useBackendModule: () => ({
+    accounts: {
+      getCapabilities: () => ({ signIn: false, apiKeys: false, balance: false }),
+    },
+  }),
   useQuery: () => ({ data: mockModels, isPending: false, isError: false }),
 }));
 jest.mock('../useProviderApiServiceQueries', () => ({
@@ -55,7 +61,7 @@ jest.mock('../useProviderApiServiceQueries', () => ({
     apiKeys: mockApiKeys,
     authConfig: null,
     providerQuery: { isPending: false, isError: false },
-    apiKeysQuery: { isPending: false, isError: false },
+    apiKeysQuery: { isPending: false, isError: false, refetch: mockRefetchApiKeys },
     authConfigQuery: { isPending: false, isError: false },
     isSaving: false,
     saveProviderMutation: { mutateAsync: mockSave },
@@ -230,6 +236,20 @@ describe('shared provider configuration saves', () => {
 
     expect(mockSave.mock.calls[0][0]).not.toHaveProperty('apiKeys');
     expect(configuration.form.state.apiKeys).toEqual(mockApiKeys);
+    expect(configuration.form.meta.isDirty).toBe(false);
+  });
+
+  it('adopts saved account keys without marking other unsaved fields as saved', async () => {
+    act(() => configuration.form.actions.setName('Unsaved name'));
+    const accountKeys = [{ id: 'account', key: 'account-key', isEnabled: true }];
+    mockRefetchApiKeys.mockResolvedValue({ data: accountKeys });
+    await act(async () => {
+      await configuration.reloadAccountKeys();
+    });
+    expect(configuration.form.state.apiKeys).toEqual(accountKeys);
+    expect(configuration.form.state.name).toBe('Unsaved name');
+    expect(configuration.form.meta.isDirty).toBe(true);
+    act(() => configuration.form.actions.setName('Custom'));
     expect(configuration.form.meta.isDirty).toBe(false);
   });
 });

@@ -16,6 +16,7 @@ import type { DbService } from '@/backend/data/db/DbService';
 import { DesktopConnectionService } from '@/backend/data/services/DesktopConnectionService';
 import { FileEntryService } from '@/backend/data/services/FileEntryService';
 import { materializeRemoteModels } from '@/backend/data/services/materializeRemoteModels';
+import { ProviderAccountService } from '@/backend/data/services/ProviderAccountService';
 import { providerRegistryService } from '@/backend/data/services/ProviderRegistryService';
 import { RemoteAgentCommandJournal } from '@/backend/data/services/RemoteAgentCommandJournal';
 import { agentAvatarImages } from '@/backend/services/agents/agentAvatarStorage';
@@ -43,6 +44,10 @@ import {
   resolveUserAvatarUri,
   USER_AVATAR_IMAGE_CONFIG,
 } from '@/backend/services/profile/userAvatarStorage';
+import {
+  cherryInAccountDefinition,
+  type ProviderAccountRuntime,
+} from '@/backend/services/providers/account';
 import { createProvidersModule } from '@/backend/services/providers/createProvidersModule';
 import {
   deleteProviderAvatar,
@@ -73,6 +78,7 @@ export function createBackend(
   services: BackendServices,
   infrastructure: {
     dbService: DbService;
+    providerAccounts: ProviderAccountRuntime;
     backup: BackupRuntime;
     documentExport: DocumentExportRuntime;
     desktopConnections: DesktopConnectionRuntime;
@@ -83,6 +89,9 @@ export function createBackend(
   },
 ): BackendComposition {
   const { dbService } = infrastructure;
+  infrastructure.providerAccounts.configure(new ProviderAccountService(dbService), [
+    cherryInAccountDefinition,
+  ]);
   // Capture this host's database; late work never resolves a replacement host.
   const exportFiles = new FileEntryService(dbService);
   infrastructure.remoteAgent.configure({
@@ -90,7 +99,9 @@ export function createBackend(
     journal: new RemoteAgentCommandJournal(createMMKV({ id: 'cherry-remote-agent-commands' })),
   });
   infrastructure.documentExport.configure(createDocumentExportDependencies(exportFiles));
-  const desktopStore = new DesktopConnectionService(dbService);
+  const desktopStore = new DesktopConnectionService(dbService, (provider) =>
+    infrastructure.providerAccounts.getCapabilities(provider),
+  );
   infrastructure.desktopConnectionManager.configure(desktopStore);
   infrastructure.desktopConnections.configure(
     desktopStore,
@@ -165,6 +176,7 @@ export function createBackend(
     servers: services.mcpServer,
   });
   const providers = createProvidersModule({
+    accounts: infrastructure.providerAccounts,
     hasAvailableModels: async (provider) =>
       (await services.model.list({ providerId: provider.id, enabled: true })).some((model) =>
         isModelSupportedBySystem(provider, model),

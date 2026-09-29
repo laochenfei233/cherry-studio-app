@@ -106,6 +106,10 @@ export function useProviderFormDraft({
       }),
     [],
   );
+  const replaceSavedApiKeys = useCallback<ProviderFormActions['replaceSavedApiKeys']>((apiKeys) => {
+    setSeed((current) => ({ ...current, values: { ...current.values, apiKeys } }));
+    setValues((current) => ({ ...current, apiKeys }));
+  }, []);
   const setAvatarUri = useCallback(
     (avatarUri: string | null) => setValues((current) => ({ ...current, avatarUri })),
     [],
@@ -152,6 +156,7 @@ export function useProviderFormDraft({
   const actions = useMemo<ProviderFormActions>(
     () => ({
       reset,
+      replaceSavedApiKeys,
       replaceTextEndpoint,
       addApiKey,
       updateApiKey,
@@ -163,6 +168,7 @@ export function useProviderFormDraft({
     }),
     [
       reset,
+      replaceSavedApiKeys,
       replaceTextEndpoint,
       addApiKey,
       updateApiKey,

@@ -1,6 +1,7 @@
 import { inferAdapterFamily } from '@cherrystudio/provider-registry';
 import { configuredEndpointsSchema, type DirectEndpoint } from '@cherrystudio/remote-protocol';
 import { and, asc, eq } from 'drizzle-orm';
+import { randomUUID } from 'expo-crypto';
 
 import { application } from '@/backend/core/application/Application';
 import type { DbService } from '@/backend/data/db/DbService';
@@ -11,6 +12,10 @@ import {
   userModelTable,
   userProviderTable,
 } from '@/backend/data/db/schemas';
+import type {
+  ProviderAccountCapabilities,
+  ProviderAccountIdentity,
+} from '@/shared/contracts/providerAccounts';
 import { DataApiError, DataApiErrorFactory, ErrorCode } from '@/shared/data/api/errors';
 import {
   type DesktopImportPreview,
@@ -119,13 +124,16 @@ function resolvePresetProviderId(provider: DesktopProviderSnapshot): string | nu
 /** Payload-only rejections; the import transaction re-validates whatever needs the database. */
 function getProviderImportRejection(
   provider: DesktopProviderSnapshot,
+  account?: ProviderAccountCapabilities,
 ): DesktopImportUnavailableReason | undefined {
   if (provider.unreadable) return 'unreadable';
   // An absent `authMethods` predates the field rather than denying API keys.
   const acceptsApiKey = provider.authMethods?.includes('api-key') ?? true;
-  if (provider.authType === 'oauth' || !acceptsApiKey) return 'unsupported-auth';
-  // A desktop signed in through OAuth exports no key, and mobile has no flow to obtain one.
   const hasUsableKey = provider.apiKeys.some((entry) => entry.isEnabled && entry.key.trim());
+  if (provider.authType === 'oauth') {
+    return account?.apiKeys && hasUsableKey ? undefined : 'unsupported-auth';
+  }
+  if (!acceptsApiKey) return 'unsupported-auth';
   return provider.authOptional || hasUsableKey ? undefined : 'missing-api-key';
 }
 
@@ -133,11 +141,12 @@ function getProviderImportRejection(
 function getProviderImportUnavailableReason(
   provider: DesktopProviderSnapshot,
   existingEndpointConfigs: EndpointConfigs | null | undefined,
+  account?: ProviderAccountCapabilities,
 ): DesktopImportUnavailableReason | undefined {
-  const rejection = getProviderImportRejection(provider);
+  const rejection = getProviderImportRejection(provider, account);
   if (rejection) return rejection;
   try {
-    const configuration = mapProvider(provider);
+    const configuration = mapProvider(provider, account);
     if (configuration.presetProviderId) return undefined;
     const endpointConfigs = { ...existingEndpointConfigs, ...configuration.endpointConfigs };
     assertCustomProviderEndpointConfiguration({
@@ -179,7 +188,10 @@ function getEnabledDesktopProviders(snapshot: DesktopProvidersSnapshot) {
     });
 }
 
-function mapProvider(provider: DesktopProviderSnapshot): Omit<InsertUserProviderRow, 'orderKey'> {
+function mapProvider(
+  provider: DesktopProviderSnapshot,
+  account?: ProviderAccountCapabilities,
+): Omit<InsertUserProviderRow, 'orderKey'> {
   const presetProviderId = resolvePresetProviderId(provider);
   const defaultChatEndpoint =
     provider.defaultChatEndpoint ??
@@ -187,7 +199,10 @@ function mapProvider(provider: DesktopProviderSnapshot): Omit<InsertUserProvider
   return {
     apiFeatures: mapApiFeatures(provider),
     apiKeys: provider.apiKeys,
-    authConfig: parseSupportedAuthConfig(provider.authConfig),
+    authConfig:
+      account?.apiKeys && provider.authType === 'oauth'
+        ? { type: 'api-key' }
+        : parseSupportedAuthConfig(provider.authConfig),
     defaultChatEndpoint,
     endpointConfigs: mapEndpointConfigs(provider),
     isEnabled: true,
@@ -248,7 +263,12 @@ function mapModel(
 
 export class DesktopConnectionService {
   // Workflows bind the originating host's database; API reads use the active host.
-  constructor(private readonly database?: Pick<DbService, 'getDb' | 'withWriteTx'>) {}
+  constructor(
+    private readonly database?: Pick<DbService, 'getDb' | 'withWriteTx'>,
+    private readonly accountCapabilities?: (
+      provider: ProviderAccountIdentity,
+    ) => ProviderAccountCapabilities,
+  ) {}
 
   private get dbService() {
     return this.database ?? application.get('DbService');
@@ -364,9 +384,11 @@ export class DesktopConnectionService {
     const existingModels = new Set(modelRows.map((row) => row.id));
     return {
       providers: getEnabledDesktopProviders(snapshot).map((provider) => {
+        const account = this.accountCapabilities?.(provider);
         const unavailableReason = getProviderImportUnavailableReason(
           provider,
           existingProviders.get(provider.id),
+          account,
         );
         return {
           action: existingProviders.has(provider.id) ? 'update' : 'add',
@@ -380,6 +402,9 @@ export class DesktopConnectionService {
           })),
           name: provider.name,
           ...(unavailableReason ? { unavailableReason } : {}),
+          ...(!unavailableReason && account?.balance && provider.authType === 'oauth'
+            ? { accountNotice: 'sign-in-for-balance' as const }
+            : {}),
         };
       }),
     };
@@ -404,7 +429,7 @@ export class DesktopConnectionService {
       if (!provider) {
         throw desktopError('invalid-selection', 'A selected provider is no longer available');
       }
-      const rejection = getProviderImportRejection(provider);
+      const rejection = getProviderImportRejection(provider, this.accountCapabilities?.(provider));
       if (rejection) {
         throw desktopError(rejection, `A selected provider was rejected as ${rejection}`);
       }
@@ -426,7 +451,19 @@ export class DesktopConnectionService {
           .from(userProviderTable)
           .where(eq(userProviderTable.providerId, providerId))
           .limit(1);
-        const configuration = mapProvider(provider);
+        const account = this.accountCapabilities?.(provider);
+        const configuration = mapProvider(provider, account);
+        if (existingProvider && account?.apiKeys) {
+          // Local key identities and enabled choices belong to the phone, including account-owned keys.
+          const keys = [...(existingProvider.apiKeys ?? [])];
+          for (const key of provider.apiKeys) {
+            if (keys.some((existing) => existing.key === key.key)) continue;
+            keys.push(
+              keys.some((existing) => existing.id === key.id) ? { ...key, id: randomUUID() } : key,
+            );
+          }
+          configuration.apiKeys = keys;
+        }
         if (!configuration.presetProviderId) {
           // Retained mobile models may still use endpoints absent from the PC.
           configuration.endpointConfigs = {
